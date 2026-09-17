@@ -267,7 +267,11 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                                          (m.get("gpu_type_ids") or []) if str(g).strip()],
                         "image": str(m.get("image") or "").strip(),
                         "docker_args": str(m.get("docker_args") or "").strip(),
-                        "ports": str(m.get("ports") or "8080/http").strip(),
+                        # REST API wants an ARRAY ("8080/http" → ["8080/http"])
+                        "ports": [p.strip() for p in
+                                  str(m.get("ports") or "8080/http").split(",")
+                                  if p.strip()] if not isinstance(m.get("ports"), list)
+                        else [str(p).strip() for p in m["ports"] if str(p).strip()],
                         "port": max(1, int(_num("port", 8080))),
                         "gpu_count": max(1, int(_num("gpu_count", 1))),
                         "container_disk_gb": int(_num("container_disk_gb", 20)),
@@ -277,12 +281,15 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         "env": {str(k): str(v) for k, v in (m.get("env") or {}).items()}
                                if isinstance(m.get("env") or {}, dict) else {},
                         "alias": str(m.get("alias") or mname).strip() or mname,
+                        "pod_id": str(m.get("pod_id") or "").strip(),
                         "start_timeout_s": _num("start_timeout_s", 600),
                         "idle_stop_s": _num("idle_stop_s", 0),
                         "idle_terminate_s": _num("idle_terminate_s", 0),
                         "deploy": m.get("deploy") if isinstance(m.get("deploy"), dict) else {},
                     }
-                    if not pod["image"]:
+                    if not pod["image"] and not pod["pod_id"]:
+                        # gateway-deployed pods need an image; a PINNED pod
+                        # (pod_id) already exists and needs none
                         logger.warning("gateway config: runpod pod model %r "
                                        "has no image — dropped", mname)
                         continue

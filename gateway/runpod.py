@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 import time
 from typing import Any
 
@@ -68,7 +69,7 @@ async def _rest(method: str, path: str, api_key_env: str,
                              headers={"Authorization": f"Bearer {_api_key(api_key_env)}"})
     if r.status_code >= 400:
         raise RunPodError(f"runpod {method} {path} -> {r.status_code}: "
-                          f"{r.text[:300]}")
+                          f"{r.text[:800]}")
     return r.json() if r.content else {}
 
 
@@ -115,6 +116,21 @@ def pod_state(pod: dict[str, Any]) -> str:
     return "UNKNOWN"
 
 
+async def pod_healthy(base_url: str) -> bool:
+    """A pod is serving when EITHER endpoint answers 200: llama.cpp's
+    /health, or /v1/models (Ollama — no /health — and every other
+    OpenAI-compatible image answers there)."""
+    async with httpx.AsyncClient(timeout=10.0) as ac:
+        for path in ("/health", "/v1/models"):
+            try:
+                r = await ac.get(f"{base_url}{path}")
+                if r.status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                continue
+    return False
+
+
 # ── Deploy payload builder ─────────────────────────────────────────────────
 
 def _pod_name(backend_name: str, model_key: str) -> str:
@@ -124,24 +140,26 @@ def _pod_name(backend_name: str, model_key: str) -> str:
 
 
 def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> dict[str, Any]:
-    """Config pod spec → POST /v1/pods payload. Convenience keys map to
-    the camelCase REST fields; the raw ``deploy`` dict always wins."""
+    """Config pod spec → POST /v1/pods payload (field names verified
+    against the live schema: interruptible, dockerStartCmd as an ARRAY,
+    ports as an ARRAY). The raw ``deploy`` dict always wins."""
     payload: dict[str, Any] = {
         "name": _pod_name(backend_name, model_key),
         "imageName": spec.get("image"),
-        "dockerArgs": spec.get("docker_args"),
         "ports": spec.get("ports"),
         "gpuCount": spec.get("gpu_count"),
         "containerDiskInGb": spec.get("container_disk_gb"),
         "env": spec.get("env") or None,
     }
+    if spec.get("docker_args"):
+        payload["dockerStartCmd"] = shlex.split(spec["docker_args"])
     if spec.get("gpu_type_ids"):
         payload["gpuTypeIds"] = spec["gpu_type_ids"]
     if spec.get("volume_gb"):
         payload["volumeInGb"] = spec["volume_gb"]
         payload["volumeMountPath"] = spec.get("volume_mount") or "/workspace"
     if spec.get("spot"):
-        payload["spot"] = True
+        payload["interruptible"] = True  # NOT 'spot' — schema-verified
     payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
     payload.update(spec.get("deploy") or {})  # raw escape hatch wins
     return payload
@@ -188,35 +206,50 @@ class _PodManager:
         return None
 
     async def ensure_ready(self) -> str:
-        """Find-or-deploy + health-wait. Returns the proxy base URL."""
+        """Pinned pod (config pod_id) → use it directly; else find-by-name
+        → resume stopped → deploy new. Then health-poll the proxy URL.
+        Returns the proxy base URL."""
         self.touch()
         async with self.lock:
             if self.is_ready():
                 return self.base_url()
-            pod = await self._find_pod()
-            if pod is None:
-                payload = deploy_payload(self.backend_name, self.model_key,
-                                         self.spec)
-                logger.info("runpod deploy [%s/%s]: %s", self.backend_name,
-                            self.model_key, payload)
-                pod = await deploy_pod(payload, self.api_key_env)
-                self.deployed_s = time.monotonic()
-            self.pod_id = str(pod.get("id"))
-            state = pod_state(pod)
-            if state not in ("RUNNING", "READY", "UNKNOWN"):
-                logger.info("runpod pod %s is %s — starting", self.pod_id, state)
-                await start_pod(self.pod_id, self.api_key_env)
-            # health-poll the proxy URL (llama.cpp /health); pods take
-            # 30s–minutes (image pull + model download on boot)
+            pinned = str(self.spec.get("pod_id") or "").strip()
+            if pinned:
+                # BYO pod — never deployed or renamed by the gateway
+                self.pod_id = pinned
+                pod = await self._find_pod()
+                if pod is None:
+                    raise RunPodError(
+                        f"runpod pod {pinned!r} (pod_id in config) not found")
+                if pod_state(pod) not in ("RUNNING", "READY", "UNKNOWN"):
+                    logger.info("runpod pod %s (pinned) is %s — starting",
+                                pinned, pod_state(pod))
+                    await start_pod(pinned, self.api_key_env)
+            else:
+                pod = await self._find_pod()
+                if pod is None:
+                    payload = deploy_payload(self.backend_name, self.model_key,
+                                             self.spec)
+                    logger.info("runpod deploy [%s/%s]: %s", self.backend_name,
+                                self.model_key, payload)
+                    pod = await deploy_pod(payload, self.api_key_env)
+                    self.deployed_s = time.monotonic()
+                self.pod_id = str(pod.get("id"))
+                if pod_state(pod) not in ("RUNNING", "READY", "UNKNOWN"):
+                    logger.info("runpod pod %s is %s — starting",
+                                self.pod_id, pod_state(pod))
+                    await start_pod(self.pod_id, self.api_key_env)
+            # health-poll the proxy URL (llama.cpp /health, Ollama
+            # /v1/models); pods take 30s–minutes (image pull + download)
             deadline = time.monotonic() + float(self.spec.get("start_timeout_s") or 600)
             while time.monotonic() < deadline:
-                self.pod_status = pod_state(
-                    await self._find_pod() or {"status": "UNKNOWN"})
+                pod_now = await self._find_pod()
+                self.pod_status = pod_state(pod_now) if pod_now else "UNKNOWN"
                 if self.pod_status in ("EXITED", "FAILED", "TERMINATED", "CRASHED"):
                     raise RunPodError(
                         f"runpod pod {self.pod_id} entered {self.pod_status} "
                         "during startup")
-                if await llamaserver.get_health(self.base_url(), timeout=10.0):
+                if await pod_healthy(self.base_url()):
                     self.ready = True
                     logger.info("runpod pod ready [%s/%s] at %s",
                                 self.backend_name, self.model_key,

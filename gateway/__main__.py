@@ -4,11 +4,38 @@ Plain HTTP on the configured bind:port (default 127.0.0.1:8010) — the
 OpenAI client ecosystem targets http://localhost:8010/v1. Config lives
 in data/gateway_config.json (hot-reloadable; see gateway/config.py),
 GGUFs in data/models (models_dir in the config).
+
+Secrets: every ``api_key_env`` named by the config is loaded from the OS
+keyring at boot (Workshop convention: service 'Workshop', username = the
+env var name) when the env var isn't already set — real env vars always
+win, and adding a NEW api_key_env to the config needs a restart (the
+bridge runs once at startup).
 """
 from __future__ import annotations
 
 import logging
+import os
 import sys
+
+
+def _load_secret_env() -> None:
+    """api_key_env vars → OS keyring fallback. Never logs values."""
+    try:
+        import keyring
+    except ImportError:
+        return
+    from .config import get_gateway_config
+    names = {b.get("api_key_env")
+             for b in get_gateway_config().backends.values()}
+    for name in sorted(n for n in names if n):
+        if os.environ.get(name):
+            continue
+        try:
+            val = keyring.get_password("Workshop", name)
+            if val:
+                os.environ[name] = val
+        except Exception:  # noqa: BLE001 — locked/missing keyring is fine
+            pass
 
 
 def main() -> None:
@@ -21,6 +48,8 @@ def main() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    _load_secret_env()
 
     from .config import get_gateway_config
     cfg = get_gateway_config()

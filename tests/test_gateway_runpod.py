@@ -77,7 +77,7 @@ def _patch_pod_http(monkeypatch, *, health=True, reply=None, stream=None):
     """Patch the pod HTTP bridge (health + chat + stream)."""
     calls: list[dict] = []
 
-    async def fake_health(base_url, timeout=5.0):
+    async def fake_health(base_url):
         calls.append({"health": base_url})
         return health
 
@@ -96,7 +96,7 @@ def _patch_pod_http(monkeypatch, *, health=True, reply=None, stream=None):
         for d in (stream or []):
             yield d
 
-    monkeypatch.setattr(lsrv, "get_health", fake_health)
+    monkeypatch.setattr(rp, "pod_healthy", fake_health)
     monkeypatch.setattr(lsrv, "post_chat", fake_post)
     monkeypatch.setattr(lsrv, "stream_chat", fake_stream)
     return calls
@@ -298,7 +298,10 @@ def test_pod_cold_deploy_and_chat(wired, gguf, monkeypatch):
     assert payload["name"] == "gw-rp-big"
     assert payload["imageName"] == "ghcr.io/ggml-org/llama.cpp:server-cuda"
     assert payload["gpuTypeIds"] == ["NVIDIA RTX A6000"]
-    assert payload["spot"] is True
+    assert payload["interruptible"] is True  # spot → interruptible (live schema)
+    assert payload["ports"] == ["8080/http"]  # array (live schema)
+    assert payload["dockerStartCmd"][0] == "-m"  # docker args → string array
+    assert "--port" in payload["dockerStartCmd"]
     # health-polled + proxied through the pod's proxy.runpod.net URL
     assert any(c["health"] == f"https://{POD_ID}-8080.proxy.runpod.net"
                for c in http)
@@ -324,7 +327,7 @@ def test_pod_deploy_payload_mapping(wired, gguf, monkeypatch):
     assert payload["volumeMountPath"] == "/data"
     assert payload["containerDiskInGb"] == 25
     assert payload["gpuCount"] == 2
-    assert "spot" not in payload  # false → omitted
+    assert "interruptible" not in payload  # spot false → omitted
     assert payload["imageName"] == "custom/img:latest"  # raw deploy wins
     assert payload["zzz"] == 1  # unknown raw fields pass through
 
@@ -404,15 +407,46 @@ def test_pod_startup_timeout_502(wired, gguf, monkeypatch):
     wired(cfg)
     _patch_rest(monkeypatch)
 
-    async def never_healthy(base_url, timeout=5.0):
+    async def never_healthy(base_url):
         return False
 
-    monkeypatch.setattr(lsrv, "get_health", never_healthy)
+    monkeypatch.setattr(rp, "pod_healthy", never_healthy)
     with TestClient(gw_app.app) as client:
         r = client.post("/v1/chat/completions", json={
             "model": "big", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 502
     assert "not healthy" in r.json()["error"]["message"]
+
+
+def test_pod_pinned_pod_id(wired, gguf, monkeypatch):
+    """BYO pod: pod_id pin skips find-by-name AND deploy; a stopped pinned
+    pod is started; a missing pinned pod is a 502."""
+    cfg = _rp_config(gguf, pod_id="pod-byo123", port=11434,
+                     alias="qwen2.5:0.5b", image="", docker_args="")
+    wired(cfg)
+    rest = _patch_rest(monkeypatch)
+    rest.pods.append({"id": "pod-byo123", "name": "disgusted_scarlet_sheep",
+                      "status": "EXITED"})
+    http = _patch_pod_http(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    kinds = rest.kinds()
+    assert "deploy" not in kinds          # never deployed
+    assert ("start", "pod-byo123") in rest.calls  # resumed instead
+    post = [c["post"] for c in http if "post" in c][0]
+    assert post[0] == "https://pod-byo123-11434.proxy.runpod.net"
+    assert post[1]["model"] == "qwen2.5:0.5b"  # alias → remote model tag
+
+    # pinned pod missing → 502
+    rest.pods.clear()
+    rp.reset_managers()
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
+    assert "not found" in r.json()["error"]["message"]
 
 
 def _stream_payload(model):
