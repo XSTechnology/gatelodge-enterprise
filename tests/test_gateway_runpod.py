@@ -480,6 +480,142 @@ def test_pod_stream(wired, gguf, monkeypatch):
     assert sp[1]["stream"] is True
 
 
+# ── serverless RAW job protocol (transport "runsync") ─────────────────────
+
+OLLAMA_SINGLE = {"created_at": "t", "done": True, "done_reason": "stop",
+                 "eval_count": 7, "eval_duration": 1, "load_duration": 1,
+                 "message": {"content": "one two three", "role": "assistant"},
+                 "model": "smollm2:135m", "prompt_eval_count": 5,
+                 "prompt_eval_duration": 1, "total_duration": 9}
+
+OLLAMA_CHUNKS = [
+    '{"model":"smollm2:135m","message":{"role":"assistant","content":"one "},"done":false}',
+    '{"model":"smollm2:135m","message":{"role":"assistant","content":"two "},"done":false}',
+    '{"model":"smollm2:135m","message":{"content":"","role":"assistant"},"done":true,'
+    '"done_reason":"stop","eval_count":3,"prompt_eval_count":4}',
+]
+
+
+def _patch_runsync(monkeypatch, output=None, error=None, calls=None):
+    async def fake_runsync(endpoint_id, body_input, api_key_env, timeout=120.0):
+        if calls is not None:
+            calls.append({"endpoint_id": endpoint_id, "input": body_input})
+        if error:
+            raise rp.RunPodError(error)
+        return output
+    monkeypatch.setattr(rp, "runsync_chat", fake_runsync)
+
+
+def test_runsync_transport_chat(wired, gguf, monkeypatch):
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["smollm"] = {
+        "endpoint_id": "ep-xyz", "transport": "runsync",
+        "remote_id": "smollm2:135m"}
+    wired(cfg)
+    calls: list[dict] = []
+    _patch_runsync(monkeypatch, output=OLLAMA_SINGLE, calls=calls)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "smollm", "temperature": 0.2, "max_tokens": 44,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model"] == "smollm"
+    assert body["served_by"]["backend"] == "rp"
+    assert body["choices"][0]["message"]["content"] == "one two three"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"] == {"prompt_tokens": 5, "completion_tokens": 7,
+                             "total_tokens": 12}
+    # raw protocol payload: model → remote_id, knobs forwarded
+    assert calls[0]["input"]["model"] == "smollm2:135m"
+    assert calls[0]["input"]["temperature"] == 0.2
+    assert calls[0]["input"]["max_tokens"] == 44
+
+
+def test_runsync_transport_chunked_output(wired, gguf, monkeypatch):
+    """stream:true worker output (list of Ollama chunk strings) joins."""
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["smollm"] = {
+        "endpoint_id": "ep-xyz", "transport": "runsync"}
+    wired(cfg)
+    _patch_runsync(monkeypatch, output=OLLAMA_CHUNKS)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "smollm",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["choices"][0]["message"]["content"] == "one two "
+    assert body["usage"]["completion_tokens"] == 3
+    assert body["usage"]["prompt_tokens"] == 4
+
+
+def test_runsync_transport_job_failed_502(wired, gguf, monkeypatch):
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["smollm"] = {
+        "endpoint_id": "ep-xyz", "transport": "runsync"}
+    wired(cfg)
+    _patch_runsync(monkeypatch, error="job FAILED: oom")
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "smollm",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
+    assert "FAILED" in r.json()["error"]["message"]
+
+
+def test_runsync_transport_stream_collects(wired, gguf, monkeypatch):
+    """Streaming through runsync: job collected, then emitted as SSE."""
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["smollm"] = {
+        "endpoint_id": "ep-xyz", "transport": "runsync"}
+    wired(cfg)
+    _patch_runsync(monkeypatch, output=OLLAMA_SINGLE)
+    with TestClient(gw_app.app) as client:
+        with client.stream("POST", "/v1/chat/completions", json={
+                "model": "smollm", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}) as r:
+            assert r.status_code == 200
+            lines = [ln for ln in r.iter_lines() if ln.strip()]
+    assert lines[-1] == "data: [DONE]"
+    events = [json.loads(ln[6:]) for ln in lines[:-1]]
+    content = "".join(e["choices"][0]["delta"].get("content") or ""
+                      for e in events)
+    assert content == "one two three"
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_runsync_default_transport_is_openai(wired, gguf, monkeypatch):
+    """No transport field → openai shim path (cloud client), not runsync."""
+    wired(_rp_config(gguf))
+    _patch_rest(monkeypatch)
+    rec, fake = _patch_cloud(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "rp:fast",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert rec["client_name"] == "runpod-rp-fast"  # cloud client used
+
+
+def test_ollama_output_mapping_shapes():
+    # single dict in a list (the worker's non-stream shape)
+    d = rp.ollama_output_to_openai([OLLAMA_SINGLE], "echo")
+    assert d["choices"][0]["message"]["content"] == "one two three"
+    assert d["usage"]["total_tokens"] == 12
+    assert d["model"] == "echo"
+    # chunk-string list (the worker's stream:true shape)
+    d2 = rp.ollama_output_to_openai(OLLAMA_CHUNKS, "echo")
+    assert d2["choices"][0]["message"]["content"] == "one two "
+    # garbage entries skipped
+    d3 = rp.ollama_output_to_openai(["not json", 42, OLLAMA_SINGLE], "e")
+    assert d3["choices"][0]["message"]["content"] == "one two three"
+    # empty output → empty content, stop
+    d4 = rp.ollama_output_to_openai(None, "e")
+    assert d4["choices"][0]["message"]["content"] == ""
+    assert d4["choices"][0]["finish_reason"] == "stop"
+
+
 async def test_pod_idle_reaper_stop_then_terminate(wired, gguf, monkeypatch):
     cfg = _rp_config(gguf, idle_stop_s=60, idle_terminate_s=600)
     wired(cfg)

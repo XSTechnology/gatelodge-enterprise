@@ -28,6 +28,7 @@ REST API (rest.runpod.io — the GraphQL API is deprecated):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shlex
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 REST_BASE = "https://rest.runpod.io/v1"
 SERVERLESS_URL = "https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
+SERVERLESS_API = "https://api.runpod.ai/v2/{endpoint_id}"
 
 
 class RunPodError(Exception):
@@ -169,6 +171,80 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> d
 
 def serverless_base_url(endpoint_id: str) -> str:
     return SERVERLESS_URL.format(endpoint_id=endpoint_id)
+
+
+# ── Serverless RAW job protocol (transport "runsync") ──────────────────────
+
+async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
+                       api_key_env: str, timeout: float = 120.0) -> Any:
+    """POST /v2/<ep>/runsync with {"input": {...}}; poll /status/{id} while
+    the job queues or runs (scale-to-zero cold start). Returns the job's
+    OUTPUT verbatim (worker-specific shape — map with ollama_output_to_openai
+    or your own)."""
+    base = SERVERLESS_API.format(endpoint_id=endpoint_id)
+    hdr = {"Authorization": f"Bearer {_api_key(api_key_env)}"}
+    async with httpx.AsyncClient(timeout=timeout) as ac:
+        r = await ac.post(f"{base}/runsync", json={"input": body_input},
+                          headers=hdr)
+    if r.status_code >= 400:
+        raise RunPodError(f"runpod serverless runsync -> {r.status_code}: "
+                          f"{r.text[:300]}")
+    job = r.json()
+    deadline = time.monotonic() + timeout
+    while job.get("status") in ("IN_QUEUE", "IN_PROGRESS"):
+        if time.monotonic() >= deadline:
+            raise RunPodError(f"runpod serverless job {job.get('id')} still "
+                              f"{job.get('status')} after {timeout:.0f}s")
+        await asyncio.sleep(1.0)
+        async with httpx.AsyncClient(timeout=timeout) as ac:
+            r = await ac.get(f"{base}/status/{job.get('id')}", headers=hdr)
+        if r.status_code >= 400:
+            raise RunPodError(f"runpod serverless status -> {r.status_code}: "
+                              f"{r.text[:300]}")
+        job = r.json()
+    if job.get("status") != "COMPLETED":
+        raise RunPodError(f"runpod serverless job {job.get('status')}: "
+                          f"{str(job.get('error'))[:300]}")
+    return job.get("output")
+
+
+def ollama_output_to_openai(output: Any, model_echo: str) -> dict[str, Any]:
+    """RunPod Ollama-worker output → OpenAI chat.completion. Handles BOTH
+    worker shapes: a single Ollama chat dict ({message, eval_count,
+    prompt_eval_count, done_reason}) or a LIST of Ollama chunk JSON strings
+    (stream:true collection — the last done chunk carries the stats)."""
+    import uuid
+
+    parts: list[str] = []
+    final: dict[str, Any] = {}
+    for it in (output if isinstance(output, list) else [output]):
+        if isinstance(it, str):
+            try:
+                it = json.loads(it)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if not isinstance(it, dict):
+            continue
+        msg = it.get("message") or {}
+        if msg.get("content"):
+            parts.append(msg["content"])
+        if it.get("done"):
+            final = it
+    pt = int(final.get("prompt_eval_count") or 0)
+    ct = int(final.get("eval_count") or 0)
+    return {
+        "id": f"chatcmpl-rp-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_echo,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "".join(parts)},
+            "finish_reason": final.get("done_reason") or "stop",
+        }],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                  "total_tokens": pt + ct},
+    }
 
 
 # ── Pod manager ────────────────────────────────────────────────────────────

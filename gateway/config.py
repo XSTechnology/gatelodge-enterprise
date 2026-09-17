@@ -250,10 +250,22 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                     continue
                 m = dict(m)
                 if m.get("endpoint_id"):
-                    # serverless — keep endpoint_id + remote_id only
+                    # serverless — endpoint_id + remote_id + transport:
+                    # "openai" (the /openai/v1 shim, default) or "runsync"
+                    # (raw job protocol — Ollama-style workers whose OpenAI
+                    # shim is absent/broken). timeout_s (0 = queue default)
+                    # covers scale-to-zero cold starts, which routinely
+                    # exceed the global queue timeout.
+                    transport = str(m.get("transport") or "openai").strip().lower()
+                    try:
+                        tmo = float(m.get("timeout_s") or 0)
+                    except (TypeError, ValueError):
+                        tmo = 0.0
                     rmodels[str(mname)] = {
                         "endpoint_id": str(m["endpoint_id"]).strip(),
                         "remote_id": str(m.get("remote_id") or mname).strip(),
+                        "transport": transport if transport in ("openai", "runsync") else "openai",
+                        "timeout_s": tmo,
                     }
                 else:
                     # pod lifecycle — numbers coerced, deploy dict kept raw

@@ -33,14 +33,18 @@ Implemented:
                               llama-server over HTTP): OpenAI passthrough
                               via the cloud client path (api_key_env).
   runpod backends            — type "runpod" (api_key_env). SERVERLESS
-                              models ({endpoint_id, remote_id}): OpenAI
-                              passthrough at
-                              api.runpod.ai/v2/<endpoint_id>/openai/v1.
-                              POD models ({gpu_type_ids, image,
-                              docker_args, ...}): lifecycle-managed GPU
-                              pods — find-or-deploy on first request,
-                              health-polled via the pod's proxy.runpod.net
-                              URL, idle-stop then idle-terminate.
+                              models ({endpoint_id, remote_id, transport}):
+                              "openai" (default) passes through the
+                              endpoint's /openai/v1 shim; "runsync" speaks
+                              the raw job protocol (Ollama-style workers —
+                              runsync + status polling, Ollama→OpenAI
+                              output mapping; streaming collects then
+                              emits). POD models ({gpu_type_ids, image,
+                              docker_args, ...} or pod_id pin):
+                              lifecycle-managed GPU pods — find-or-deploy
+                              on first request, health-polled via the
+                              pod's proxy.runpod.net URL, idle-stop then
+                              idle-terminate.
   GET  /healthz              — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
   GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
@@ -356,6 +360,27 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         resp["model"] = requested
         return resp, backend_name, model_key
 
+    if btype == "runpod" and backend["models"][model_key].get("transport") == "runsync":
+        # Serverless RAW job protocol (Ollama-style worker): runsync + poll,
+        # output mapped Ollama → OpenAI. Not streamable incrementally (the
+        # /stream SSE endpoint is not available on all endpoints) — streaming
+        # requests collect then emit.
+        m = backend["models"][model_key]
+        body_input: dict[str, Any] = {
+            "model": m["remote_id"],
+            "messages": body.messages,
+        }
+        if body.temperature is not None:
+            body_input["temperature"] = body.temperature
+        if body.max_tokens:
+            body_input["max_tokens"] = body.max_tokens
+        out = await runpod.runsync_chat(
+            m["endpoint_id"], body_input,
+            backend.get("api_key_env") or "RUNPOD_API_KEY",
+            m.get("timeout_s") or cfg.queue["timeout_s"])
+        resp = runpod.ollama_output_to_openai(out, requested)
+        return resp, backend_name, model_key
+
     # Cloud-shaped path: openai backends, REMOTE llama-server, and runpod
     # SERVERLESS all speak OpenAI over HTTP with a bearer key.
     remote_id = backend["models"][model_key]
@@ -659,10 +684,35 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     if data == "[DONE]":
                         break
                     yield f"data: {data}\n\n"
+            elif (backend.get("type") == "runpod"
+                    and backend["models"][model_key].get("endpoint_id")
+                    and backend["models"][model_key].get("transport") == "runsync"):
+                # Serverless RAW job protocol — no incremental SSE from the
+                # endpoint; collect the job, then emit as OpenAI chunks.
+                m = backend["models"][model_key]
+                body_input = {
+                    "model": m["remote_id"],
+                    "messages": body.messages,
+                }
+                if body.temperature is not None:
+                    body_input["temperature"] = body.temperature
+                if body.max_tokens:
+                    body_input["max_tokens"] = body.max_tokens
+                out = await runpod.runsync_chat(
+                    m["endpoint_id"], body_input,
+                    backend.get("api_key_env") or "RUNPOD_API_KEY",
+                    m.get("timeout_s") or cfg.queue["timeout_s"])
+                resp = runpod.ollama_output_to_openai(out, requested)
+                choice = resp["choices"][0]
+                yield _chunk({"role": "assistant", "content": ""})
+                if choice["message"].get("content"):
+                    yield _chunk({"content": choice["message"]["content"]})
+                yield _chunk({}, finish=choice.get("finish_reason") or "stop")
             else:
                 # cloud passthrough — the remote stream is already
                 # OpenAI-chunk-shaped (role/finish chunks included);
-                # remote llama-server and runpod serverless share this path
+                # remote llama-server and runpod serverless (openai
+                # transport) share this path
                 remote_id = backend["models"][model_key]
                 client_name = backend_name
                 cloud_backend = backend
