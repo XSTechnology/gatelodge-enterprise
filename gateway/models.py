@@ -307,6 +307,62 @@ def installed_ggufs(models_dir: str | Path) -> list[dict[str, Any]]:
     return out
 
 
+# ─── Pools (worker pools) ──────────────────────────────────────────────────
+
+class _InstancePool:
+    """k homogeneous instances of ONE model behind a free-list.
+
+    acquire() returns a free instance, creating one (up to max_workers)
+    when none is free — loads run in a worker thread so the event loop
+    keeps serving other models while a new worker boots. Instances are
+    EXCLUSIVE while checked out: the pool itself is the concurrency gate
+    (the per-instance locks are no longer taken on the request path).
+
+    VRAM cost is k × the model's footprint — size worker pools for small
+    hot models, not the 27B."""
+
+    def __init__(self, name: str, max_workers: int, make):
+        self.name = name
+        self.max_workers = max(1, int(max_workers))
+        self._make = make
+        self.instances: list[_Instance] = []
+        self.sig: tuple | None = None  # set by the engine (config shape)
+        self._free: asyncio.Queue = asyncio.Queue()
+        self._create_lock = asyncio.Lock()
+
+    def _new_instance(self) -> _Instance:
+        inst = self._make()
+        self.instances.append(inst)
+        return inst
+
+    async def acquire(self) -> _Instance:
+        while True:
+            try:
+                return self._free.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if len(self.instances) < self.max_workers:
+                async with self._create_lock:
+                    try:  # someone may have released while we waited
+                        return self._free.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    if len(self.instances) < self.max_workers:
+                        return await asyncio.to_thread(self._new_instance)
+            else:
+                return await self._free.get()
+
+    def release(self, inst: _Instance) -> None:
+        self._free.put_nowait(inst)
+
+    def first_or_create(self) -> _Instance:
+        """Synchronous preload/registry access: the first instance,
+        created on the caller's thread when the pool is empty."""
+        if not self.instances:
+            return self._new_instance()
+        return self.instances[0]
+
+
 # ─── Engine ────────────────────────────────────────────────────────────────
 
 class EmbeddedEngine:
@@ -326,11 +382,11 @@ class EmbeddedEngine:
     def __init__(self, config: GatewayConfig | None = None):
         self.chat = _ChatEndpoint(self)
         self._config = config or get_gateway_config()
-        self._instances: dict[str, _Instance] = {}
-        self._instance_cfg: dict[str, tuple[str, int, str]] = {}
-        # Embedding instances live in their OWN registry: same GGUF file
-        # could appear in both, but the Llama objects differ (pooling vs
-        # generation context) and each has its own lock.
+        # Chat models live in POOLS (worker pools: k homogeneous instances,
+        # lazily created, exclusively checked out — concurrent requests to
+        # one model run in parallel instead of serializing on a lock).
+        self._pools: dict[str, _InstancePool] = {}
+        # Embedding instances stay SINGLE (llama_cpp batches internally).
         self._embed_instances: dict[str, _Instance] = {}
         self._embed_instance_cfg: dict[str, tuple[str, int, str]] = {}
 
@@ -355,14 +411,17 @@ class EmbeddedEngine:
                 return str(cand)
         return ""
 
-    def _get_instance(self, model_name: str | None) -> _Instance:
+    def _pool_for(self, model_name: str | None) -> _InstancePool:
+        """Pool for a model, built from the CURRENT config entry. A config
+        change (gguf/ctx/placement/workers) replaces the pool — in-flight
+        requests keep their checked-out instances (old pool is GC'd)."""
         self._config.maybe_reload()
         name = (model_name or "").strip()
         entry = self._config.local_models().get(name)
         if entry is None:
             # Auto-discovery: any GGUF in models_dir is servable by its
-            # stem with defaults (ctx 4096, default placement). Config
-            # models always win — custom ctx/placement, paths outside
+            # stem with defaults (ctx 4096, one worker). Config models
+            # always win — custom ctx/placement/workers, paths outside
             # models_dir, and they shadow same-named stems.
             if name and self.resolve_gguf(name, self._config.models_dir):
                 entry = {"gguf": name, "ctx": 4096, "placement": ""}
@@ -381,17 +440,39 @@ class EmbeddedEngine:
         except (TypeError, ValueError):
             ctx = 4096
         placement = _cfg_gpu(entry.get("placement", ""))
-        want = (path, ctx, placement)
-        inst = self._instances.get(name)
-        if inst is not None and self._instance_cfg.get(name) != want:
+        try:
+            workers = max(1, int(entry.get("workers") or 1))
+        except (TypeError, ValueError):
+            workers = 1
+        want = (path, ctx, placement, workers)
+        pool = self._pools.get(name)
+        if pool is not None and pool.sig != want:
             logger.info("gateway model %r config changed — reloading", name)
-            self._instances.pop(name, None)
-            inst = None
-        if inst is None:
-            inst = _Instance(name, path, ctx, placement)
-            self._instances[name] = inst
-            self._instance_cfg[name] = want
-        return inst
+            self._pools.pop(name, None)
+            pool = None
+        if pool is None:
+            pool = _InstancePool(name, workers,
+                                 make=lambda: _Instance(name, path, ctx, placement))
+            pool.sig = want
+            self._pools[name] = pool
+        return pool
+
+    def _get_instance(self, model_name: str | None) -> _Instance:
+        """Sync registry/preload access: first instance of the pool,
+        created on the caller's thread when empty (tests, /admin/load)."""
+        return self._pool_for(model_name).first_or_create()
+
+    async def _acquire(self, model_name: str | None) -> _Instance:
+        """Check out an exclusive instance for a request (worker pool)."""
+        return await self._pool_for(model_name).acquire()
+
+    def _release(self, model_name: str | None, inst: _Instance) -> None:
+        pool = self._pools.get((model_name or "").strip())
+        if pool is not None:
+            pool.release(inst)
+        # pool replaced mid-request (config change) — the old pool (and the
+        # checked-out instance with it) is garbage collected; dropping the
+        # release is correct.
 
     def _get_embedding_instance(self, model_name: str | None) -> _Instance:
         """Lazily load / return an EMBEDDING instance (config-defined only —
@@ -440,18 +521,18 @@ class EmbeddedEngine:
                 raise EmbeddedLLMError(f"embedded embedding failed: {e}") from e
 
     def unload(self, which: str = "all") -> int:
-        """Drop instances to free VRAM (chat AND embedding registries).
+        """Drop pools/instances to free VRAM (chat AND embedding).
         Returns number of instances unloaded."""
         if which == "all":
-            names = list(self._instances) + list(self._embed_instances)
+            names = list(self._pools) + list(self._embed_instances)
         else:
-            names = ([which] if which in self._instances
+            names = ([which] if which in self._pools
                      or which in self._embed_instances else [])
         n = 0
         for nm in names:
-            if self._instances.pop(nm, None) is not None:
-                self._instance_cfg.pop(nm, None)
-                n += 1
+            pool = self._pools.pop(nm, None)
+            if pool is not None:
+                n += len(pool.instances)
             if self._embed_instances.pop(nm, None) is not None:
                 self._embed_instance_cfg.pop(nm, None)
                 n += 1
@@ -459,21 +540,23 @@ class EmbeddedEngine:
         return n
 
     def is_loaded(self) -> bool:
-        return bool(self._instances) or bool(self._embed_instances)
+        return bool(self._pools) or bool(self._embed_instances)
 
     def loaded_models(self) -> list[dict[str, Any]]:
         """Currently loaded instances, Ollama-ps shaped (for /healthz in
-        Stage 2 and the console in Stage 5). Embedding instances carry
+        Stage 2 and the console in Stage 5). Pooled models with more than
+        one worker carry a worker index; embedding instances carry
         role 'embed'."""
 
-        def _entry(inst: _Instance, role: str = "gateway") -> dict[str, Any]:
+        def _entry(inst: _Instance, role: str = "gateway",
+                   worker: int | None = None) -> dict[str, Any]:
             try:
                 size = Path(inst.path).stat().st_size
             except OSError:
                 size = 0
             n_ctx_raw = getattr(getattr(inst, "llama", None), "n_ctx", 0)
             n_ctx = int(n_ctx_raw() if callable(n_ctx_raw) else (n_ctx_raw or 0))
-            return {
+            out = {
                 "name": Path(inst.path).stem,
                 "alias": inst.name,
                 "description": f"{inst.name} · {inst.path}",
@@ -489,9 +572,17 @@ class EmbeddedEngine:
                 "expires": "",
                 "digest": "",
             }
+            if worker is not None:
+                out["worker"] = worker
+            return out
 
-        return ([_entry(i) for i in self._instances.values()]
-                + [_entry(i, role="embed") for i in self._embed_instances.values()])
+        out: list[dict[str, Any]] = []
+        for pool in self._pools.values():
+            many = len(pool.instances) > 1
+            for i, inst in enumerate(pool.instances):
+                out.append(_entry(inst, worker=i if many else None))
+        return out + [_entry(i, role="embed")
+                      for i in self._embed_instances.values()]
 
     # ── tool-calling helpers ──
 
@@ -625,17 +716,17 @@ class _CompletionsEndpoint:
         max_tokens = kwargs.get("max_tokens")
         temperature = kwargs.get("temperature")
 
-        inst = self._engine._get_instance(model_name)
-        norm = self._engine._normalize_messages(messages, tools)
-
+        inst = await self._engine._acquire(model_name)
         llm_kwargs: dict[str, Any] = {"temperature": temperature if temperature is not None else 0.1}
         if max_tokens:
             llm_kwargs["max_tokens"] = max_tokens
-
         if stream:
-            return self._stream(inst, norm, llm_kwargs)
-
-        async with inst.lock:
+            # the generator owns the checkout; it releases in its finally
+            return self._stream(model_name, inst,
+                                self._engine._normalize_messages(messages, tools),
+                                llm_kwargs)
+        try:
+            norm = self._engine._normalize_messages(messages, tools)
             try:
                 msg, usage = await asyncio.to_thread(
                     self._engine._completion_sync, inst, norm, llm_kwargs
@@ -645,36 +736,39 @@ class _CompletionsEndpoint:
             except Exception as e:
                 raise EmbeddedLLMError(f"embedded generation failed: {e}") from e
 
-        # Tool-calling: parse JSON tool call out of content when tools were offered
-        if tools and msg.content:
-            tc = self._engine._parse_tool_call(msg.content, tools)
-            if tc is not None:
-                msg.tool_calls = [tc]
-                logger.info("Embedded tool call: %s(%s)", tc.function.name, tc.function.arguments[:80])
-            elif _is_echo(msg.content, messages) or _is_instruction_regurgitation(msg.content):
-                # Model echoed the question or parroted the tool instruction —
-                # retry once as plain chat (no tool instruction).
-                logger.info("Embedded echo detected — retrying without tool instruction")
-                plain = [m for m in messages if m.get("role") in ("system", "user", "assistant")]
-                # Same template constraint: fold any non-leading system
-                # messages into one at the front.
-                sys_txt = "\n\n".join(
-                    (m.get("content") or "") for m in plain if m.get("role") == "system"
-                ).strip()
-                plain = [m for m in plain if m.get("role") != "system"]
-                if sys_txt:
-                    plain.insert(0, {"role": "system", "content": sys_txt})
-                retry_kwargs = dict(llm_kwargs)
-                async with inst.lock:
+            # Tool-calling: parse JSON tool call out of content when tools were offered
+            if tools and msg.content:
+                tc = self._engine._parse_tool_call(msg.content, tools)
+                if tc is not None:
+                    msg.tool_calls = [tc]
+                    logger.info("Embedded tool call: %s(%s)", tc.function.name, tc.function.arguments[:80])
+                elif _is_echo(msg.content, messages) or _is_instruction_regurgitation(msg.content):
+                    # Model echoed the question or parroted the tool instruction —
+                    # retry once as plain chat (no tool instruction). Same worker:
+                    # we still hold the exclusive checkout.
+                    logger.info("Embedded echo detected — retrying without tool instruction")
+                    plain = [m for m in messages if m.get("role") in ("system", "user", "assistant")]
+                    # Same template constraint: fold any non-leading system
+                    # messages into one at the front.
+                    sys_txt = "\n\n".join(
+                        (m.get("content") or "") for m in plain if m.get("role") == "system"
+                    ).strip()
+                    plain = [m for m in plain if m.get("role") != "system"]
+                    if sys_txt:
+                        plain.insert(0, {"role": "system", "content": sys_txt})
+                    retry_kwargs = dict(llm_kwargs)
                     try:
                         msg, usage = await asyncio.to_thread(
                             self._engine._completion_sync, inst, plain, retry_kwargs
                         )
                     except Exception as e:
                         raise EmbeddedLLMError(f"embedded retry failed: {e}") from e
-        return _Completion(choices=[_Choice(message=msg)], usage=usage)
+            return _Completion(choices=[_Choice(message=msg)], usage=usage)
+        finally:
+            self._engine._release(model_name, inst)
 
-    async def _stream(self, inst: _Instance, messages: list[dict], llm_kwargs: dict) -> AsyncIterator[_Chunk]:
+    async def _stream(self, model_name: str | None, inst: _Instance,
+                      messages: list[dict], llm_kwargs: dict) -> AsyncIterator[_Chunk]:
         """Bridge the sync llama_cpp chunk generator into an async iterator.
 
         Thinking models (Qwen3-style) emit reasoning before a </think>
@@ -725,7 +819,7 @@ class _CompletionsEndpoint:
             except Exception as e:  # surface generation errors to the consumer
                 loop.call_soon_threadsafe(q.put_nowait, ("error", e))
 
-        async with inst.lock:
+        try:
             thread = threading.Thread(target=_worker, daemon=True)
             thread.start()
             while True:
@@ -738,6 +832,8 @@ class _CompletionsEndpoint:
                 text = delta.get("content")
                 if text:
                     yield _Chunk(choices=[_ChoiceDelta(delta={"content": text})])
+        finally:
+            self._engine._release(model_name, inst)
 
 
 # ─── Process-wide singleton ────────────────────────────────────────────────

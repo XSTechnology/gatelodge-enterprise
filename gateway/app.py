@@ -65,7 +65,7 @@ All data endpoints (including /healthz) require it when configured.
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Deferred to v2: /v1/completions, worker pools.
+Deferred to v2: /v1/completions.
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.

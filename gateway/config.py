@@ -52,6 +52,10 @@ Semantics:
 - ``gguf`` is a GGUF stem or path, resolved against ``models_dir``.
 - ``placement`` per model: '' = llama.cpp default, 'N' = pin to card N,
   'auto' = free-VRAM-weighted split across all cards.
+- ``workers`` per embedded model (default 1): k lazily-created in-process
+  instances behind a free-list — k concurrent requests to that model run
+  in PARALLEL instead of serializing on one instance's lock. VRAM cost is
+  k × the model's footprint; size pools for small hot models.
 - Alias chains list 'backend:model' entries; Stage 1 executes the FIRST
   entry only (hedge racing arrives in Stage 3). ``local_only`` aliases
   must never leave the machine (privacy guarantee once cloud exists).
@@ -187,7 +191,15 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
             continue
         entry: dict[str, Any] = {"type": btype}
         if btype == EMBEDDED_BACKEND:
-            entry["models"] = _normalize_local_models(b.get("models"))
+            models = _normalize_local_models(b.get("models"))
+            for m in models.values():
+                try:
+                    # worker pool size (k in-process instances for parallel
+                    # serving; VRAM cost is k × model size)
+                    m["workers"] = max(1, int(m.get("workers") or 1))
+                except (TypeError, ValueError):
+                    m["workers"] = 1
+            entry["models"] = models
             # Embedding GGUFs are SEPARATE instances (Llama(embedding=True) —
             # pooling context); never auto-discovered (a chat GGUF mistaken
             # for an embedder would return garbage vectors).
