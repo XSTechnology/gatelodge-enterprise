@@ -84,6 +84,8 @@ def wired(tmp_path, monkeypatch):
         monkeypatch.setattr(gw_config, "_CONFIG", cfg)
         engine = gw_models.EmbeddedEngine(cfg)
         monkeypatch.setattr(gw_models, "_ENGINE", engine)
+        # JSONL request log → tmp (never touch the real data/gateway_log.jsonl)
+        monkeypatch.setattr(gw_app, "_LOG_PATH", tmp_path / "gateway_log.jsonl")
         return cfgfile, cfg, engine
     return _wire
 
@@ -247,7 +249,7 @@ def test_stream_engine_error_yields_error_event(wired, gguf):
     assert len(events) == 1
     err = events[0].get("error") or {}
     assert err.get("type") == "server_error"
-    assert err.get("code") == "embedded_error"
+    assert err.get("code") == "execution_error"
     assert "not found" in err.get("message", "")
 
 

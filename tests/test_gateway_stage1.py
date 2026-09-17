@@ -95,6 +95,8 @@ def wired(tmp_path, monkeypatch):
         monkeypatch.setattr(gw_config, "_CONFIG", cfg)
         engine = gw_models.EmbeddedEngine(cfg)
         monkeypatch.setattr(gw_models, "_ENGINE", engine)
+        # JSONL request log → tmp (never touch the real data/gateway_log.jsonl)
+        monkeypatch.setattr(gw_app, "_LOG_PATH", tmp_path / "gateway_log.jsonl")
         return cfgfile, cfg, engine
     return _wire
 
@@ -596,14 +598,25 @@ def test_chat_stream_now_implemented(wired, gguf):
     _with_fake_llama(fn, stream_script=["Hi", " there"])
 
 
-def test_chat_cloud_backend_rejected_stage1(wired, gguf):
-    wired(_local_config(gguf, extra_backends={"groq": GROQ}))
+def test_chat_cloud_missing_api_key_502(wired, gguf, monkeypatch):
+    """Stage 3 executes cloud backends — a backend whose api_key_env points
+    at an unset variable fails cleanly (no network attempt)."""
+    import gateway.cloud as gw_cloud
+    monkeypatch.setenv("GATEWAY_TEST_KEY_DEFINITELY_UNSET", "")  # ensure empty
+    monkeypatch.delenv("GATEWAY_TEST_KEY_DEFINITELY_UNSET", raising=False)
+    wired(_local_config(gguf, extra_backends={
+        "groq": {"type": "openai", "base_url": "http://127.0.0.1:9/v1",
+                 "api_key_env": "GATEWAY_TEST_KEY_DEFINITELY_UNSET",
+                 "models": {"cloud-fast": "llama-3.1-8b-instant"}}}))
+    # no cloud client may even be constructed with the real constructor
+    monkeypatch.setattr(gw_cloud, "_CLIENTS", {})
     with TestClient(gw_app.app) as client:
         r = client.post("/v1/chat/completions", json={
             "model": "groq:cloud-fast",
             "messages": [{"role": "user", "content": "hi"}]})
-    assert r.status_code == 400
-    assert "Stage 3" in r.json()["error"]["message"]
+    assert r.status_code == 502
+    assert "GATEWAY_TEST_KEY_DEFINITELY_UNSET" in r.json()["error"]["message"]
+    assert r.json()["error"]["type"] == "server_error"
 
 
 def test_chat_empty_messages_400_openai_shaped(wired, gguf):

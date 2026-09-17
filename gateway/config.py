@@ -260,13 +260,18 @@ class GatewayConfig:
 
     # ── resolution ──
 
-    def resolve_model(self, name: str | None) -> tuple[str, str]:
-        """Request ``model`` → (backend_name, model_key).
+    def resolve_chain(self, name: str | None) -> dict[str, Any]:
+        """Request ``model`` → execution plan (Stage 3).
 
-        Order: alias (primary chain entry — first entry only in Stage 1),
+        {"entries": [(backend_name, model_key), ...],  # chain order
+         "hedge_s": float,                              # 0 = no hedge race
+         "local_only": bool}                            # privacy flag
+
+        Order: alias (full chain; hedge_s + local_only from the alias),
         then the direct 'backend:model' form, then a bare backend model
-        name (embedded backend preferred). Cloud targets resolve normally;
-        the app layer rejects them until Stage 3 wires cloud execution.
+        name (embedded backend preferred) — both single-entry, no hedge.
+        ``local_only`` plans keep ONLY embedded entries (they must never
+        leave the machine, whatever the chain says).
 
         Raises GatewayConfigError for anything unknown (→ HTTP 400).
         """
@@ -280,18 +285,38 @@ class GatewayConfig:
             chain = alias.get("chain") or []
             if not chain:
                 raise GatewayConfigError(f"alias {name!r} has an empty chain")
-            return self._resolve_entry(chain[0], alias=name)
-        if ":" in name:
-            return self._resolve_entry(name)
-        # Bare model name — search the embedded backend first
-        local = self.local_backend_name()
-        if local and name in (self.backends.get(local) or {}).get("models", {}):
-            return local, name
-        for bname, b in self.backends.items():
-            if name in (b.get("models") or {}):
-                return bname, name
-        raise GatewayConfigError(
-            f"unknown model: {name!r} (not an alias or a backend model)")
+            entries = [self._resolve_entry(c, alias=name) for c in chain]
+            plan = {"entries": entries,
+                    "hedge_s": float(alias.get("hedge_s") or 0),
+                    "local_only": bool(alias.get("local_only"))}
+        elif ":" in name:
+            plan = {"entries": [self._resolve_entry(name)],
+                    "hedge_s": 0.0, "local_only": False}
+        else:
+            local = self.local_backend_name()
+            if local and name in (self.backends.get(local) or {}).get("models", {}):
+                entries = [(local, name)]
+            else:
+                found = next(((bname, name) for bname, b in self.backends.items()
+                              if name in (b.get("models") or {})), None)
+                if found is None:
+                    raise GatewayConfigError(
+                        f"unknown model: {name!r} (not an alias or a backend model)")
+                entries = [found]
+            plan = {"entries": entries, "hedge_s": 0.0, "local_only": False}
+        if plan["local_only"]:
+            plan["entries"] = [
+                (b, m) for b, m in plan["entries"]
+                if (self.backends.get(b) or {}).get("type") == EMBEDDED_BACKEND]
+            if not plan["entries"]:
+                raise GatewayConfigError(
+                    f"alias {name!r} is local_only but its chain has no "
+                    "local backend entries")
+        return plan
+
+    def resolve_model(self, name: str | None) -> tuple[str, str]:
+        """Primary chain entry of resolve_chain (Stage-1 compatibility)."""
+        return self.resolve_chain(name)["entries"][0]
 
     def _resolve_entry(self, entry: str, alias: str | None = None) -> tuple[str, str]:
         backend_name, sep, model_key = entry.partition(":")
