@@ -937,3 +937,191 @@ def test_pod_model_without_image_dropped(wired, gguf, monkeypatch):
             "model": "rp:broken",
             "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400
+
+
+# ── runpod-public backend (Public Endpoints) ──────────────────────────────
+
+def _rp_public_config(gguf):
+    """Config with a runpod-public backend."""
+    return {
+        "backends": {
+            "local": {"type": "embedded", "models": {}},
+            "pub": {
+                "type": "runpod-public",
+                "api_key_env": "RUNPOD_API_KEY_TEST",
+                "models": {
+                    "flux": {
+                        "model_slug": "black-forest-labs-flux-1-schnell",
+                        "remote_id": "flux-1-schnell",
+                    },
+                    "flux-slow": {
+                        "model_slug": "black-forest-labs-flux-1-schnell",
+                        "remote_id": "flux-1-schnell",
+                        "timeout_s": 300,
+                    },
+                },
+            },
+        },
+        "aliases": {},
+        "queue": {"max_waiting": 4, "timeout_s": 120},
+    }
+
+
+def _patch_public_runsync(monkeypatch, output=None, error=None, calls=None):
+    async def fake_public_runsync(model_slug, body_input, api_key_env,
+                                   timeout=120.0, policy=None):
+        if calls is not None:
+            calls.append({"model_slug": model_slug, "input": body_input,
+                          "policy": policy})
+        if error:
+            raise rp.RunPodError(error)
+        return output
+    monkeypatch.setattr(rp, "runsync_public_chat", fake_public_runsync)
+
+
+def test_public_endpoint_chat(wired, gguf, monkeypatch):
+    """Public endpoint chat via runsync protocol."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    calls: list[dict] = []
+    _patch_public_runsync(monkeypatch, output=OLLAMA_SINGLE, calls=calls)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "pub:flux", "temperature": 0.5,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model"] == "pub:flux"
+    assert body["served_by"]["backend"] == "pub"
+    assert body["choices"][0]["message"]["content"] == "one two three"
+    # runsync payload: model → remote_id, model_slug used for URL
+    assert calls[0]["model_slug"] == "black-forest-labs-flux-1-schnell"
+    assert calls[0]["input"]["model"] == "flux-1-schnell"
+    assert calls[0]["input"]["temperature"] == 0.5
+
+
+def test_public_endpoint_stream(wired, gguf, monkeypatch):
+    """Public endpoint streaming — collect-then-emit."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    _patch_public_runsync(monkeypatch, output=OLLAMA_SINGLE)
+    with TestClient(gw_app.app) as client:
+        with client.stream("POST", "/v1/chat/completions", json={
+                "model": "pub:flux", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}) as r:
+            assert r.status_code == 200
+            lines = [ln for ln in r.iter_lines() if ln.strip()]
+    assert lines[-1] == "data: [DONE]"
+    events = [json.loads(ln[6:]) for ln in lines[:-1]]
+    content = "".join(e["choices"][0]["delta"].get("content") or ""
+                      for e in events)
+    assert content == "one two three"
+
+
+def test_public_endpoint_custom_timeout(wired, gguf, monkeypatch):
+    """Per-model timeout_s overrides default queue timeout."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    calls: list[dict] = []
+    _patch_public_runsync(monkeypatch, output=OLLAMA_SINGLE, calls=calls)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "pub:flux-slow",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+
+
+def test_public_endpoint_error_502(wired, gguf, monkeypatch):
+    """Public endpoint failure → 502."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    _patch_public_runsync(monkeypatch, error="endpoint not found")
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "pub:flux",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
+    assert "endpoint not found" in r.json()["error"]["message"]
+
+
+def test_public_endpoint_healthz(wired, gguf, monkeypatch):
+    """Public endpoints show in /healthz backends section."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    with TestClient(gw_app.app) as client:
+        hz = client.get("/healthz").json()
+    # Check backends section
+    assert "pub" in hz["backends"]
+    pub_backend = hz["backends"]["pub"]
+    assert pub_backend["type"] == "runpod-public"
+    assert pub_backend["configured_models"] == 2
+    # /v1/models carries the full model detail
+    models = client.get("/v1/models").json()["data"]
+    pub_models = [m for m in models if m.get("owned_by") == "pub"]
+    assert len(pub_models) == 2
+    flux = [m for m in pub_models if m["id"] == "flux"][0]
+    assert flux["status"] == "available"
+    assert flux["model_slug"] == "black-forest-labs-flux-1-schnell"
+    assert flux["backend_type"] == "runpod-public"
+
+
+def test_public_endpoint_v1_models(wired, gguf, monkeypatch):
+    """Public endpoint models listed in /v1/models."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    with TestClient(gw_app.app) as client:
+        ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
+    assert "flux" in ids
+    assert "flux-slow" in ids
+
+
+def test_public_endpoint_completions(wired, gguf, monkeypatch):
+    """Public endpoint serves legacy /v1/completions."""
+    cfg = _rp_public_config(gguf)
+    wired(cfg)
+    calls: list[dict] = []
+    _patch_public_runsync(monkeypatch, output=OLLAMA_SINGLE, calls=calls)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/completions", json={
+            "model": "pub:flux", "prompt": "once upon",
+            "max_tokens": 50})
+    assert r.status_code == 200, r.text
+    assert calls[0]["input"]["prompt"] == "once upon"
+
+
+async def test_public_runsync_direct(fake_httpx):
+    """runsync_public_chat uses PUBLIC_API URL (model slug, not endpoint)."""
+    fake_httpx.responses = [
+        _FakeResp(200, {"status": "COMPLETED", "id": "j1", "output": []}),
+    ]
+    await rp.runsync_public_chat("black-forest-labs-flux-1-schnell",
+                                  {"prompt": "hi"},
+                                  "RUNPOD_API_KEY_TEST", timeout=10.0)
+    url = fake_httpx.calls[0][1]
+    assert "black-forest-labs-flux-1-schnell" in url
+    assert "/runsync" in url
+    # Verify it uses the PUBLIC_API base, not SERVERLESS_API
+    assert url.startswith("https://api.runpod.ai/v2/black-forest-labs-flux-1-schnell")
+
+
+async def test_public_runsync_policy(fake_httpx):
+    """Policy passthrough on public endpoints."""
+    fake_httpx.responses = [
+        _FakeResp(200, {"status": "COMPLETED", "id": "j1", "output": []}),
+    ]
+    await rp.runsync_public_chat("slug", {"prompt": "hi"},
+                                  "RUNPOD_API_KEY_TEST", timeout=10.0,
+                                  policy={"executionTimeout": 300000})
+    body = fake_httpx.calls[0][2]
+    assert body["policy"] == {"executionTimeout": 300000}
+
+
+async def test_public_runsync_error(fake_httpx):
+    """Public endpoint HTTP error → RunPodError."""
+    fake_httpx.responses = [
+        _FakeResp(404, {"error": "not found"}),
+    ]
+    with pytest.raises(rp.RunPodError) as ei:
+        await rp.runsync_public_chat("slug", {"prompt": "hi"},
+                                      "RUNPOD_API_KEY_TEST", timeout=10.0)
+    assert "404" in str(ei.value)

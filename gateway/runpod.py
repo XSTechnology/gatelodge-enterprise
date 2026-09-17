@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 REST_BASE = "https://api.runpod.io/v2"
 SERVERLESS_URL = "https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
 SERVERLESS_API = "https://api.runpod.ai/v2/{endpoint_id}"
+PUBLIC_API = "https://api.runpod.ai/v2/{model_slug}"
 
 
 class RunPodError(Exception):
@@ -311,6 +312,50 @@ async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
     if job.get("status") != "COMPLETED":
         raise RunPodError(f"runpod serverless job {job.get('status')}: "
                           f"{str(job.get('error'))[:300]}")
+    return job.get("output")
+
+
+async def runsync_public_chat(model_slug: str, body_input: dict[str, Any],
+                               api_key_env: str, timeout: float = 120.0,
+                               policy: dict[str, Any] | None = None) -> Any:
+    """POST /v2/<model-slug>/runsync — Public Endpoints (pre-deployed,
+    always warm). Same runsync protocol as user serverless but the URL
+    uses a model slug (e.g. 'black-forest-labs-flux-1-schnell') instead
+    of an endpoint id. No cold-start — no polling loop needed, single
+    request round-trip."""
+    base = PUBLIC_API.format(model_slug=model_slug)
+    hdr = {"Authorization": f"Bearer {_api_key(api_key_env)}"}
+    wait_ms = max(1000, min(int(timeout * 1000), 300000))
+    payload: dict[str, Any] = {"input": body_input}
+    if isinstance(policy, dict) and policy:
+        payload["policy"] = policy
+    r = await _request("POST", f"{base}/runsync?wait={wait_ms}", hdr,
+                       timeout, payload)
+    if r.status_code >= 400:
+        raise RunPodError(f"runpod public endpoint {model_slug!r} -> "
+                          f"{r.status_code}: {r.text[:300]}")
+    job = r.json()
+    # Public endpoints are always warm — should complete in one shot.
+    # Poll briefly if still in progress (defensive).
+    deadline = time.monotonic() + timeout
+    while job.get("status") in ("IN_QUEUE", "IN_PROGRESS"):
+        if time.monotonic() >= deadline:
+            raise RunPodError(
+                f"runpod public endpoint {model_slug!r} job "
+                f"{job.get('id')} still {job.get('status')} after "
+                f"{timeout:.0f}s")
+        await asyncio.sleep(1.0)
+        r = await _request("GET", f"{base}/status/{job.get('id')}", hdr,
+                           timeout)
+        if r.status_code >= 400:
+            raise RunPodError(
+                f"runpod public endpoint status -> {r.status_code}: "
+                f"{r.text[:300]}")
+        job = r.json()
+    if job.get("status") != "COMPLETED":
+        raise RunPodError(
+            f"runpod public endpoint {model_slug!r} job "
+            f"{job.get('status')}: {str(job.get('error'))[:300]}")
     return job.get("output")
 
 

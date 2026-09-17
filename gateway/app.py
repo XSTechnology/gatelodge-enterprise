@@ -101,7 +101,7 @@ from . import runpod
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
-                     RUNPOD_BACKEND)
+                     RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
                      get_engine, installed_ggufs)
 
@@ -427,6 +427,21 @@ async def list_models() -> dict[str, Any]:
                     "remote_id": remote_id,
                 })
 
+            elif btype == RUNPOD_PUBLIC_BACKEND:
+                # Public Endpoints — always available, no lifecycle
+                _add({
+                    "id": mname,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": bname,
+                    "capabilities": caps,
+                    "backend_type": label,
+                    "status": "available",
+                    "local": False,
+                    "model_slug": mcfg.get("model_slug"),
+                    "timeout_s": mcfg.get("timeout_s", 120),
+                })
+
     # ── auto-discovered GGUFs ────────────────────────────────────────
     local = cfg.local_backend_name() or "local"
     for g in installed_ggufs(cfg.models_dir):
@@ -626,6 +641,26 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
             body_input["max_tokens"] = body.max_tokens
         out = await runpod.runsync_chat(
             m["endpoint_id"], body_input,
+            backend.get("api_key_env") or "RUNPOD_API_KEY",
+            m.get("timeout_s") or cfg.queue["timeout_s"],
+            policy=m.get("policy"))
+        resp = runpod.ollama_output_to_openai(out, requested)
+        return resp, backend_name, model_key
+
+    if btype == "runpod-public":
+        # Public Endpoints: pre-deployed, always warm, runsync protocol
+        # Model config: {"model_slug": "black-forest-labs-flux-1-schnell"}
+        m = backend["models"][model_key]
+        body_input: dict[str, Any] = {
+            "model": m.get("remote_id", m["model_slug"]),
+            "messages": body.messages,
+        }
+        if body.temperature is not None:
+            body_input["temperature"] = body.temperature
+        if body.max_tokens:
+            body_input["max_tokens"] = body.max_tokens
+        out = await runpod.runsync_public_chat(
+            m["model_slug"], body_input,
             backend.get("api_key_env") or "RUNPOD_API_KEY",
             m.get("timeout_s") or cfg.queue["timeout_s"],
             policy=m.get("policy"))
@@ -983,6 +1018,29 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     if choice["message"].get("content"):
                         yield _chunk({"content": choice["message"]["content"]})
                     yield _chunk({}, finish=choice.get("finish_reason") or "stop")
+            elif backend.get("type") == "runpod-public":
+                # Public Endpoints — collect-then-emit (no incremental
+                # stream on public endpoints; always warm so latency low)
+                m = backend["models"][model_key]
+                api_env = backend.get("api_key_env") or "RUNPOD_API_KEY"
+                tmo = m.get("timeout_s") or cfg.queue["timeout_s"]
+                body_input = {
+                    "model": m.get("remote_id", m["model_slug"]),
+                    "messages": body.messages,
+                }
+                if body.temperature is not None:
+                    body_input["temperature"] = body.temperature
+                if body.max_tokens:
+                    body_input["max_tokens"] = body.max_tokens
+                yield _chunk({"role": "assistant", "content": ""})
+                out = await runpod.runsync_public_chat(
+                    m["model_slug"], body_input, api_env, tmo,
+                    policy=m.get("policy"))
+                resp = runpod.ollama_output_to_openai(out, requested)
+                choice = resp["choices"][0]
+                if choice["message"].get("content"):
+                    yield _chunk({"content": choice["message"]["content"]})
+                yield _chunk({}, finish=choice.get("finish_reason") or "stop")
             else:
                 # cloud passthrough — the remote stream is already
                 # OpenAI-chunk-shaped (role/finish chunks included);
@@ -1325,6 +1383,28 @@ async def legacy_completions(body: CompletionRequest) -> Response:
                 body_input["options"] = {"num_predict": body.max_tokens}
             out = await runpod.runsync_chat(
                 m["endpoint_id"], body_input,
+                backend.get("api_key_env") or "RUNPOD_API_KEY",
+                m.get("timeout_s") or cfg.queue["timeout_s"],
+                policy=m.get("policy"))
+            resp = runpod.ollama_generate_output_to_openai(out, requested)
+            ms = int((time.perf_counter() - t0) * 1000)
+            _log_request(requested, backend_name, False, ms,
+                         resp.get("usage") or {}, 200)
+            return JSONResponse(resp)
+
+        # runpod public endpoints — runsync generate mode
+        if btype == "runpod-public":
+            m = backend["models"][model_key]
+            body_input: dict[str, Any] = {
+                "model": m.get("remote_id", m["model_slug"]),
+                "prompt": prompts[0],
+            }
+            if body.temperature is not None:
+                body_input["temperature"] = body.temperature
+            if body.max_tokens:
+                body_input["options"] = {"num_predict": body.max_tokens}
+            out = await runpod.runsync_public_chat(
+                m["model_slug"], body_input,
                 backend.get("api_key_env") or "RUNPOD_API_KEY",
                 m.get("timeout_s") or cfg.queue["timeout_s"],
                 policy=m.get("policy"))

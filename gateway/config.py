@@ -86,6 +86,12 @@ Semantics:
   knobs (0 = never). ``deploy`` is a raw dict merged verbatim into the
   POST /v2/pods payload (escape hatch for REST fields the gateway
   doesn't model). Pods are NOT touched on gateway shutdown.
+- ``runpod-public`` backends (api_key_env, default RUNPOD_API_KEY):
+  RunPod Public Endpoints — pre-deployed, always-warm models accessed
+  by slug (e.g. 'black-forest-labs-flux-1-schnell'). Models use
+  {model_slug, remote_id?, timeout_s?, policy?}. Runs via runsync
+  protocol (collect-then-emit for streaming). No lifecycle management
+  needed — endpoints are managed by RunPod.
 - Top-level keys present in the file replace the built-in defaults
   wholesale (defining "backends" overrides the default backends).
 - Secrets never live in the JSON — cloud backends name an env var
@@ -109,8 +115,9 @@ EMBEDDED_BACKEND = "embedded"
 OPENAI_BACKEND = "openai"
 LLAMA_SERVER_BACKEND = "llama-server"
 RUNPOD_BACKEND = "runpod"
+RUNPOD_PUBLIC_BACKEND = "runpod-public"
 _BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
-                  RUNPOD_BACKEND)
+                  RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND)
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -327,6 +334,32 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                                        "has no image — dropped", mname)
                         continue
                     rmodels[str(mname)] = pod
+            entry["models"] = rmodels
+        elif btype == RUNPOD_PUBLIC_BACKEND:
+            # Public Endpoints: {model_slug, remote_id?, timeout_s?, policy?}
+            entry["api_key_env"] = str(b.get("api_key_env") or "RUNPOD_API_KEY")
+            rmodels: dict[str, dict[str, Any]] = {}
+            for mname, m in (b.get("models") or {}).items():
+                if not isinstance(m, dict):
+                    logger.warning("gateway config: runpod-public model %r "
+                                   "is not an object — dropped", mname)
+                    continue
+                m = dict(m)
+                slug = str(m.get("model_slug") or "").strip()
+                if not slug:
+                    logger.warning("gateway config: runpod-public model %r "
+                                   "has no model_slug — dropped", mname)
+                    continue
+                try:
+                    tmo = float(m.get("timeout_s") or 0)
+                except (TypeError, ValueError):
+                    tmo = 0.0
+                rmodels[str(mname)] = {
+                    "model_slug": slug,
+                    "remote_id": str(m.get("remote_id") or slug).strip(),
+                    "timeout_s": tmo,
+                    "policy": dict(m["policy"]) if isinstance(m.get("policy"), dict) else {},
+                }
             entry["models"] = rmodels
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
