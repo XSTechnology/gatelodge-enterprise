@@ -816,36 +816,102 @@ function showSyslog(ui) {
 }
 
 // ---------- Parameters ----------
+// ---------- Parameters ----------
+var _editKeyName = null;
 function showParams(ui) {
   ui.title.textContent = '⚙️ Setup Parameters';
   api('/admin/backends').then(function (d) {
-    var html = '<div class="widget"><h3>Server</h3>' +
-      srow('Bind address', d.bind, 'bind') +
-      srow('Port', d.port, 'port', 'number') +
-      srow('Models directory', d.models_dir, 'models_dir') +
-      srow('Default alias', d.default_alias || '(none)', 'default_alias') +
-      srow('Queue: max waiting', d.queue.max_waiting, 'q_max_waiting', 'number') +
-      srow('Queue: timeout (s)', d.queue.timeout_s, 'q_timeout_s', 'number') +
-      '<div class="muted">All parameters hot-reload from the config file — or save below.</div></div>';
-    html += '<div class="widget"><h3>Raw config JSON</h3>' +
-      '<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">' +
-      '<button class="btn btn-primary" onclick="saveConfig()">Save &amp; apply</button>' +
+    var html = '';
+    // Server settings
+    html += '<div class="widget"><h3>Server</h3>' +
+      '<div class="srow"><label>Bind address</label>' +
+      '<input id="pm-bind" type="text" value="' + esc(d.bind) + '"></div>' +
+      '<div class="srow"><label>Port</label>' +
+      '<input id="pm-port" type="number" value="' + esc(d.port) + '"></div>' +
+      '<div class="srow"><label>Models directory</label>' +
+      '<input id="pm-models-dir" type="text" value="' + esc(d.models_dir) + '"></div>' +
+      '<div class="srow"><label>Default alias</label>' +
+      '<input id="pm-default-alias" type="text" value="' + esc(d.default_alias || '') +
+      '" placeholder="(none — model= required)"></div></div>';
+    // Queue settings
+    html += '<div class="widget"><h3>Queue</h3>' +
+      '<div class="srow"><label>Max waiting</label>' +
+      '<input id="pm-q-max" type="number" value="' + esc((d.queue || {}).max_waiting) + '"></div>' +
+      '<div class="srow"><label>Timeout (seconds)</label>' +
+      '<input id="pm-q-timeout" type="number" value="' + esc((d.queue || {}).timeout_s) + '"></div>' +
+      '<div style="margin-top:10px;display:flex;gap:8px;">' +
+      '<button class="btn btn-primary" onclick="saveParams()">Save &amp; apply</button>' +
       '<button class="btn" onclick="reloadConfig()">↻ Reload from disk</button>' +
-      '<span class="muted" id="cfg-path"></span></div>' +
+      '</div></div>';
+    // Gateway keys
+    html += '<div class="widget"><h3>Gateway access keys</h3>';
+    html += d.gateway_keys_configured
+      ? '<div class="kv"><span class="badge ok">secured</span> Bearer auth active</div>'
+      : '<div class="kv"><span class="badge warn">open</span> No keys — trusts localhost</div>';
+    html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">' +
+      '<input id="pm-key-input" type="text" placeholder="Add key…" style="width:200px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);font-size:.85rem;font-family:inherit;">' +
+      '<button class="btn btn-sm btn-primary" onclick="addGatewayKey()">Add</button></div>';
+    // Show existing keys
+    api('/admin/config').then(function (c) {
+      try {
+        var cfg = JSON.parse(c.text);
+        var keys = cfg.gateway_keys || [];
+        if (keys.length) {
+          html += '<div style="margin-top:8px;"><table><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>';
+          keys.forEach(function (k) {
+            var masked = k.substring(0, 4) + '••••' + k.substring(k.length - 4);
+            html += '<tr><td><code>' + esc(masked) + '</code></td>' +
+              '<td><button class="btn btn-sm btn-danger" onclick="removeGatewayKey(\'' + esc(k) + '\')">remove</button></td></tr>';
+          });
+          html += '</tbody></table></div>';
+        }
+      } catch (e) { /* ignore parse error */ }
+      // Inject keys table into the widget
+      var widgetEls = document.querySelectorAll('.widget');
+      if (widgetEls.length >= 3) {
+        // Already built, append to last widget
+      }
+    });
+    html += '<div class="muted" style="margin-top:6px">Keys are stored in the config file — restart the gateway or reload to apply.</div></div>';
+    // Raw config (collapsible)
+    html += '<div class="widget"><h3 style="cursor:pointer;" onclick="toggleRawConfig()">Raw config JSON <span class="muted" id="raw-toggle">[click to expand]</span></h3>' +
+      '<div id="raw-config-section" style="display:none;margin-top:8px;">' +
+      '<div style="display:flex;gap:8px;margin-bottom:8px;">' +
+      '<button class="btn btn-sm btn-primary" onclick="saveRawConfig()">Save raw JSON</button></div>' +
       '<textarea id="cfg-raw" spellcheck="false"></textarea>' +
-      '<div class="muted" style="margin-top:4px">Editing is raw JSON — the structured backends/models editors arrive via the config schema. Broken JSON is rejected (last good config keeps serving).</div></div>';
+      '<div class="muted" style="margin-top:4px">Broken JSON is rejected — last good config keeps serving.</div></div></div>';
     ui.body.innerHTML = html;
+    // Load raw config
     api('/admin/config').then(function (c) {
       document.getElementById('cfg-raw').value = c.text;
-      document.getElementById('cfg-path').textContent = c.path;
     });
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
-function srow(label, val, id, type) {
-  return '<div class="srow"><label>' + esc(label) + '</label>' +
-    '<input id="pm-' + esc(id) + '" type="' + (type || 'text') + '" value="' + esc(val) + '"></div>';
+function toggleRawConfig() {
+  var section = document.getElementById('raw-config-section');
+  var toggle = document.getElementById('raw-toggle');
+  if (section.style.display === 'none') {
+    section.style.display = 'block';
+    toggle.textContent = '[click to collapse]';
+  } else {
+    section.style.display = 'none';
+    toggle.textContent = '[click to expand]';
+  }
 }
-function saveConfig() {
+function saveParams() {
+  var body = {
+    bind: document.getElementById('pm-bind').value.trim(),
+    port: parseInt(document.getElementById('pm-port').value) || 8010,
+    models_dir: document.getElementById('pm-models-dir').value.trim(),
+    default_alias: document.getElementById('pm-default-alias').value.trim(),
+    queue_max_waiting: parseInt(document.getElementById('pm-q-max').value) || 4,
+    queue_timeout_s: parseFloat(document.getElementById('pm-q-timeout').value) || 120
+  };
+  api('/admin/params', {method: 'PUT', body: body})
+    .then(function () { notify('✓ parameters saved + applied'); refreshHeader(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function saveRawConfig() {
   var text = document.getElementById('cfg-raw').value;
   api('/admin/config', {method: 'PUT', body: {text: text}})
     .then(function () { notify('✓ config saved + applied'); refreshHeader(); })
@@ -856,30 +922,59 @@ function reloadConfig() {
     .then(function () { notify('✓ reloaded'); showPanel('params'); refreshHeader(); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
+function addGatewayKey() {
+  var input = document.getElementById('pm-key-input');
+  var key = input.value.trim();
+  if (!key) { notify('Enter a key value', true); return; }
+  api('/admin/gateway-keys', {method: 'POST', body: {key: key}})
+    .then(function () { notify('✓ key added'); input.value = ''; showPanel('params'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function removeGatewayKey(key) {
+  if (!confirm('Remove gateway key ' + key.substring(0, 8) + '…?')) return;
+  api('/admin/gateway-keys', {method: 'POST', body: {key: key, delete: true}})
+    .then(function () { notify('✓ key removed'); showPanel('params'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
 
 // ---------- API Keys ----------
 function showKeys(ui) {
   ui.title.textContent = '🔑 API Keys & Connections';
-  api('/admin/secrets').then(function (d) {
-    var html = '<div class="widget"><h3>Gateway access (bearer keys)</h3>';
-    html += d.gateway_keys_configured
-      ? '<div class="kv"><span class="badge ok">configured</span> Requests need <b>Authorization: Bearer &lt;key&gt;</b> — keys live in gateway_keys in the config (Parameters → raw JSON).</div>'
-      : '<div class="kv"><span class="badge warn">open</span> No gateway_keys configured — the gateway trusts localhost. Add keys via Parameters → raw JSON.</div>';
-    html += '</div><div class="widget"><h3>Backend service credentials</h3>';
-    if (!(d.api_keys || []).length)
+  // Fetch both secrets and backends data
+  Promise.all([api('/admin/secrets'), api('/admin/backends')]).then(function (results) {
+    var secrets = results[0];
+    var backends = results[1];
+    var html = '';
+    // Gateway access section
+    html += '<div class="widget"><h3>Gateway access (bearer keys)</h3>';
+    html += secrets.gateway_keys_configured
+      ? '<div class="kv"><span class="badge ok">secured</span> Requests need <b>Authorization: Bearer &lt;key&gt;</b></div>'
+      : '<div class="kv"><span class="badge warn">open</span> No gateway_keys configured — trusts localhost. Add keys via <b>Parameters → Gateway access keys</b>.</div>';
+    html += '</div>';
+    // Backend service credentials
+    html += '<div class="widget"><h3>Backend service credentials</h3>';
+    if (!(secrets.api_keys || []).length)
       html += '<div class="muted">No cloud/runpod backends configured — nothing needs keys.</div>';
     else {
-      html += '<table><thead><tr><th>env var</th><th>used by</th><th>status</th></tr></thead><tbody>';
-      d.api_keys.forEach(function (k) {
+      html += '<table><thead><tr><th>Environment variable</th><th>Used by backends</th><th>Status</th></tr></thead><tbody>';
+      secrets.api_keys.forEach(function (k) {
         var badge = k.source === 'env' ? '<span class="badge ok">env</span>'
           : k.source === 'keyring' ? '<span class="badge ok">keyring</span>'
           : '<span class="badge err">missing</span>';
-        html += '<tr><td><b>' + esc(k.name) + '</b></td><td>' +
+        html += '<tr><td><code>' + esc(k.name) + '</code></td><td>' +
           k.backends.map(esc).join(', ') + '</td><td>' + badge + '</td></tr>';
       });
       html += '</tbody></table>';
     }
-    html += '<div class="muted" style="margin-top:6px">' + esc(d.hint) + '</div></div>';
+    html += '<div class="muted" style="margin-top:10px">' + esc(secrets.hint) + '</div></div>';
+    // How to set keys
+    html += '<div class="widget"><h3>Setting API keys</h3>' +
+      '<div class="kv"><b>Option 1 — Environment variable</b></div>' +
+      '<div class="muted">Set the env var before starting the gateway (e.g., <code>set GROQ_API_KEY=your_key</code> on Windows).</div>' +
+      '<div class="kv" style="margin-top:6px;"><b>Option 2 — OS Keyring</b></div>' +
+      '<div class="muted">Store in the OS keyring: service = <code>Workshop</code>, username = env var name (e.g., <code>RUNPOD_API_KEY</code>). The gateway reads from keyring at boot — restart after adding.</div>' +
+      '<div class="kv" style="margin-top:6px;"><b>Option 3 — Workshop secret</b></div>' +
+      '<div class="muted">Use the Workshop platform to store secrets. The gateway bridges Workshop keyring at startup.</div></div>';
     ui.body.innerHTML = html;
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }

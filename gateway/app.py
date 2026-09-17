@@ -1928,6 +1928,62 @@ async def admin_runpod_stop(payload: StopPayload) -> Response:
             "terminated": payload.terminate}
 
 
+class ParamsPayload(BaseModel):
+    """Structured parameters for the console — avoids raw JSON editing."""
+    model_config = ConfigDict(extra="ignore")
+    bind: str | None = None
+    port: int | None = None
+    models_dir: str | None = None
+    default_alias: str | None = None
+    queue_max_waiting: int | None = None
+    queue_timeout_s: float | None = None
+
+
+@app.put("/admin/params")
+async def admin_put_params(payload: ParamsPayload) -> Response:
+    """Update top-level config parameters via structured fields."""
+    def mutator(raw: dict):
+        if payload.bind is not None:
+            raw["bind"] = payload.bind
+        if payload.port is not None:
+            raw["port"] = payload.port
+        if payload.models_dir is not None:
+            raw["models_dir"] = payload.models_dir
+        if payload.default_alias is not None:
+            raw["default_alias"] = payload.default_alias
+        # Queue settings
+        q = raw.setdefault("queue", {})
+        if payload.queue_max_waiting is not None:
+            q["max_waiting"] = payload.queue_max_waiting
+        if payload.queue_timeout_s is not None:
+            q["timeout_s"] = payload.queue_timeout_s
+
+    _mutate_config(mutator)
+    return {"ok": True}
+
+
+class GatewayKeyPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    key: str = ""
+    delete: bool = False
+
+
+@app.post("/admin/gateway-keys")
+async def admin_gateway_keys(payload: GatewayKeyPayload) -> Response:
+    """Add or remove a gateway bearer key."""
+    def mutator(raw: dict):
+        keys = raw.setdefault("gateway_keys", [])
+        if payload.delete and payload.key:
+            if payload.key in keys:
+                keys.remove(payload.key)
+        elif payload.key and payload.key not in keys:
+            keys.append(payload.key)
+
+    _mutate_config(mutator)
+    cfg = get_gateway_config()
+    return {"ok": True, "gateway_keys": cfg.gateway_keys}
+
+
 @app.post("/admin/reload")
 async def admin_reload() -> Response:
     """Force a config reload now (same as the console's reload button)."""
