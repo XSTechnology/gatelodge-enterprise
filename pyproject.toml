@@ -1,0 +1,26 @@
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "Local OpenAI-compatible LLM gateway — embedded llama.cpp + cloud backends, JSON-convention tool calling, GPU placement"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "llama-cpp-python",
+    "openai>=1.60",
+    "pydantic>=2.9",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv.sources]
+llama-cpp-python = { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" }
