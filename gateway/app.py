@@ -1,8 +1,12 @@
 """OpenAI-compatible HTTP surface — Stage 1: local backend, non-streaming.
 
 Implemented:
-  GET  /v1/models           — union of backend models + aliases
-  POST /v1/chat/completions — non-streaming; embedded backend only
+  GET  /v1/models           — aliases + backend models + auto-discovered
+                              GGUF stems from models_dir
+  POST /v1/chat/completions — non-streaming; embedded backend only. Any
+                              GGUF stem in models_dir is servable without
+                              config; multiple models load lazily and run
+                              concurrently (per-instance locks).
 
 Arriving in later stages (per the design doc's stage plan):
   streaming SSE (Stage 2), /healthz (Stage 2), cloud backends + alias
@@ -26,7 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import GatewayConfigError, get_gateway_config
-from .models import EmbeddedLLMError, get_engine
+from .models import EmbeddedEngine, EmbeddedLLMError, get_engine, installed_ggufs
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +93,11 @@ async def list_models() -> dict[str, Any]:
     for bname, b in cfg.backends.items():
         for mname in (b.get("models") or {}):
             _add(mname, bname)
+    # Auto-discovered GGUFs — every stem in models_dir is servable without
+    # any config (aliases and config models shadow same-named stems).
+    local = cfg.local_backend_name() or "local"
+    for g in installed_ggufs(cfg.models_dir):
+        _add(g["name"], local)
     return {"object": "list", "data": data}
 
 
@@ -103,7 +112,13 @@ async def chat_completions(body: ChatRequest) -> JSONResponse:
     try:
         backend_name, model_key = cfg.resolve_model(requested)
     except GatewayConfigError as e:
-        return _error(400, str(e), param="model", code="model_not_found")
+        # Auto-discovery: any GGUF in models_dir is servable by its stem
+        # (aliases and config models already had their chance above).
+        if requested and EmbeddedEngine.resolve_gguf(requested, cfg.models_dir):
+            backend_name = cfg.local_backend_name() or "local"
+            model_key = requested
+        else:
+            return _error(400, str(e), param="model", code="model_not_found")
 
     backend = cfg.backends[backend_name]
     if backend.get("type") != "embedded":

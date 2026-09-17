@@ -3,6 +3,13 @@
 Fully standalone: this project has no relationship with the assistant
 project — every knob lives in this file (or the built-in defaults).
 
+Built-in defaults are DELIBERATELY model-free: no models or aliases are
+predefined. Every GGUF in ``models_dir`` is auto-discovered and servable
+by its file stem (e.g. ``Qwen3.8-27B-Uncensored-Q4_K_M``) with default
+ctx 4096 and default GPU placement — multiple models load lazily and run
+concurrently, as many as VRAM allows. Config entries override/extend:
+friendly names, custom ctx/placement, aliases, cloud backends.
+
 Full schema (Stage 3 adds cloud execution; the parser accepts it from day
 one so configs don't churn between stages):
 
@@ -11,19 +18,18 @@ one so configs don't churn between stages):
   "bind": "127.0.0.1",
   "models_dir": "data/models",        # where GGUFs live (relative = project root)
   "gateway_keys": [],                 # bearer tokens; [] = open (localhost trust; Stage 4)
-  "default_alias": "smart",
+  "default_alias": "",                # model= defaults to this when omitted
   "backends": {
     "local": {"type": "embedded", "models": {
-        "fast":  {"gguf": "qwen2.5-0.5b-instruct-q4_k_m", "ctx": 4096, "placement": ""},
-        "smart": {"gguf": "Qwen3.8-27B-Uncensored-Q4_K_M", "ctx": 4096, "placement": ""}}},
+        "big":   {"gguf": "Qwen3.8-27B-Uncensored-Q4_K_M", "ctx": 8192, "placement": "auto"},
+        "small": {"gguf": "qwen2.5-0.5b-instruct-q4_k_m", "ctx": 4096, "placement": ""}}},
     "groq":  {"type": "openai", "base_url": "https://api.groq.com/openai/v1",
                "api_key_env": "GROQ_API_KEY",
                "models": {"cloud-fast": "llama-3.1-8b-instant"}}
   },
   "aliases": {
-    "fast":  {"chain": ["local:fast"], "hedge_s": 0},
-    "smart": {"chain": ["local:smart", "groq:cloud-fast"], "hedge_s": 8},
-    "private": {"chain": ["local:smart"], "local_only": true}
+    "smart": {"chain": ["local:big", "groq:cloud-fast"], "hedge_s": 8},
+    "private": {"chain": ["local:big"], "local_only": true}
   },
   "queue": {"max_waiting": 4, "timeout_s": 120}
 }
@@ -59,29 +65,17 @@ EMBEDDED_BACKEND = "embedded"
 OPENAI_BACKEND = "openai"
 _BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND)
 
-# Out-of-the-box config: local models only (works with no env keys set).
-# Stems must match files in models_dir.
+# Out-of-the-box config: deliberately model-free — no baked-in models or
+# aliases. GGUFs in models_dir are auto-discovered (servable by stem);
+# the operator adds named models / aliases / cloud backends in the config.
 DEFAULT_CONFIG: dict[str, Any] = {
     "port": 8010,
     "bind": "127.0.0.1",
     "models_dir": str(DEFAULT_MODELS_DIR),
     "gateway_keys": [],
-    "default_alias": "smart",
-    "backends": {
-        "local": {
-            "type": "embedded",
-            "models": {
-                "fast": {"gguf": "qwen2.5-0.5b-instruct-q4_k_m", "ctx": 4096, "placement": ""},
-                "smart": {"gguf": "Qwen3.8-27B-Uncensored-Q4_K_M", "ctx": 4096, "placement": ""},
-                "home": {"gguf": "Home-3B-v3.q4_k_m", "ctx": 3072, "placement": ""},
-            },
-        }
-    },
-    "aliases": {
-        "fast": {"chain": ["local:fast"], "hedge_s": 0},
-        "smart": {"chain": ["local:smart"], "hedge_s": 0},
-        "home": {"chain": ["local:home"], "hedge_s": 0},
-    },
+    "default_alias": "",
+    "backends": {"local": {"type": "embedded", "models": {}}},
+    "aliases": {},
     "queue": {"max_waiting": 4, "timeout_s": 120},
 }
 

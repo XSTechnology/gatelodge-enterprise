@@ -307,9 +307,12 @@ class EmbeddedEngine:
     Consumers treat it like an AsyncOpenAI client:
       await engine.chat.completions.create(model=..., messages=..., ...)
 
-    Instances are keyed by gateway model name (the 'local' backend's
-    models in the gateway config); changing gguf/ctx/placement hot-reloads
-    the instance on its next use.
+    Any number of models can be resident at once — each is a lazily
+    loaded _Instance with its own asyncio lock, so different models
+    generate concurrently (VRAM is the only limit). Resolution: config
+    models under backends.local.models first, then auto-discovery of
+    GGUF stems in models_dir (default ctx 4096 / default placement).
+    Changing a model's gguf/ctx/placement hot-reloads it on next use.
     """
 
     def __init__(self, config: GatewayConfig | None = None):
@@ -344,9 +347,17 @@ class EmbeddedEngine:
         name = (model_name or "").strip()
         entry = self._config.local_models().get(name)
         if entry is None:
-            raise EmbeddedLLMError(
-                f"unknown local model {model_name!r} — define it under "
-                "backends.local.models in the gateway config")
+            # Auto-discovery: any GGUF in models_dir is servable by its
+            # stem with defaults (ctx 4096, default placement). Config
+            # models always win — custom ctx/placement, paths outside
+            # models_dir, and they shadow same-named stems.
+            if name and self.resolve_gguf(name, self._config.models_dir):
+                entry = {"gguf": name, "ctx": 4096, "placement": ""}
+            else:
+                raise EmbeddedLLMError(
+                    f"unknown model {model_name!r} — define it under "
+                    "backends.local.models in the gateway config, or drop "
+                    "its GGUF into models_dir")
         path = self.resolve_gguf(entry.get("gguf", ""), self._config.models_dir)
         if not path:
             raise EmbeddedLLMError(

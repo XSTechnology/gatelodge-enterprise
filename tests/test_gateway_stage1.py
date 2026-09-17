@@ -2,10 +2,11 @@
 
 Covers: config defaults + file overrides + hot reload + broken-JSON
 resilience; model resolution (alias primary, 'backend:model' direct form,
-bare backend model, unknown → 400); the embedded engine (instance
-registry keyed by gateway config, reload-on-config-change, placement
-passthrough, GGUF resolution); the HTTP surface via TestClient with the
-FakeLlama sys.modules trick.
+bare backend model, unknown → 400); auto-discovery (any GGUF in
+models_dir servable by stem — config models shadow stems); the embedded
+engine (instance registry keyed by gateway config, reload-on-config-change,
+placement passthrough, GGUF resolution); the HTTP surface via TestClient
+with the FakeLlama sys.modules trick.
 """
 import json
 import sys
@@ -98,6 +99,9 @@ def _local_config(gguf, *, extra_backends=None, aliases=None, default="fast"):
         backends.update(extra_backends)
     return {
         "port": 9911, "bind": "127.0.0.1", "default_alias": default,
+        # Point models_dir at an empty/nonexistent tmp dir so tests never
+        # see the REAL data/models GGUFs (auto-discovery would list them).
+        "models_dir": str(gguf.parent / "models"),
         "backends": backends,
         "aliases": aliases or {
             "fast": {"chain": ["local:fast"], "hedge_s": 0},
@@ -117,11 +121,9 @@ def test_config_defaults_when_file_missing(tmp_path):
     cfg = gw_config.GatewayConfig(tmp_path / "nope.json")
     assert cfg.port == 8010
     assert cfg.bind == "127.0.0.1"
-    assert cfg.default_alias == "smart"
-    assert set(cfg.local_models()) == {"fast", "smart", "home"}
-    assert cfg.local_models()["home"]["gguf"] == "Home-3B-v3.q4_k_m"
-    assert cfg.local_models()["home"]["ctx"] == 3072
-    assert set(cfg.aliases) >= {"fast", "smart", "home"}
+    assert cfg.default_alias == ""
+    assert cfg.local_models() == {}  # deliberately model-free defaults
+    assert cfg.aliases == {}
     assert cfg.queue["max_waiting"] == 4
     assert cfg.gateway_keys == []
     # models_dir anchors at the project root
@@ -344,6 +346,38 @@ def test_resolve_gguf_direct_path(gguf):
         str(gguf), "Z:/nowhere") == str(gguf)
 
 
+def test_engine_auto_discovery(tmp_path):
+    """Any GGUF in models_dir is servable by stem with default ctx —
+    no config entry needed."""
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "tiny-d.gguf").write_bytes(b"x")
+    cfgfile = tmp_path / "gateway_config.json"
+    cfgfile.write_text(json.dumps({"models_dir": str(models_dir)}),
+                       encoding="utf-8")
+    cfg = gw_config.GatewayConfig(cfgfile)
+    engine = gw_models.EmbeddedEngine(cfg)
+
+    def fn(records):
+        inst = engine._get_instance("tiny-d")
+        assert inst.name == "tiny-d"
+        load = [r["load"] for r in records if "load" in r][0]
+        assert load["n_ctx"] == 4096  # discovery default
+        assert load["n_gpu_layers"] == -1
+
+    _with_fake_llama(fn)
+
+
+def test_engine_discovery_unknown_raises(tmp_path):
+    cfgfile = tmp_path / "gateway_config.json"
+    cfgfile.write_text(json.dumps(
+        {"models_dir": str(tmp_path / "empty")}), encoding="utf-8")
+    cfg = gw_config.GatewayConfig(cfgfile)
+    engine = gw_models.EmbeddedEngine(cfg)
+    with pytest.raises(EmbeddedLLMError):
+        engine._get_instance("nope")
+
+
 # ── HTTP surface ───────────────────────────────────────────────────────────
 
 def test_models_endpoint_union(wired, gguf):
@@ -360,6 +394,75 @@ def test_models_endpoint_union(wired, gguf):
     owned = {m["id"]: m["owned_by"] for m in body["data"]}
     assert owned["fast"] == "local"
     assert owned["cloud-fast"] == "groq"
+
+
+def _discovery_config(gguf, *, models=None):
+    cfgd = _local_config(gguf)
+    cfgd["backends"]["local"]["models"] = models or {}
+    cfgd["aliases"] = {}
+    return cfgd
+
+
+def test_models_endpoint_lists_discovered_ggufs(wired, gguf):
+    models_dir = gguf.parent / "models"
+    models_dir.mkdir()
+    (models_dir / "tiny-a.gguf").write_bytes(b"x")
+    cfgd = _discovery_config(gguf)
+    cfgd["models_dir"] = str(models_dir)
+    wired(cfgd)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/v1/models")
+    assert r.status_code == 200
+    body = r.json()
+    ids = {m["id"] for m in body["data"]}
+    assert ids == {"tiny-a"}  # discovered stem, nothing configured
+    assert body["data"][0]["owned_by"] == "local"
+
+
+def test_chat_auto_discovered_stem(wired, gguf):
+    models_dir = gguf.parent / "models"
+    models_dir.mkdir()
+    (models_dir / "tiny-b.gguf").write_bytes(b"x")
+    cfgd = _discovery_config(gguf)
+    cfgd["models_dir"] = str(models_dir)
+    wired(cfgd)
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions", json={
+                "model": "tiny-b",
+                "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["model"] == "tiny-b"
+        assert body["served_by"]["model"] == "tiny-b"
+        load = [r_["load"] for r_ in records if "load" in r_][0]
+        assert load["n_ctx"] == 4096  # discovery default
+
+    _with_fake_llama(fn)
+
+
+def test_config_model_beats_discovered_stem(wired, gguf):
+    """A config model with the same name as a discovered stem wins —
+    custom ctx/placement apply instead of the discovery defaults."""
+    models_dir = gguf.parent / "models"
+    models_dir.mkdir()
+    (models_dir / "tiny-c.gguf").write_bytes(b"x")
+    cfgd = _discovery_config(gguf, models={
+        "tiny-c": {"gguf": str(gguf), "ctx": 777, "placement": ""}})
+    cfgd["models_dir"] = str(models_dir)
+    wired(cfgd)
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions", json={
+                "model": "tiny-c",
+                "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        load = [r_["load"] for r_ in records if "load" in r_][0]
+        assert load["n_ctx"] == 777  # config entry, not the discovery default
+
+    _with_fake_llama(fn)
 
 
 def test_chat_basic_roundtrip(wired, gguf):
