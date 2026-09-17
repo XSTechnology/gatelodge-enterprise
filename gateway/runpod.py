@@ -135,6 +135,18 @@ async def list_pods(api_key_env: str) -> list[dict[str, Any]]:
     return []
 
 
+async def list_endpoints(api_key_env: str) -> list[dict[str, Any]]:
+    """GET /v1/endpoints → endpoint list (normalized to a list of dicts)."""
+    out = await _rest("GET", "/endpoints", api_key_env)
+    if isinstance(out, list):
+        return [e for e in out if isinstance(e, dict)]
+    if isinstance(out, dict):
+        for key in ("endpoints", "data", "items"):
+            if isinstance(out.get(key), list):
+                return [e for e in out[key] if isinstance(e, dict)]
+    return []
+
+
 async def start_pod(pod_id: str, api_key_env: str) -> Any:
     return await _rest("POST", f"/pods/{pod_id}/start", api_key_env)
 

@@ -1984,6 +1984,48 @@ async def admin_gateway_keys(payload: GatewayKeyPayload) -> Response:
     return {"ok": True, "gateway_keys": cfg.gateway_keys}
 
 
+@app.post("/admin/runpod/inventory")
+async def admin_runpod_inventory() -> Response:
+    """Check RunPod entities against config. Returns live pods/endpoints
+    and flags configured models whose entities no longer exist."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+
+    # Find runpod backends
+    rp_backends = {n: b for n, b in cfg.backends.items() if b.get("type") == "runpod"}
+    if not rp_backends:
+        return {"pods": [], "endpoints": [], "stale": [], "message": "no runpod backends configured"}
+
+    # Use first runpod backend's api_key_env
+    api_key_env = list(rp_backends.values())[0].get("api_key_env", "RUNPOD_API_KEY")
+
+    try:
+        pods = await runpod.list_pods(api_key_env)
+        endpoints = await runpod.list_endpoints(api_key_env)
+    except Exception as e:
+        return {"error": str(e), "pods": [], "endpoints": [], "stale": []}
+
+    pod_ids = {p.get("id") for p in pods}
+    ep_ids = {e.get("id") for e in endpoints}
+
+    # Check configured models for stale references
+    stale = []
+    for bname, bdef in rp_backends.items():
+        for mname, mdef in (bdef.get("models") or {}).items():
+            pid = mdef.get("pod_id")
+            eid = mdef.get("endpoint_id")
+            if pid and pid not in pod_ids:
+                stale.append({"backend": bname, "model": mname, "type": "pod", "id": pid})
+            elif eid and eid not in ep_ids:
+                stale.append({"backend": bname, "model": mname, "type": "endpoint", "id": eid})
+
+    return {
+        "pods": [{"id": p.get("id"), "name": p.get("name"), "status": p.get("status") or p.get("desiredStatus")} for p in pods],
+        "endpoints": [{"id": e.get("id"), "name": e.get("name"), "workersMax": e.get("workersMax")} for e in endpoints],
+        "stale": stale,
+    }
+
+
 @app.post("/admin/reload")
 async def admin_reload() -> Response:
     """Force a config reload now (same as the console's reload button)."""

@@ -621,12 +621,16 @@ function buildBackendTable(defs) {
         settings.push('url: ' + esc(b.base_url || ''), 'key: ' + esc(b.api_key_env || ''));
       }
       var modelCount = Object.keys(b.models || {}).length + Object.keys(b.embedding_models || {}).length;
+      var actions = '<button class="btn btn-sm" onclick="editBackend(\'' + esc(b.name) + '\')">edit</button> ' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteBackend(\'' + esc(b.name) + '\')">delete</button>';
+      if (b.type === 'runpod') {
+        actions += ' <button class="btn btn-sm" onclick="checkRunpodInventory()">🔍 inventory</button>';
+      }
       html += '<tr><td><b>' + esc(b.name) + '</b> <span class="muted">(' + modelCount + ' models)</span></td>' +
         '<td><span class="badge ' + esc(b.type) + '">' + esc(b.type) + '</span></td>' +
         '<td>' + esc(b.mode || '—') + '</td>' +
         '<td class="muted">' + (settings.length ? settings.join(' · ') : '—') + '</td>' +
-        '<td><button class="btn btn-sm" onclick="editBackend(\'' + esc(b.name) + '\')">edit</button> ' +
-        '<button class="btn btn-sm btn-danger" onclick="deleteBackend(\'' + esc(b.name) + '\')">delete</button></td></tr>';
+        '<td>' + actions + '</td></tr>';
     });
     html += '</tbody></table>';
   }
@@ -746,6 +750,57 @@ function stopChild(backend, model) {
 function stopPod(backend, model, terminate) {
   api('/admin/runpod/stop', {method: 'POST', body: {backend: backend, model: model, terminate: terminate}})
     .then(function () { notify('✓ pod ' + (terminate ? 'terminated' : 'stopped')); showPanel('services'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function checkRunpodInventory() {
+  api('/admin/runpod/inventory', {method: 'POST'}).then(function (d) {
+    var html = '<div class="widget"><h3>RunPod Inventory</h3>';
+    if (d.error) {
+      html += '<div style="color:var(--danger)">' + esc(d.error) + '</div>';
+    } else {
+      html += '<h4>Live pods (' + d.pods.length + ')</h4>';
+      if (d.pods.length) {
+        html += '<table><thead><tr><th>id</th><th>name</th><th>status</th></tr></thead><tbody>';
+        d.pods.forEach(function (p) {
+          html += '<tr><td><code>' + esc(p.id) + '</code></td><td>' + esc(p.name) + '</td><td>' + esc(p.status) + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      } else {
+        html += '<div class="muted">No pods</div>';
+      }
+      html += '<h4 style="margin-top:10px;">Live endpoints (' + d.endpoints.length + ')</h4>';
+      if (d.endpoints.length) {
+        html += '<table><thead><tr><th>id</th><th>name</th><th>max workers</th></tr></thead><tbody>';
+        d.endpoints.forEach(function (e) {
+          html += '<tr><td><code>' + esc(e.id) + '</code></td><td>' + esc(e.name) + '</td><td>' + esc(e.workersMax) + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      } else {
+        html += '<div class="muted">No endpoints</div>';
+      }
+      if (d.stale && d.stale.length) {
+        html += '<h4 style="margin-top:10px;color:var(--danger);">Stale references (' + d.stale.length + ')</h4>';
+        html += '<table><thead><tr><th>backend:model</th><th>type</th><th>id</th><th></th></tr></thead><tbody>';
+        d.stale.forEach(function (s) {
+          html += '<tr><td><b>' + esc(s.backend) + ':' + esc(s.model) + '</b></td><td>' + esc(s.type) + '</td><td><code>' + esc(s.id) + '</code></td>' +
+            '<td><button class="btn btn-sm btn-danger" onclick="removeStaleModel(\'' + esc(s.backend) + '\',\'' + esc(s.model) + '\')">remove</button></td></tr>';
+        });
+        html += '</tbody></table>';
+      } else {
+        html += '<div class="muted" style="margin-top:10px;">✓ All configured entities are live</div>';
+      }
+    }
+    html += '</div>';
+    // Show in a modal
+    document.getElementById('modal-title').textContent = '🔌 RunPod Inventory';
+    document.getElementById('modal-body').innerHTML = html;
+    document.getElementById('modal').classList.add('show');
+  }).catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function removeStaleModel(backend, model) {
+  if (!confirm('Remove ' + backend + ':' + model + ' from config?')) return;
+  api('/admin/models', {method: 'POST', body: {name: model, backend: backend, delete: true}})
+    .then(function () { notify('✓ removed'); checkRunpodInventory(); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
