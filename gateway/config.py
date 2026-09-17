@@ -25,7 +25,12 @@ one so configs don't churn between stages):
         "small": {"gguf": "qwen2.5-0.5b-instruct-q4_k_m", "ctx": 4096, "placement": ""}}},
     "groq":  {"type": "openai", "base_url": "https://api.groq.com/openai/v1",
                "api_key_env": "GROQ_API_KEY",
-               "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+               "models": {"cloud-fast": "llama-3.1-8b-instant"}},
+    "srv":   {"type": "llama-server", "server_exe": "llama-server", "models": {
+        "batch": {"gguf": "qwen2.5-0.5b-instruct-q4_k_m", "ctx": 16384,
+                   "placement": "", "parallel": 4}}},
+    "runpod": {"type": "llama-server", "base_url": "https://api.runpod.ai/v2/ENDPOINT/openai/v1",
+               "api_key_env": "RUNPOD_API_KEY", "models": {"gpu-big": "model-id"}}
   },
   "aliases": {
     "smart": {"chain": ["local:big", "groq:cloud-fast"], "hedge_s": 8},
@@ -46,6 +51,15 @@ Semantics:
   shape) are served by POST /v1/embeddings as SEPARATE instances —
   Llama(embedding=True) builds a pooling context; chat GGUFs cannot
   embed and embedding GGUFs are never auto-discovered.
+- ``llama-server`` backends: SUBPROCESS mode (no base_url) spawns one
+  llama-server child per model — continuous batching / slots (parallel
+  concurrent requests on ONE loaded model, unlike the embedded engine's
+  serialized lock); ctx is the TOTAL context divided among the slots;
+  server_exe/host/port_base/start_timeout_s/idle_timeout_s (0=never
+  idle-kill)/extra_args per backend; per-model parallel/alias knobs.
+  REMOTE mode (base_url set — RunPod or any llama-server over HTTP) is
+  a pure OpenAI passthrough: models map name → remote model id, optional
+  api_key_env. local_only counts subprocess mode as local, remote as not.
 - Top-level keys present in the file replace the built-in defaults
   wholesale (defining "backends" overrides the default backends).
 - Secrets never live in the JSON — cloud backends name an env var
@@ -67,7 +81,8 @@ DEFAULT_MODELS_DIR = PROJECT_ROOT / "data" / "models"
 
 EMBEDDED_BACKEND = "embedded"
 OPENAI_BACKEND = "openai"
-_BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND)
+LLAMA_SERVER_BACKEND = "llama-server"
+_BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND)
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -107,7 +122,8 @@ def _resolve_dir(raw: Any) -> str:
 
 
 def _normalize_local_models(raw: Any, what: str = "local model") -> dict[str, dict[str, Any]]:
-    """Validate + normalize embedded model entries ({gguf, ctx, placement})."""
+    """Validate + normalize embedded model entries ({gguf, ctx, placement}).
+    Unknown extra keys are preserved (llama-server models add parallel/alias)."""
     out: dict[str, dict[str, Any]] = {}
     if not isinstance(raw, dict):
         return out
@@ -121,11 +137,13 @@ def _normalize_local_models(raw: Any, what: str = "local model") -> dict[str, di
             ctx = int(m.get("ctx") or 4096)
         except (TypeError, ValueError):
             ctx = 4096
-        out[str(mname)] = {
+        entry = dict(m)  # keep extras (parallel, alias, ...)
+        entry.update({
             "gguf": str(m["gguf"]).strip(),
             "ctx": ctx,
             "placement": str(m.get("placement") or "").strip(),
-        }
+        })
+        out[str(mname)] = entry
     return out
 
 
@@ -151,6 +169,48 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
             # for an embedder would return garbage vectors).
             entry["embedding_models"] = _normalize_local_models(
                 b.get("embedding_models"), what="local embedding model")
+        elif btype == LLAMA_SERVER_BACKEND:
+            base_url = str(b.get("base_url") or "").strip().rstrip("/")
+            entry["base_url"] = base_url
+            entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
+            if base_url:
+                # REMOTE mode (RunPod / any llama-server over HTTP): models
+                # map our name → the server's model id, cloud-style.
+                rmodels: dict[str, str] = {}
+                for mname, m in (b.get("models") or {}).items():
+                    if isinstance(m, dict):
+                        m = m.get("id") or m.get("model") or ""
+                    if isinstance(m, str) and m.strip():
+                        rmodels[str(mname)] = m.strip()
+                entry["models"] = rmodels
+            else:
+                # SUBPROCESS mode: the gateway spawns and manages one
+                # llama-server child per model (continuous batching /
+                # slots — unlike the embedded engine's per-instance lock).
+                entry["server_exe"] = str(b.get("server_exe") or "llama-server")
+                entry["host"] = str(b.get("host") or "127.0.0.1")
+                try:
+                    entry["port_base"] = int(b.get("port_base") or 8120)
+                except (TypeError, ValueError):
+                    entry["port_base"] = 8120
+                try:
+                    entry["start_timeout_s"] = float(b.get("start_timeout_s") or 180)
+                except (TypeError, ValueError):
+                    entry["start_timeout_s"] = 180.0
+                try:
+                    entry["idle_timeout_s"] = float(b.get("idle_timeout_s") or 0)
+                except (TypeError, ValueError):
+                    entry["idle_timeout_s"] = 0.0
+                entry["extra_args"] = [str(a) for a in (b.get("extra_args") or [])]
+                lsmodels = _normalize_local_models(
+                    b.get("models"), what="llama-server model")
+                for mname, m in lsmodels.items():
+                    try:
+                        m["parallel"] = max(1, int(m.get("parallel") or 1))
+                    except (TypeError, ValueError):
+                        m["parallel"] = 1
+                    m["alias"] = str(m.get("alias") or mname).strip() or mname
+                entry["models"] = lsmodels
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
             entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
@@ -342,12 +402,22 @@ class GatewayConfig:
         if plan["local_only"]:
             plan["entries"] = [
                 (b, m) for b, m in plan["entries"]
-                if (self.backends.get(b) or {}).get("type") == EMBEDDED_BACKEND]
+                if self._entry_is_local(b)]
             if not plan["entries"]:
                 raise GatewayConfigError(
                     f"alias {name!r} is local_only but its chain has no "
                     "local backend entries")
         return plan
+
+    def _entry_is_local(self, backend_name: str) -> bool:
+        """Embedded always; llama-server only in SUBPROCESS mode (remote
+        base_url — RunPod etc. — leaves the machine like a cloud backend)."""
+        b = self.backends.get(backend_name) or {}
+        if b.get("type") == EMBEDDED_BACKEND:
+            return True
+        if b.get("type") == LLAMA_SERVER_BACKEND:
+            return not b.get("base_url")
+        return False
 
     def resolve_model(self, name: str | None) -> tuple[str, str]:
         """Primary chain entry of resolve_chain (Stage-1 compatibility)."""

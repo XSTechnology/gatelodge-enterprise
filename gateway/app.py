@@ -24,6 +24,14 @@ Implemented:
                               auto-discovered); cloud backends pass through
                               (dimensions forwarded, ignored for embedded).
                               encoding_format float|base64 supported.
+  llama-server backends      — type "llama-server". SUBPROCESS mode (no
+                              base_url): one managed child per model,
+                              spawned lazily, continuous batching across
+                              --parallel slots, native tools + streaming,
+                              idle_timeout_s reaper, killed on shutdown.
+                              REMOTE mode (base_url — RunPod or any
+                              llama-server over HTTP): OpenAI passthrough
+                              via the cloud client path (api_key_env).
   GET  /healthz              — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
   GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
@@ -44,7 +52,7 @@ All data endpoints (including /healthz) require it when configured.
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Deferred to v2: /v1/completions, worker pools, llama-server backend.
+Deferred to v2: /v1/completions, worker pools, RunPod pod lifecycle.
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.
@@ -69,6 +77,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import cloud
+from . import llamaserver
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
@@ -121,6 +130,12 @@ def _event_ring() -> _RingHandler:
 
 
 _event_ring()  # attach at import — events before the first /admin/events call
+
+
+@app.on_event("shutdown")
+async def _kill_llama_servers() -> None:
+    """Stop every managed llama-server child when the gateway exits."""
+    llamaserver.kill_all()
 
 
 # ── OpenAI-shaped errors ───────────────────────────────────────────────────
@@ -239,11 +254,14 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     """Execute ONE chain entry → (openai_response_dict, backend, model_key).
 
     Embedded → the in-process engine (tools via the JSON convention).
-    Cloud → AsyncOpenAI (tools forwarded as-is, max_tokens capped 800)."""
+    llama-server subprocess → managed child (native batching/tools).
+    Cloud / remote llama-server → AsyncOpenAI (tools forwarded as-is,
+    max_tokens capped 800 for cloud-type only)."""
     backend_name, model_key = entry
     backend = cfg.backends[backend_name]
+    btype = backend.get("type")
 
-    if backend.get("type") == "embedded":
+    if btype == "embedded":
         engine = get_engine()
         comp = await engine.chat.completions.create(
             model=model_key,
@@ -285,7 +303,28 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
             },
         }, backend_name, model_key)
 
-    # openai-type cloud backend
+    if btype == "llama-server" and not backend.get("base_url"):
+        # Managed subprocess: native OpenAI wire format incl. tools —
+        # no JSON-convention shim, no max_tokens cap (it's local).
+        llamaserver.ensure_reaper()
+        mgr = llamaserver.get_manager(cfg, backend_name, model_key)
+        base = await mgr.ensure_ready()
+        payload: dict[str, Any] = {
+            "model": mgr.alias,  # the child's --alias (its model id)
+            "messages": body.messages,
+        }
+        if body.tools:
+            payload["tools"] = body.tools
+        if body.temperature is not None:
+            payload["temperature"] = body.temperature
+        if body.max_tokens:
+            payload["max_tokens"] = body.max_tokens
+        resp = await llamaserver.post_chat(base, payload,
+                                           cfg.queue["timeout_s"])
+        resp["model"] = requested  # consistent echo; served_by carries truth
+        return resp, backend_name, model_key
+
+    # openai-type cloud backend (or REMOTE llama-server — same wire shape)
     client = cloud.get_cloud_client(backend_name, backend,
                                     timeout=cfg.queue["timeout_s"])
     kwargs: dict[str, Any] = {
@@ -295,7 +334,9 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     if body.temperature is not None:
         kwargs["temperature"] = body.temperature
     if body.max_tokens:
-        kwargs["max_tokens"] = min(body.max_tokens, cloud.CLOUD_MAX_TOKENS_CAP)
+        # cap for openai-type cloud (cost); local llama-server passes through
+        kwargs["max_tokens"] = (min(body.max_tokens, cloud.CLOUD_MAX_TOKENS_CAP)
+                                if btype == "openai" else body.max_tokens)
     if body.tools:
         kwargs["tools"] = body.tools
     try:
@@ -388,11 +429,13 @@ async def chat_completions(body: ChatRequest) -> Response:
     cfg.maybe_reload()
     t0 = time.perf_counter()
 
-    # Queue admission: capacity = resident instances (min 1) + max_waiting.
+    # Queue admission: capacity = resident instances (min 1) + running
+    # llama-server children (they batch concurrently) + max_waiting.
     # Over-limit requests get 429 + Retry-After instead of piling onto the
     # serialized per-instance locks.
     engine = get_engine()
-    capacity = max(1, len(engine.loaded_models())) + cfg.queue["max_waiting"]
+    capacity = (max(1, len(engine.loaded_models()))
+                + llamaserver.running_count() + cfg.queue["max_waiting"])
     if _active_chats >= capacity:
         _log_request(body.model, "", body.stream,
                      int((time.perf_counter() - t0) * 1000), {}, 429)
@@ -452,14 +495,15 @@ def _release_chat_slot() -> None:
 
 def _stream_chat(requested: str, entry: tuple[str, str],
                  body: ChatRequest) -> StreamingResponse:
-    """SSE bridge — embedded engine (think-hold-back) or cloud passthrough.
+    """SSE bridge — embedded engine (think-hold-back), llama-server
+    subprocess (native SSE passthrough), or cloud passthrough.
 
     OpenAI wire format: role chunk → content chunks → finish chunk →
-    `data: [DONE]` (cloud chunks pass through in their native shape).
+    `data: [DONE]` (cloud + llama-server chunks pass through natively).
     Mid-flight errors become an OpenAI-shaped error object + [DONE].
 
     Streaming with tools:
-      — cloud: forwarded as-is (native tool-call deltas)
+      — cloud / llama-server: forwarded as-is (native tool-call deltas)
       — embedded: content deltas streamed live; at stream end the buffered
         text is parsed for a JSON tool call → emitted as a delta.tool_calls
         chunk (JSON-convention shim has no token-level tool boundaries)."""
@@ -522,6 +566,30 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         _release_chat_slot()
                         return
                 yield _chunk({}, finish="stop")
+            elif (backend.get("type") == "llama-server"
+                    and not backend.get("base_url")):
+                # Managed subprocess — native OpenAI SSE incl. tool-call
+                # deltas (no JSON-convention shim needed); [DONE] arrives
+                # from the child, the common tail re-adds it if not.
+                llamaserver.ensure_reaper()
+                mgr = llamaserver.get_manager(cfg, backend_name, model_key)
+                base = await mgr.ensure_ready()
+                payload: dict[str, Any] = {
+                    "model": mgr.alias,
+                    "messages": body.messages,
+                    "stream": True,
+                }
+                if body.tools:
+                    payload["tools"] = body.tools
+                if body.temperature is not None:
+                    payload["temperature"] = body.temperature
+                if body.max_tokens:
+                    payload["max_tokens"] = body.max_tokens
+                async for data in llamaserver.stream_chat(
+                        base, payload, cfg.queue["timeout_s"]):
+                    if data == "[DONE]":
+                        break
+                    yield f"data: {data}\n\n"
             else:
                 # cloud passthrough — the remote stream is already
                 # OpenAI-chunk-shaped (role/finish chunks included)
@@ -533,7 +601,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 }
                 if body.temperature is not None:
                     kwargs["temperature"] = body.temperature
-                if body.max_tokens:
+                if body.max_tokens and backend.get("type") == "openai":
                     kwargs["max_tokens"] = min(body.max_tokens,
                                                cloud.CLOUD_MAX_TOKENS_CAP)
                 if body.tools:
@@ -616,7 +684,8 @@ async def embeddings(body: EmbeddingRequest) -> Response:
     # Same admission gate as chat — embedding requests serialize on their
     # instance lock, so an unbounded pile-up would starve everything else.
     engine = get_engine()
-    capacity = max(1, len(engine.loaded_models())) + cfg.queue["max_waiting"]
+    capacity = (max(1, len(engine.loaded_models()))
+                + llamaserver.running_count() + cfg.queue["max_waiting"])
     if _active_chats >= capacity:
         _log_request(requested, "", False,
                      int((time.perf_counter() - t0) * 1000), {}, 429)
@@ -698,6 +767,7 @@ async def healthz() -> dict[str, Any]:
         "discovered_models": len(discovered),
         "loaded_count": len(loaded),
         "loaded": loaded,  # Ollama-ps shaped: alias/path/size_vram/n_ctx/load_s
+        "llama_server": llamaserver.status(),  # managed children (subprocess)
         "gpus": gpus,
     }
 
