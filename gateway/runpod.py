@@ -33,7 +33,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -49,6 +49,11 @@ SERVERLESS_API = "https://api.runpod.ai/v2/{endpoint_id}"
 
 class RunPodError(Exception):
     """RunPod API failure or pod never became healthy — maps to 502."""
+
+
+class RunPodStreamUnavailable(RunPodError):
+    """GET /stream/{id} rejected — endpoint/worker without stream support;
+    callers may fall back to collect-then-emit (runsync)."""
 
 
 # ── REST client (module-level functions so tests can monkeypatch) ──────────
@@ -178,14 +183,17 @@ def serverless_base_url(endpoint_id: str) -> str:
 async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
                        api_key_env: str, timeout: float = 120.0) -> Any:
     """POST /v2/<ep>/runsync with {"input": {...}}; poll /status/{id} while
-    the job queues or runs (scale-to-zero cold start). Returns the job's
+    the job queues or runs (scale-to-zero cold start). ?wait= keeps RunPod
+    itself waiting up to 300s before bouncing IN_QUEUE. Returns the job's
     OUTPUT verbatim (worker-specific shape — map with ollama_output_to_openai
     or your own)."""
     base = SERVERLESS_API.format(endpoint_id=endpoint_id)
     hdr = {"Authorization": f"Bearer {_api_key(api_key_env)}"}
+    # docs: ?wait is 1000-300000 ms — RunPod holds the sync window open
+    wait_ms = max(1000, min(int(timeout * 1000), 300000))
     async with httpx.AsyncClient(timeout=timeout) as ac:
-        r = await ac.post(f"{base}/runsync", json={"input": body_input},
-                          headers=hdr)
+        r = await ac.post(f"{base}/runsync?wait={wait_ms}",
+                          json={"input": body_input}, headers=hdr)
     if r.status_code >= 400:
         raise RunPodError(f"runpod serverless runsync -> {r.status_code}: "
                           f"{r.text[:300]}")
@@ -206,6 +214,76 @@ async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
         raise RunPodError(f"runpod serverless job {job.get('status')}: "
                           f"{str(job.get('error'))[:300]}")
     return job.get("output")
+
+
+async def run_job(endpoint_id: str, body_input: dict[str, Any],
+                  api_key_env: str, timeout: float = 120.0) -> str:
+    """POST /v2/<ep>/run (async) → job id. Pair with stream_job for
+    incremental results."""
+    base = SERVERLESS_API.format(endpoint_id=endpoint_id)
+    async with httpx.AsyncClient(timeout=timeout) as ac:
+        r = await ac.post(f"{base}/run", json={"input": body_input},
+                          headers={"Authorization": f"Bearer {_api_key(api_key_env)}"})
+    if r.status_code >= 400:
+        raise RunPodError(f"runpod serverless run -> {r.status_code}: "
+                          f"{r.text[:300]}")
+    job = r.json()
+    if not job.get("id"):
+        raise RunPodError(f"runpod serverless run returned no id: "
+                          f"{str(job)[:200]}")
+    return str(job["id"])
+
+
+async def stream_job(endpoint_id: str, job_id: str, api_key_env: str,
+                     timeout: float = 300.0) -> AsyncIterator[Any]:
+    """GET /v2/<ep>/stream/{job_id} — SSE of incremental output chunks as
+    the worker yields them (docs: single chunks up to 1 MB). Yields each
+    chunk verbatim; raises when the job FAILED."""
+    base = SERVERLESS_API.format(endpoint_id=endpoint_id)
+    hdr = {"Authorization": f"Bearer {_api_key(api_key_env)}"}
+    async with httpx.AsyncClient(timeout=timeout) as ac:
+        async with ac.stream("GET", f"{base}/stream/{job_id}",
+                             headers=hdr) as r:
+            if r.status_code >= 400:
+                body = (await r.aread()).decode("utf-8", "replace")
+                raise RunPodStreamUnavailable(
+                    f"runpod serverless stream -> {r.status_code}: "
+                    f"{body[:300]}")
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                try:
+                    ev = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                status = ev.get("status")
+                if status == "FAILED":
+                    raise RunPodError(f"runpod serverless job FAILED: "
+                                      f"{str(ev.get('error'))[:300]}")
+                out = ev.get("output")
+                if out is not None:
+                    yield out
+                if status == "COMPLETED":
+                    return
+
+
+def ollama_chunk_content(chunk: Any) -> tuple[str, bool, str]:
+    """One worker output chunk (Ollama shape: dict or JSON string) →
+    (content, done, done_reason). Tolerates anything else → ('', ...)."""
+    if isinstance(chunk, str):
+        try:
+            chunk = json.loads(chunk)
+        except (json.JSONDecodeError, ValueError):
+            return "", False, ""
+    if not isinstance(chunk, dict):
+        return "", False, ""
+    content = (chunk.get("message") or {}).get("content") or ""
+    return content, bool(chunk.get("done")), str(chunk.get("done_reason") or "")
 
 
 def ollama_output_to_openai(output: Any, model_echo: str) -> dict[str, Any]:

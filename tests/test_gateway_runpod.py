@@ -564,13 +564,56 @@ def test_runsync_transport_job_failed_502(wired, gguf, monkeypatch):
     assert "FAILED" in r.json()["error"]["message"]
 
 
-def test_runsync_transport_stream_collects(wired, gguf, monkeypatch):
-    """Streaming through runsync: job collected, then emitted as SSE."""
+def _patch_run_stream(monkeypatch, chunks=None, unavailable=False):
+    """Fake run_job + stream_job for the streaming path."""
+    async def fake_run(endpoint_id, body_input, api_key_env, timeout=120.0):
+        return "job-123"
+
+    async def fake_stream(endpoint_id, job_id, api_key_env, timeout=300.0):
+        if unavailable:
+            raise rp.RunPodStreamUnavailable("stream -> 404")
+        for c in (chunks or []):
+            yield c
+
+    monkeypatch.setattr(rp, "run_job", fake_run)
+    monkeypatch.setattr(rp, "stream_job", fake_stream)
+
+
+def test_runsync_transport_stream_true(wired, gguf, monkeypatch):
+    """Streaming: POST /run + GET /stream SSE chunks → incremental deltas."""
     cfg = _rp_config(gguf)
     cfg["backends"]["rp"]["models"]["smollm"] = {
         "endpoint_id": "ep-xyz", "transport": "runsync"}
     wired(cfg)
-    _patch_runsync(monkeypatch, output=OLLAMA_SINGLE)
+    _patch_run_stream(monkeypatch, chunks=[
+        '{"message":{"role":"assistant","content":"one "},"done":false}',
+        {"message": {"role": "assistant", "content": "two"},
+         "done": False},
+        {"message": {"content": ""}, "done": True, "done_reason": "stop"},
+    ])
+    with TestClient(gw_app.app) as client:
+        with client.stream("POST", "/v1/chat/completions", json={
+                "model": "smollm", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}) as r:
+            assert r.status_code == 200
+            lines = [ln for ln in r.iter_lines() if ln.strip()]
+    assert lines[-1] == "data: [DONE]"
+    events = [json.loads(ln[6:]) for ln in lines[:-1]]
+    deltas = [e["choices"][0]["delta"].get("content")
+              for e in events if e["choices"][0]["delta"].get("content")]
+    assert deltas == ["one ", "two"]  # incremental, not one blob
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_runsync_transport_stream_fallback(wired, gguf, monkeypatch):
+    """No /stream support → collect-then-emit fallback via runsync."""
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["smollm"] = {
+        "endpoint_id": "ep-xyz", "transport": "runsync"}
+    wired(cfg)
+    _patch_run_stream(monkeypatch, unavailable=True)
+    calls: list[dict] = []
+    _patch_runsync(monkeypatch, output=OLLAMA_SINGLE, calls=calls)
     with TestClient(gw_app.app) as client:
         with client.stream("POST", "/v1/chat/completions", json={
                 "model": "smollm", "stream": True,
@@ -582,7 +625,8 @@ def test_runsync_transport_stream_collects(wired, gguf, monkeypatch):
     content = "".join(e["choices"][0]["delta"].get("content") or ""
                       for e in events)
     assert content == "one two three"
-    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+    # fallback dropped stream:true from the collected job input
+    assert calls[0]["input"].get("stream") is None
 
 
 def test_runsync_default_transport_is_openai(wired, gguf, monkeypatch):
@@ -614,6 +658,20 @@ def test_ollama_output_mapping_shapes():
     d4 = rp.ollama_output_to_openai(None, "e")
     assert d4["choices"][0]["message"]["content"] == ""
     assert d4["choices"][0]["finish_reason"] == "stop"
+
+
+def test_ollama_chunk_content_shapes():
+    # JSON string chunk
+    c, done, reason = rp.ollama_chunk_content(
+        '{"message":{"content":"hi"},"done":false}')
+    assert (c, done, reason) == ("hi", False, "")
+    # dict chunk with done
+    c, done, reason = rp.ollama_chunk_content(
+        {"message": {"content": ""}, "done": True, "done_reason": "length"})
+    assert (c, done, reason) == ("", True, "length")
+    # garbage tolerated
+    assert rp.ollama_chunk_content("not json") == ("", False, "")
+    assert rp.ollama_chunk_content(42) == ("", False, "")
 
 
 async def test_pod_idle_reaper_stop_then_terminate(wired, gguf, monkeypatch):

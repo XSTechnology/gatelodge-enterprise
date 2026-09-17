@@ -687,27 +687,50 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             elif (backend.get("type") == "runpod"
                     and backend["models"][model_key].get("endpoint_id")
                     and backend["models"][model_key].get("transport") == "runsync"):
-                # Serverless RAW job protocol — no incremental SSE from the
-                # endpoint; collect the job, then emit as OpenAI chunks.
+                # Serverless RAW job protocol — TRUE streaming via
+                # POST /run + GET /stream/{id} (SSE of worker chunks);
+                # falls back to collect-then-emit (runsync) when the
+                # endpoint has no stream support.
                 m = backend["models"][model_key]
+                api_env = backend.get("api_key_env") or "RUNPOD_API_KEY"
+                tmo = m.get("timeout_s") or cfg.queue["timeout_s"]
                 body_input = {
                     "model": m["remote_id"],
                     "messages": body.messages,
+                    "stream": True,
                 }
                 if body.temperature is not None:
                     body_input["temperature"] = body.temperature
                 if body.max_tokens:
                     body_input["max_tokens"] = body.max_tokens
-                out = await runpod.runsync_chat(
-                    m["endpoint_id"], body_input,
-                    backend.get("api_key_env") or "RUNPOD_API_KEY",
-                    m.get("timeout_s") or cfg.queue["timeout_s"])
-                resp = runpod.ollama_output_to_openai(out, requested)
-                choice = resp["choices"][0]
                 yield _chunk({"role": "assistant", "content": ""})
-                if choice["message"].get("content"):
-                    yield _chunk({"content": choice["message"]["content"]})
-                yield _chunk({}, finish=choice.get("finish_reason") or "stop")
+                finish = "stop"
+                try:
+                    job_id = await runpod.run_job(m["endpoint_id"],
+                                                  body_input, api_env, tmo)
+                    got_any = False
+                    async for chunk in runpod.stream_job(
+                            m["endpoint_id"], job_id, api_env, tmo):
+                        content, done, reason = runpod.ollama_chunk_content(chunk)
+                        if content:
+                            got_any = True
+                            yield _chunk({"content": content})
+                        if done:
+                            finish = reason or "stop"
+                    if not got_any:
+                        raise runpod.RunPodStreamUnavailable("empty stream")
+                    yield _chunk({}, finish=finish)
+                except runpod.RunPodStreamUnavailable:
+                    # no usable incremental stream — collect-then-emit
+                    out = await runpod.runsync_chat(
+                        m["endpoint_id"],
+                        {k: v for k, v in body_input.items() if k != "stream"},
+                        api_env, tmo)
+                    resp = runpod.ollama_output_to_openai(out, requested)
+                    choice = resp["choices"][0]
+                    if choice["message"].get("content"):
+                        yield _chunk({"content": choice["message"]["content"]})
+                    yield _chunk({}, finish=choice.get("finish_reason") or "stop")
             else:
                 # cloud passthrough — the remote stream is already
                 # OpenAI-chunk-shaped (role/finish chunks included);
