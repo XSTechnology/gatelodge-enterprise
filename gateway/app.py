@@ -1,10 +1,12 @@
-"""OpenAI-compatible HTTP surface — Stages 1-4: local + cloud, chains + hedge,
-auth + admin.
+"""OpenAI-compatible HTTP surface — Stages 1-5: full gateway + console.
 
 Implemented:
-  GET  /v1/models           — aliases + backend models + auto-discovered
+  GET  /                     — single-page console (config / models /
+                              performance / logs panes); the static shell
+                              loads without a key, its API calls need one
+  GET  /v1/models            — aliases + backend models + auto-discovered
                               GGUF stems from models_dir
-  POST /v1/chat/completions — non-streaming AND streaming (SSE). Embedded
+  POST /v1/chat/completions  — non-streaming AND streaming (SSE). Embedded
                               engine (any GGUF stem in models_dir, multiple
                               models concurrently) AND openai-type cloud
                               backends. Alias chains execute with a hedge
@@ -12,24 +14,28 @@ Implemented:
                               cloud client. Cloud max_tokens capped at 800.
                               Over-capacity concurrent requests get 429 +
                               Retry-After (queue.max_waiting).
-  GET  /healthz             — backends, loaded instances (VRAM/ctx),
+  GET  /healthz              — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
-  GET/POST /admin/aliases   — list / upsert / delete aliases (persisted to
+  GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
                               data/gateway_config.json, applied immediately)
-  POST /admin/load          — preload an embedded instance (config model
+  GET/PUT /admin/config      — raw config editor (validated JSON object,
+                              written + hot-reloaded)
+  POST /admin/load           — preload an embedded instance (config model
                               or discovered stem)
-  POST /admin/unload        — drop instances ({model} or {all: true})
+  POST /admin/unload         — drop instances ({model} or {all: true})
+  GET  /admin/stats          — per-model latency/token/error aggregates +
+                              recent requests from gateway_log.jsonl
+  GET  /admin/events         — recent gateway log events (in-memory ring)
 
 Auth: bearer tokens from gateway_keys in the config (hot-reload). Empty
 list = open (localhost trust). Clients pass the key as the OpenAI api_key.
-All endpoints (including /healthz) require it when configured.
+All data endpoints (including /healthz) require it when configured.
 
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Arriving later: console page (Stage 5). /v1/completions and
-/v1/embeddings are deferred to v2, as is streaming tool-call deltas
-(stream + tools → 400 today).
+Deferred to v2: /v1/completions, /v1/embeddings, streaming tool-call
+deltas (stream + tools → 400 today), worker pools, llama-server backend.
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.
@@ -37,16 +43,18 @@ Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import cloud
@@ -57,7 +65,7 @@ from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="0.4.0-stage4")
+app = FastAPI(title="LLM Gateway", version="0.5.0-stage5")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
@@ -65,6 +73,43 @@ _log_lock = threading.Lock()
 # Concurrent chat completions in flight (queue admission control — the
 # event loop is single threaded, plain int arithmetic is safe)
 _active_chats = 0
+
+
+# ── In-memory event ring (console Logs pane) ───────────────────────────────
+
+class _RingHandler(logging.Handler):
+    """Keeps the last ~300 gateway log events for the console."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.events: collections.deque[dict[str, str]] = collections.deque(maxlen=300)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.events.append({
+                "ts": time.strftime("%H:%M:%S"),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage()[:300],
+            })
+        except Exception:  # noqa: BLE001 — never let logging break a request
+            pass
+
+
+_EVENTS: _RingHandler | None = None
+
+
+def _event_ring() -> _RingHandler:
+    global _EVENTS
+    if _EVENTS is None:
+        _EVENTS = _RingHandler()
+        logging.getLogger().addHandler(_EVENTS)
+        # our INFO events must survive even when nothing called basicConfig
+        logging.getLogger("gateway").setLevel(logging.INFO)
+    return _EVENTS
+
+
+_event_ring()  # attach at import — events before the first /admin/events call
 
 
 # ── OpenAI-shaped errors ───────────────────────────────────────────────────
@@ -88,6 +133,9 @@ async def _bearer_auth(request: Request, call_next):
     cfg.maybe_reload()
     keys = cfg.gateway_keys
     if keys:
+        if request.method == "GET" and request.url.path == "/":
+            return await call_next(request)  # static console shell — its API
+            # calls still require the key (the page prompts for it)
         auth = request.headers.get("authorization") or ""
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         if token not in keys:
@@ -621,4 +669,100 @@ async def admin_unload(payload: LoadPayload) -> Response:
                       "{\"all\": true})", param="model")
     n = engine.unload(which)
     return {"unloaded": n, "loaded": engine.loaded_models()}
+
+
+# ── Console (Stage 5): page + config editor + stats + events ───────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def console() -> Response:
+    """Single-page console (config / models / performance / logs panes)."""
+    html = (Path(__file__).resolve().parent / "console.html").read_text(
+        encoding="utf-8")
+    return HTMLResponse(html)
+
+
+@app.get("/admin/config")
+async def admin_get_config() -> Response:
+    """Raw config text for the console editor (defaults when no file)."""
+    cfg = get_gateway_config()
+    text = None
+    if cfg.path.is_file():
+        try:
+            text = cfg.path.read_text(encoding="utf-8")
+        except OSError:
+            text = None
+    if text is None:
+        text = json.dumps(default_config_raw(), indent=2)
+    return {"path": str(cfg.path), "text": text}
+
+
+class ConfigPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+
+
+@app.put("/admin/config")
+async def admin_put_config(payload: ConfigPayload) -> Response:
+    """Save the raw config text (validated as a JSON object) + reload now."""
+    try:
+        data = json.loads(payload.text)
+    except json.JSONDecodeError as e:
+        return _error(400, f"invalid JSON: {e}", param="text")
+    if not isinstance(data, dict):
+        return _error(400, "config must be a JSON object", param="text")
+    cfg = get_gateway_config()
+    cfg.path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.path.write_text(payload.text, encoding="utf-8")
+    cfg.reload_now()
+    return {"ok": True,
+            "backends": {n: len(b.get("models") or {})
+                         for n, b in cfg.backends.items()},
+            "aliases": sorted(cfg.aliases)}
+
+
+@app.get("/admin/stats")
+async def admin_stats() -> Response:
+    """Per-model aggregates + recent requests from gateway_log.jsonl."""
+    per: dict[tuple[str, str], dict[str, Any]] = {}
+    recent: list[dict[str, Any]] = []
+    total = 0
+    try:
+        lines = _LOG_PATH.read_text(encoding="utf-8").strip().splitlines()
+    except OSError:
+        lines = []
+    for ln in lines[-20000:]:
+        try:
+            e = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        total += 1
+        recent.append(e)
+        key = (str(e.get("model") or "?"), str(e.get("backend") or "?"))
+        agg = per.setdefault(key, {
+            "model": key[0], "backend": key[1], "n": 0, "ms_sum": 0,
+            "max_ms": 0, "total_tokens": 0, "errors": 0})
+        ms = int(e.get("ms") or 0)
+        agg["n"] += 1
+        agg["ms_sum"] += ms
+        agg["max_ms"] = max(agg["max_ms"], ms)
+        agg["total_tokens"] += int((e.get("usage") or {}).get("total_tokens") or 0)
+        if int(e.get("status") or 200) >= 400:
+            agg["errors"] += 1
+    rows = []
+    for agg in per.values():
+        rows.append({"model": agg["model"], "backend": agg["backend"],
+                     "n": agg["n"],
+                     "avg_ms": round(agg["ms_sum"] / agg["n"]) if agg["n"] else 0,
+                     "max_ms": agg["max_ms"],
+                     "total_tokens": agg["total_tokens"],
+                     "errors": agg["errors"]})
+    rows.sort(key=lambda r: -r["n"])
+    return {"per_model": rows, "recent": recent[-50:], "total": total}
+
+
+@app.get("/admin/events")
+async def admin_events() -> Response:
+    """Recent gateway log events (in-memory ring, newest last)."""
+    return {"events": list(_event_ring().events)}
 

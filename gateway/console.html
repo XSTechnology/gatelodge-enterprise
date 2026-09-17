@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #101114; color: #d7d7db;
+         font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+           padding: 10px 16px; background: #17181c; border-bottom: 1px solid #2a2b31; }
+  header h1 { font-size: 16px; margin: 0; color: #4ec9b0; }
+  #status { color: #9a9aa2; font-size: 12px; }
+  #keybar { margin-left: auto; display: none; gap: 6px; }
+  #keybar.show { display: flex; }
+  input, button, textarea { font: inherit; border-radius: 6px; border: 1px solid #33343b;
+    background: #1d1e23; color: #d7d7db; padding: 4px 8px; }
+  button { cursor: pointer; }
+  button:hover { border-color: #4ec9b0; }
+  button.danger:hover { border-color: #e05555; color: #e05555; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  section { background: #17181c; border: 1px solid #2a2b31; border-radius: 10px;
+            padding: 12px; min-width: 0; }
+  section h2 { font-size: 13px; margin: 0 0 10px; color: #4ec9b0;
+               text-transform: uppercase; letter-spacing: .08em; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #232429;
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
+  th { color: #8a8a92; font-weight: 500; }
+  td.num, th.num { text-align: right; }
+  .muted { color: #8a8a92; }
+  .err { color: #e05555; }
+  .ok { color: #6fbf73; }
+  #cfg-raw { width: 100%; height: 220px; font: 12px/1.4 Consolas, monospace;
+             white-space: pre; resize: vertical; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  #logs { font: 11.5px/1.5 Consolas, monospace; max-height: 340px; overflow-y: auto;
+          background: #101114; border: 1px solid #232429; border-radius: 6px; padding: 6px; }
+  #logs .INFO { color: #9a9aa2; } #logs .WARNING { color: #d9a659; }
+  #logs .ERROR { color: #e05555; } #logs .ts { color: #5c5c64; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .chip { border: 1px solid #33343b; border-radius: 999px; padding: 2px 10px;
+          font-size: 12px; display: inline-flex; gap: 8px; align-items: center; }
+  .chip .own { color: #5c5c64; font-size: 10.5px; }
+  .toast { position: fixed; bottom: 14px; right: 14px; background: #1d1e23;
+           border: 1px solid #4ec9b0; border-radius: 8px; padding: 8px 14px;
+           display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LLM Gateway</h1>
+  <span id="status">connecting…</span>
+  <span id="keybar">
+    <input id="key" type="password" placeholder="API key" style="width:180px">
+    <button id="key-save">Save</button>
+  </span>
+</header>
+<div class="grid">
+
+  <section id="pane-config">
+    <h2>Config</h2>
+    <div class="row">
+      <input id="al-name" placeholder="alias name" style="width:140px">
+      <input id="al-chain" placeholder="chain: local:model, groq:fast" style="flex:1;min-width:220px">
+      <input id="al-hedge" placeholder="hedge_s" style="width:80px" type="number" min="0" step="0.5">
+      <label class="muted"><input type="checkbox" id="al-local"> local_only</label>
+      <button id="al-add">Upsert alias</button>
+    </div>
+    <table id="aliases"><thead><tr><th>alias</th><th>chain</th><th class="num">hedge_s</th><th>local_only</th><th></th></tr></thead><tbody></tbody></table>
+    <div class="row" style="margin-top:10px">
+      <button id="cfg-save">Save config JSON</button>
+      <span class="muted" id="cfg-path"></span>
+    </div>
+    <textarea id="cfg-raw" spellcheck="false"></textarea>
+  </section>
+
+  <section id="pane-models">
+    <h2>Models</h2>
+    <div class="muted" id="gpus"></div>
+    <table id="loaded"><thead><tr><th>loaded</th><th>ctx</th><th class="num">vram</th><th class="num">load_s</th><th></th></tr></thead><tbody></tbody></table>
+    <div class="muted" style="margin-top:10px">available (aliases + config models + discovered stems)</div>
+    <div class="chips" id="available"></div>
+  </section>
+
+  <section id="pane-perf">
+    <h2>Performance</h2>
+    <table id="perf"><thead><tr><th>model</th><th>backend</th><th class="num">reqs</th><th class="num">avg ms</th><th class="num">max ms</th><th class="num">tokens</th><th class="num">errors</th></tr></thead><tbody></tbody></table>
+    <div class="muted" id="perf-total" style="margin-top:8px"></div>
+  </section>
+
+  <section id="pane-logs">
+    <h2>Logs</h2>
+    <div id="logs"></div>
+  </section>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KEY = localStorage.getItem("gw_key") || "";
+
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.borderColor = isErr ? "#e05555" : "#4ec9b0";
+  t.style.display = "block";
+  setTimeout(() => { t.style.display = "none"; }, 2500);
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({"Content-Type": "application/json"}, opts.headers || {});
+  if (KEY) headers["Authorization"] = "Bearer " + KEY;
+  const r = await fetch(path, Object.assign({}, opts, {headers}));
+  if (r.status === 401) { $("keybar").classList.add("show"); throw new Error("401"); }
+  return r;
+}
+
+$("key-save").onclick = () => {
+  localStorage.setItem("gw_key", $("key").value);
+  location.reload();
+};
+
+/* ── Config pane ── */
+async function refreshConfig() {
+  const r = await api("/admin/config").catch(() => null);
+  if (!r || !r.ok) return;
+  const d = await r.json();
+  $("cfg-raw").value = d.text;
+  $("cfg-path").textContent = d.path;
+  const ra = await api("/admin/aliases").then(x => x.json()).catch(() => ({aliases: {}}));
+  const tb = $("aliases").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const [name, a] of Object.entries(ra.aliases || {})) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${esc(name)}</td><td>${esc((a.chain || []).join(" → "))}</td>` +
+      `<td class="num">${a.hedge_s ?? 0}</td><td>${a.local_only ? "🔒" : ""}</td>` +
+      `<td><button class="danger" data-del="${esc(name)}">del</button></td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
+    const r = await api("/admin/aliases", {method: "POST",
+      body: JSON.stringify({name: b.dataset.del, delete: true})});
+    if (r.ok) { toast("alias deleted"); refreshAll(); } else toast("delete failed", true);
+  });
+}
+
+$("al-add").onclick = async () => {
+  const chain = $("al-chain").value.split(",").map(s => s.trim()).filter(Boolean);
+  const body = {name: $("al-name").value.trim(), chain};
+  const h = parseFloat($("al-hedge").value);
+  if (!isNaN(h)) body.hedge_s = h;
+  if ($("al-local").checked) body.local_only = true;
+  const r = await api("/admin/aliases", {method: "POST", body: JSON.stringify(body)});
+  if (r.ok) { toast("alias saved"); refreshAll(); }
+  else toast((await r.json()).error.message, true);
+};
+
+$("cfg-save").onclick = async () => {
+  const r = await api("/admin/config", {method: "PUT",
+    body: JSON.stringify({text: $("cfg-raw").value})});
+  if (r.ok) { toast("config saved + reloaded"); refreshAll(); }
+  else toast((await r.json()).error.message, true);
+};
+
+/* ── Models pane ── */
+async function refreshModels() {
+  const h = await api("/healthz").then(r => r.json()).catch(() => null);
+  if (!h) { $("status").textContent = "unreachable"; return; }
+  $("status").textContent = `${h.version} · ${h.loaded_count} loaded · ` +
+    (h.gpus || []).map(g => `${g.name}: ${g.used_mb}/${g.total_mb} MB (free ${g.free_mb})`).join(" · ");
+  $("gpus").textContent = (h.gpus || []).map(g =>
+    `${g.name} — used ${fmtMB(g.used_mb)} / ${fmtMB(g.total_mb)}, free ${fmtMB(g.free_mb)}`).join(" | ");
+  const tb = $("loaded").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const m of h.loaded || []) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td title="${esc(m.path)}">${esc(m.alias)}</td><td class="num">${m.n_ctx}</td>` +
+      `<td class="num">${esc(m.size_vram_human)}</td><td class="num">${m.load_s}s</td>` +
+      `<td><button class="danger" data-un="${esc(m.alias)}">unload</button></td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("[data-un]").forEach(b => b.onclick = async () => {
+    const r = await api("/admin/unload", {method: "POST",
+      body: JSON.stringify({model: b.dataset.un})});
+    if (r.ok) refreshAll(); else toast("unload failed", true);
+  });
+  const models = await api("/v1/models").then(r => r.json()).catch(() => ({data: []}));
+  const chips = $("available");
+  chips.innerHTML = "";
+  for (const m of models.data || []) {
+    const el = document.createElement("span");
+    el.className = "chip";
+    el.innerHTML = `<span>${esc(m.id)}</span><span class="own">${esc(m.owned_by)}</span>` +
+      `<button data-load="${esc(m.id)}" title="preload">↑</button>`;
+    chips.appendChild(el);
+  }
+  chips.querySelectorAll("[data-load]").forEach(b => b.onclick = async () => {
+    b.textContent = "…";
+    const r = await api("/admin/load", {method: "POST",
+      body: JSON.stringify({model: b.dataset.load})});
+    if (r.ok) { toast("loaded"); refreshAll(); }
+    else { b.textContent = "↑"; toast((await r.json()).error.message, true); }
+  });
+}
+
+/* ── Performance pane ── */
+async function refreshPerf() {
+  const s = await api("/admin/stats").then(r => r.json()).catch(() => null);
+  if (!s) return;
+  const tb = $("perf").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const r of s.per_model || []) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${esc(r.model)}</td><td>${esc(r.backend)}</td>` +
+      `<td class="num">${r.n}</td><td class="num">${r.avg_ms}</td>` +
+      `<td class="num">${r.max_ms}</td><td class="num">${r.total_tokens}</td>` +
+      `<td class="num ${r.errors ? "err" : ""}">${r.errors}</td>`;
+    tb.appendChild(tr);
+  }
+  $("perf-total").textContent = `${s.total} requests logged` +
+    (s.recent ? ` — last: ${esc(s.recent[s.recent.length - 1]?.model || "")}` : "");
+}
+
+/* ── Logs pane ── */
+async function refreshLogs() {
+  const ev = await api("/admin/events").then(r => r.json()).catch(() => null);
+  const st = await api("/admin/stats").then(r => r.json()).catch(() => null);
+  const box = $("logs");
+  const lines = [];
+  for (const e of (ev && ev.events) || [])
+    lines.push(`<div class="${e.level}"><span class="ts">${e.ts}</span> ${e.level} ${esc(e.logger)}: ${esc(e.message)}</div>`);
+  for (const r of ((st && st.recent) || []).slice(-15).reverse())
+    lines.push(`<div class="INFO"><span class="ts">${r.ts}</span> REQ ${esc(r.model)} ${r.backend} ${r.stream ? "stream" : ""} ${r.ms}ms <span class="${r.status >= 400 ? "err" : "ok"}">${r.status}</span></div>`);
+  box.innerHTML = lines.slice(-250).join("");
+}
+
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : mb + " MB"; }
+
+async function refreshAll() {
+  await Promise.allSettled([refreshConfig(), refreshModels(), refreshPerf(), refreshLogs()]);
+}
+refreshAll();
+setInterval(refreshAll, 4000);
+</script>
+</body>
+</html>
