@@ -99,7 +99,9 @@ from . import cloud
 from . import llamaserver
 from . import runpod
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
-                     get_gateway_config)
+                     get_gateway_config,
+                     EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
+                     RUNPOD_BACKEND)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
                      get_engine, installed_ggufs)
 
@@ -236,35 +238,277 @@ class ChatRequest(BaseModel):
 
 @app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
+    """Model inventory with routing metadata.
+
+    Every entry carries enough information for a consuming program to make
+    smart routing decisions: capabilities, backend type, live status,
+    VRAM cost, context length, locality (privacy), and alias resolution.
+
+    OpenAI-compatible shape — extra fields are ignored by the SDK but
+    available for programmatic consumption.
+    """
     cfg = get_gateway_config()
     cfg.maybe_reload()
+    engine = get_engine()
+
+    # ── gather live state ────────────────────────────────────────────
+    loaded = {m["alias"]: m for m in engine.loaded_models()}
+    lsrv_status = {f"{s['backend']}:{s['model']}": s
+                   for s in llamaserver.status()}
+    rp_status = {f"{s['backend']}:{s['model']}": s
+                 for s in runpod.status()}
+
+    # embedding model names (local)
+    embed_names = set(cfg.local_embedding_models())
+
     data: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def _add(model_id: str, owned_by: str) -> None:
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            data.append({"id": model_id, "object": "model",
-                         "created": 0, "owned_by": owned_by})
+    def _add(entry: dict[str, Any]) -> None:
+        if entry["id"] and entry["id"] not in seen:
+            seen.add(entry["id"])
+            data.append(entry)
 
-    # Aliases are the user-facing surface — listed first and winning name
-    # collisions (owned_by = the alias's primary backend).
+    # ── aliases (user-facing names, listed first) ────────────────────
     for name, alias in cfg.aliases.items():
         chain = alias.get("chain") or []
-        backend = chain[0].partition(":")[0] if chain else "gateway"
-        _add(name, backend if backend in cfg.backends else "gateway")
-    for bname, b in cfg.backends.items():
-        for mname in (b.get("models") or {}):
-            _add(mname, bname)
-    # Auto-discovered GGUFs — every stem in models_dir is servable without
-    # any config (aliases and config models shadow same-named stems).
+        if not chain:
+            continue
+        primary_backend, _, primary_model = chain[0].partition(":")
+        backend_cfg = cfg.backends.get(primary_backend, {})
+        btype = backend_cfg.get("type", "gateway")
+
+        # Determine capabilities from chain entries
+        caps = _resolve_capabilities(chain, cfg, embed_names)
+        is_local = all(cfg._entry_is_local(c.partition(":")[0]) for c in chain)
+
+        _add({
+            "id": name,
+            "object": "model",
+            "created": 0,
+            "owned_by": primary_backend,
+            "capabilities": caps,
+            "backend_type": _backend_label(btype, primary_backend, cfg),
+            "status": "available",
+            "local": is_local,
+            "chain": chain,
+            "hedge_s": float(alias.get("hedge_s") or 0),
+            "local_only": bool(alias.get("local_only")),
+        })
+
+    # ── backend models ───────────────────────────────────────────────
+    for bname, backend in cfg.backends.items():
+        btype = backend.get("type")
+        models = backend.get("models") or {}
+        label = _backend_label(btype, bname, cfg)
+
+        for mname, mcfg in models.items():
+            key = f"{bname}:{mname}"
+            caps = ["chat", "completions"]
+
+            if btype == EMBEDDED_BACKEND:
+                gguf = mcfg.get("gguf", mname)
+                ctx = mcfg.get("ctx", 4096)
+                workers = mcfg.get("workers", 1)
+                placement = mcfg.get("placement", "")
+
+                # Check loaded state
+                inst = loaded.get(mname)
+                status = "loaded" if inst else "available"
+                vram = inst.get("size_vram", 0) if inst else 0
+                role = inst.get("role", "chat") if inst else "chat"
+
+                _add({
+                    "id": mname,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": bname,
+                    "capabilities": caps,
+                    "backend_type": label,
+                    "status": status,
+                    "local": True,
+                    "vram_mb": vram // (1024 * 1024) if vram else 0,
+                    "context_length": ctx,
+                    "workers": workers,
+                    "placement": placement,
+                    "gguf": gguf,
+                    "role": role,
+                })
+
+            elif btype == LLAMA_SERVER_BACKEND:
+                base_url = backend.get("base_url")
+                if base_url:
+                    # Remote mode — always available
+                    remote_id = mcfg if isinstance(mcfg, str) else mcfg.get("name", mname)
+                    _add({
+                        "id": mname,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": bname,
+                        "capabilities": caps,
+                        "backend_type": label,
+                        "status": "available",
+                        "local": False,
+                        "remote_id": remote_id,
+                    })
+                else:
+                    # Subprocess mode
+                    ctx = mcfg.get("ctx", 4096)
+                    parallel = mcfg.get("parallel", 1)
+                    ls = lsrv_status.get(key)
+                    status = "loaded" if (ls and ls.get("state") == "running") else "available"
+
+                    _add({
+                        "id": mname,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": bname,
+                        "capabilities": caps,
+                        "backend_type": label,
+                        "status": status,
+                        "local": True,
+                        "context_length": ctx,
+                        "parallel": parallel,
+                        "pid": ls.get("pid") if ls else None,
+                    })
+
+            elif btype == RUNPOD_BACKEND:
+                # Determine if serverless or pod
+                has_endpoint = "endpoint_id" in mcfg
+                if has_endpoint:
+                    # Serverless — always available (cold start possible)
+                    transport = mcfg.get("transport", "openai")
+                    timeout = mcfg.get("timeout_s", backend.get("timeout_s", 120))
+                    _add({
+                        "id": mname,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": bname,
+                        "capabilities": caps,
+                        "backend_type": label,
+                        "status": "available",
+                        "local": False,
+                        "endpoint_id": mcfg.get("endpoint_id"),
+                        "transport": transport,
+                        "timeout_s": timeout,
+                    })
+                else:
+                    # Pod mode
+                    rp = rp_status.get(key)
+                    state = (rp.get("state") if rp else "not-deployed")
+                    status = "loaded" if state == "running" else state
+
+                    _add({
+                        "id": mname,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": bname,
+                        "capabilities": caps,
+                        "backend_type": label,
+                        "status": status,
+                        "local": False,
+                        "pod_id": (rp.get("pod_id") if rp else mcfg.get("pod_id")),
+                        "idle_stop_s": mcfg.get("idle_stop_s", 0),
+                        "idle_terminate_s": mcfg.get("idle_terminate_s", 0),
+                    })
+
+            elif btype == OPENAI_BACKEND:
+                # Cloud backend
+                remote_id = mcfg if isinstance(mcfg, str) else mcfg.get("name", mname)
+                _add({
+                    "id": mname,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": bname,
+                    "capabilities": caps,
+                    "backend_type": label,
+                    "status": "available",
+                    "local": False,
+                    "remote_id": remote_id,
+                })
+
+    # ── auto-discovered GGUFs ────────────────────────────────────────
     local = cfg.local_backend_name() or "local"
     for g in installed_ggufs(cfg.models_dir):
-        _add(g["name"], local)
-    # Configured embedding models (explicit only — never auto-discovered)
-    for mname in cfg.local_embedding_models():
-        _add(mname, local)
+        stem = g["name"]
+        if stem in seen:
+            continue
+        inst = loaded.get(stem)
+        is_embed = stem in embed_names
+        caps = ["embeddings"] if is_embed else ["chat", "completions"]
+
+        _add({
+            "id": stem,
+            "object": "model",
+            "created": 0,
+            "owned_by": local,
+            "capabilities": caps,
+            "backend_type": "embedded",
+            "status": "loaded" if inst else "available",
+            "local": True,
+            "vram_mb": (inst.get("size_vram", 0) // (1024 * 1024)) if inst else 0,
+            "context_length": (inst.get("n_ctx", 4096) if inst else 4096),
+            "role": "embed" if is_embed else "chat",
+            "quantization": g.get("quantization", "—"),
+            "size_on_disk": g.get("size", 0),
+        })
+
+    # ── embedding models not yet covered ─────────────────────────────
+    for mname in embed_names:
+        if mname not in seen:
+            inst = loaded.get(mname)
+            _add({
+                "id": mname,
+                "object": "model",
+                "created": 0,
+                "owned_by": local,
+                "capabilities": ["embeddings"],
+                "backend_type": "embedded",
+                "status": "loaded" if inst else "available",
+                "local": True,
+                "vram_mb": (inst.get("size_vram", 0) // (1024 * 1024)) if inst else 0,
+                "role": "embed",
+            })
+
     return {"object": "list", "data": data}
+
+
+def _backend_label(btype: str | None, bname: str, cfg) -> str:
+    """Human-readable backend type label."""
+    if btype == EMBEDDED_BACKEND:
+        return "embedded"
+    if btype == LLAMA_SERVER_BACKEND:
+        backend = cfg.backends.get(bname, {})
+        if backend.get("base_url"):
+            return "llama-server-remote"
+        return "llama-server-subprocess"
+    if btype == RUNPOD_BACKEND:
+        return "runpod"
+    if btype == OPENAI_BACKEND:
+        return "openai-cloud"
+    return btype or "unknown"
+
+
+def _resolve_capabilities(chain: list[str], cfg, embed_names: set) -> list[str]:
+    """Determine capabilities from chain entries."""
+    caps = set()
+    for entry in chain:
+        backend_name = entry.partition(":")[0]
+        model_key = entry.partition(":")[2]
+        backend = cfg.backends.get(backend_name, {})
+        if backend.get("type") == EMBEDDED_BACKEND:
+            models = backend.get("models", {})
+            mcfg = models.get(model_key, {})
+            gguf = mcfg.get("gguf", model_key)
+            if gguf in embed_names or model_key in embed_names:
+                caps.add("embeddings")
+            else:
+                caps.add("chat")
+                caps.add("completions")
+        else:
+            caps.add("chat")
+            caps.add("completions")
+    return sorted(caps) if caps else ["chat", "completions"]
 
 
 # ── chain execution ────────────────────────────────────────────────────────
