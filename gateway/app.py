@@ -1780,6 +1780,74 @@ def _remove_model_from_config(raw: dict, backend: str, name: str,
     models.pop(name, None)
 
 
+# ── Admin: backend CRUD ────────────────────────────────────────────────────
+
+class BackendConfigPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = ""
+    backend_type: str = "embedded"  # embedded, llama-server, openai, runpod
+    # llama-server subprocess
+    server_exe: str = ""
+    host: str = ""
+    port_base: int | None = None
+    start_timeout_s: float | None = None
+    idle_timeout_s: float | None = None
+    extra_args: str = ""  # space-separated, stored as list
+    # remote (llama-server remote, openai, runpod)
+    base_url: str = ""
+    api_key_env: str = ""
+    # delete
+    delete: bool = False
+
+
+@app.post("/admin/backends")
+async def admin_upsert_backend(payload: BackendConfigPayload) -> Response:
+    """Create or update a backend configuration entry."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    name = payload.name.strip()
+    if not name:
+        return _error(400, "backend name must not be empty", param="name")
+
+    if payload.delete:
+        _mutate_config(lambda raw: raw.get("backends", {}).pop(name, None))
+        return {"deleted": name}
+
+    # Build backend config
+    bcfg: dict[str, Any] = {"type": payload.backend_type}
+
+    if payload.backend_type == LLAMA_SERVER_BACKEND:
+        if payload.base_url:
+            # Remote mode
+            bcfg["base_url"] = payload.base_url.rstrip("/")
+            if payload.api_key_env:
+                bcfg["api_key_env"] = payload.api_key_env
+        else:
+            # Subprocess mode
+            if payload.server_exe:
+                bcfg["server_exe"] = payload.server_exe
+            if payload.host:
+                bcfg["host"] = payload.host
+            if payload.port_base is not None:
+                bcfg["port_base"] = payload.port_base
+            if payload.start_timeout_s is not None:
+                bcfg["start_timeout_s"] = payload.start_timeout_s
+            if payload.idle_timeout_s is not None:
+                bcfg["idle_timeout_s"] = payload.idle_timeout_s
+            if payload.extra_args:
+                bcfg["extra_args"] = payload.extra_args.split()
+    elif payload.backend_type == RUNPOD_BACKEND:
+        bcfg["api_key_env"] = payload.api_key_env or "RUNPOD_API_KEY"
+    elif payload.backend_type == OPENAI_BACKEND:
+        if payload.base_url:
+            bcfg["base_url"] = payload.base_url.rstrip("/")
+        if payload.api_key_env:
+            bcfg["api_key_env"] = payload.api_key_env
+
+    _mutate_config(lambda raw: raw.setdefault("backends", {}).update({name: bcfg}))
+    return {"saved": name, "type": payload.backend_type}
+
+
 @app.get("/admin/secrets")
 async def admin_secrets() -> Response:
     """API-key STATUS for the console — which env vars the configured

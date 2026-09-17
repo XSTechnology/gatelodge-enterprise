@@ -538,72 +538,205 @@ function unload(name) {
 }
 
 // ---------- Services ----------
+var _editBackendName = null;
+var _svcBackends = {}; // name -> backend config for edit
 function showServices(ui) {
   ui.title.textContent = '🔌 Service Definitions';
+  _editBackendName = null;
   Promise.all([api('/admin/backends'), api('/healthz')]).then(function (r) {
     var defs = r[0], hz = r[1];
     var children = hz.llama_server || [], pods = hz.runpod || [];
-    var html = '';
-    (defs.backends || []).forEach(function (b) {
-      html += '<div class="svc-card"><div class="svc-head"><b>' + esc(b.name) + '</b>' +
-        '<span class="badge ' + esc(b.type) + '">' + esc(b.type) +
-        (b.mode ? ' · ' + esc(b.mode) : '') + '</span></div><div class="svc-params">';
-      var params = [];
-      if (b.type === 'embedded') {
-        params.push('models_dir: ' + esc(defs.models_dir));
-      } else if (b.type === 'llama-server') {
-        if (b.mode === 'remote') params.push('base_url: ' + esc(b.base_url),
-          'api_key_env: ' + esc(b.api_key_env || '(none)'));
-        else params.push('exe: ' + esc(b.server_exe), 'ports ' + esc(b.port_base) + '+',
-          'idle ' + esc(b.idle_timeout_s) + 's');
-      } else if (b.type === 'runpod') {
-        params.push('api_key_env: ' + esc(b.api_key_env));
-      } else {
-        params.push('base_url: ' + esc(b.base_url), 'api_key_env: ' + esc(b.api_key_env || '(none)'));
-      }
-      html += params.join(' · ') + '</div><div class="svc-models">';
-      var mm = b.models || {};
-      if (b.embedding_models && Object.keys(b.embedding_models).length)
-        mm = Object.assign({}, mm, b.embedding_models);
-      var names = Object.keys(mm);
-      if (!names.length) html += '<span class="muted">no models configured</span>';
-      names.forEach(function (n) {
-        var m = mm[n];
-        var bits = [];
-        if (m.endpoint_id) bits.push(esc(m.transport || 'openai'), 'ep ' + esc(m.endpoint_id));
-        else if (m.pod_id) bits.push('pod ' + esc(m.pod_id));
-        else { bits.push(esc(m.gguf || m)); if (m.ctx) bits.push('ctx ' + m.ctx);
-               if (m.workers > 1) bits.push('×' + m.workers + ' workers');
-               if (m.parallel > 1) bits.push('×' + m.parallel + ' slots'); }
-        html += '<div class="kv">· <b>' + esc(n) + '</b> <span class="muted">' +
-          (typeof m === 'string' ? '' : bits.join(' · ')) + '</span></div>';
-      });
-      html += '</div></div>';
-    });
-    // live children + pods
-    if (children.length) {
-      html += '<div class="widget"><h3>Live llama-server children</h3><table><tbody>';
-      children.forEach(function (c) {
-        html += '<tr><td><b>' + esc(c.backend) + ':' + esc(c.model) + '</b></td>' +
-          '<td>' + esc(c.state) + '</td><td>pid ' + (c.pid || '—') + '</td>' +
-          '<td>×' + c.parallel + ' slots</td><td class="muted">idle ' + (c.idle_s || 0) + 's</td>' +
-          '<td><button class="btn btn-sm btn-danger" onclick="stopChild(\'' + esc(c.backend) + '\',\'' + esc(c.model) + '\')">stop</button></td></tr>';
-      });
-      html += '</tbody></table><div class="muted">Children respawn lazily on the next request.</div></div>';
-    }
-    if (pods.length) {
-      html += '<div class="widget"><h3>Live runpod pods</h3><table><tbody>';
-      pods.forEach(function (p) {
-        html += '<tr><td><b>' + esc(p.backend) + ':' + esc(p.model) + '</b></td>' +
-          '<td>' + esc(p.state) + '</td><td class="muted">' + esc(p.pod_id || '') + '</td>' +
-          '<td class="muted">idle ' + (p.idle_s || 0) + 's</td>' +
-          '<td><button class="btn btn-sm" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',false)">stop</button> ' +
-          '<button class="btn btn-sm btn-danger" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',true)">terminate</button></td></tr>';
-      });
-      html += '</tbody></table><div class="muted">stop keeps storage (cheap resume); terminate frees everything (full redeploy next request).</div></div>';
-    }
+    // Store backend data for edit
+    _svcBackends = {};
+    (defs.backends || []).forEach(function (b) { _svcBackends[b.name] = b; });
+    var html = buildBackendForm(defs) +
+      buildBackendTable(defs) +
+      buildLiveChildren(children) +
+      buildLivePods(pods);
     ui.body.innerHTML = html;
+    setTimeout(function () { onSvcBackendChange(); }, 50);
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+
+function buildBackendForm(defs) {
+  var html = '<div class="widget"><h3>' + (_editBackendName ? 'Edit backend' : 'Add backend') + '</h3>';
+  html += '<div class="srow"><label>Name</label><input id="s-name" placeholder="groq"></div>';
+  html += '<div class="srow"><label>Type</label><select id="s-type" onchange="onSvcBackendChange()">' +
+    '<option value="embedded">Embedded (local GGUF)</option>' +
+    '<option value="llama-server">Llama-server (subprocess)</option>' +
+    '<option value="llama-server-remote">Llama-server (remote)</option>' +
+    '<option value="runpod">RunPod</option>' +
+    '<option value="openai">OpenAI cloud</option></select></div>';
+  html += '<div id="s-fields"></div>';
+  html += '<div style="margin-top:10px;display:flex;gap:8px;">' +
+    '<button class="btn btn-primary" onclick="saveBackend()">Save</button>' +
+    '<button class="btn" onclick="cancelBackendEdit()">Cancel</button></div>';
+  html += '<div class="muted" style="margin-top:6px">Backend-level settings. Models are managed in the Models panel.</div>';
+  html += '</div>';
+  return html;
+}
+
+function onSvcBackendChange() {
+  var stype = document.getElementById('s-type').value;
+  var container = document.getElementById('s-fields');
+  if (!container) return;
+  var html = '';
+  if (stype === 'embedded') {
+    html += '<div class="muted" style="margin-left:148px">Uses models_dir from Parameters. No extra settings needed.</div>';
+  } else if (stype === 'llama-server') {
+    html += '<div class="srow"><label>Server executable</label><input id="s-server_exe" placeholder="llama-server"></div>' +
+      '<div class="srow"><label>Host</label><input id="s-host" placeholder="127.0.0.1"></div>' +
+      '<div class="srow"><label>Port base</label><input id="s-port_base" type="number" min="1024" value="8120"></div>' +
+      '<div class="srow"><label>Start timeout (s)</label><input id="s-start_timeout_s" type="number" min="1" value="180"></div>' +
+      '<div class="srow"><label>Idle timeout (s, 0=never)</label><input id="s-idle_timeout_s" type="number" min="0" value="0"></div>' +
+      '<div class="srow"><label>Extra args</label><input id="s-extra_args" placeholder="--jinja --no-webui" style="flex:1;min-width:260px"></div>';
+  } else if (stype === 'llama-server-remote') {
+    html += '<div class="srow"><label>Base URL</label><input id="s-base_url" placeholder="http://192.168.1.100:8080" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="(blank = none)"></div>';
+  } else if (stype === 'runpod') {
+    html += '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="RUNPOD_API_KEY" value="RUNPOD_API_KEY"></div>' +
+      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Key stored in OS keyring or env var. Models use endpoint_id or pod_id.</div>';
+  } else if (stype === 'openai') {
+    html += '<div class="srow"><label>Base URL</label><input id="s-base_url" placeholder="https://api.groq.com/openai/v1" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="GROQ_API_KEY"></div>';
+  }
+  container.innerHTML = html;
+}
+
+function buildBackendTable(defs) {
+  var backends = defs.backends || [];
+  var html = '<div class="widget"><h3>Configured backends (' + backends.length + ')</h3>';
+  if (!backends.length) {
+    html += '<div class="muted">No backends configured.</div>';
+  } else {
+    html += '<table><thead><tr><th>name</th><th>type</th><th>mode</th><th>settings</th><th></th></tr></thead><tbody>';
+    backends.forEach(function (b) {
+      var settings = [];
+      if (b.type === 'llama-server') {
+        if (b.mode === 'remote') settings.push('url: ' + esc(b.base_url || ''));
+        else settings.push('exe: ' + esc(b.server_exe || ''), 'ports ' + (b.port_base || 8120) + '+', 'idle ' + (b.idle_timeout_s || 0) + 's');
+      } else if (b.type === 'runpod') {
+        settings.push('key: ' + esc(b.api_key_env || ''));
+      } else if (b.type === 'openai') {
+        settings.push('url: ' + esc(b.base_url || ''), 'key: ' + esc(b.api_key_env || ''));
+      }
+      var modelCount = Object.keys(b.models || {}).length + Object.keys(b.embedding_models || {}).length;
+      html += '<tr><td><b>' + esc(b.name) + '</b> <span class="muted">(' + modelCount + ' models)</span></td>' +
+        '<td><span class="badge ' + esc(b.type) + '">' + esc(b.type) + '</span></td>' +
+        '<td>' + esc(b.mode || '—') + '</td>' +
+        '<td class="muted">' + (settings.length ? settings.join(' · ') : '—') + '</td>' +
+        '<td><button class="btn btn-sm" onclick="editBackend(\'' + esc(b.name) + '\')">edit</button> ' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteBackend(\'' + esc(b.name) + '\')">delete</button></td></tr>';
+    });
+    html += '</tbody></table>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function buildLiveChildren(children) {
+  if (!children.length) return '';
+  var html = '<div class="widget"><h3>Live llama-server children</h3><table><tbody>';
+  children.forEach(function (c) {
+    html += '<tr><td><b>' + esc(c.backend) + ':' + esc(c.model) + '</b></td>' +
+      '<td>' + esc(c.state) + '</td><td>pid ' + (c.pid || '—') + '</td>' +
+      '<td>×' + c.parallel + ' slots</td><td class="muted">idle ' + (c.idle_s || 0) + 's</td>' +
+      '<td><button class="btn btn-sm btn-danger" onclick="stopChild(\'' + esc(c.backend) + '\',\'' + esc(c.model) + '\')">stop</button></td></tr>';
+  });
+  html += '</tbody></table><div class="muted">Children respawn lazily on the next request.</div></div>';
+  return html;
+}
+
+function buildLivePods(pods) {
+  if (!pods.length) return '';
+  var html = '<div class="widget"><h3>Live runpod pods</h3><table><tbody>';
+  pods.forEach(function (p) {
+    html += '<tr><td><b>' + esc(p.backend) + ':' + esc(p.model) + '</b></td>' +
+      '<td>' + esc(p.state) + '</td><td class="muted">' + esc(p.pod_id || '') + '</td>' +
+      '<td class="muted">idle ' + (p.idle_s || 0) + 's</td>' +
+      '<td><button class="btn btn-sm" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',false)">stop</button> ' +
+      '<button class="btn btn-sm btn-danger" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',true)">terminate</button></td></tr>';
+  });
+  html += '</tbody></table><div class="muted">stop keeps storage (cheap resume); terminate frees everything (full redeploy next request).</div></div>';
+  return html;
+}
+
+// ---------- Backend CRUD actions ----------
+function saveBackend() {
+  var name = document.getElementById('s-name').value.trim();
+  var stype = document.getElementById('s-type').value;
+  if (!name) { notify('✗ Name is required', true); return; }
+  var payload = {name: name, backend_type: (stype === 'llama-server-remote') ? 'llama-server' : stype};
+  if (stype === 'llama-server') {
+    var server_exe = document.getElementById('s-server_exe');
+    if (server_exe) payload.server_exe = server_exe.value.trim();
+    var host = document.getElementById('s-host');
+    if (host) payload.host = host.value.trim();
+    var port_base = document.getElementById('s-port_base');
+    if (port_base && port_base.value) payload.port_base = parseInt(port_base.value);
+    var start_timeout_s = document.getElementById('s-start_timeout_s');
+    if (start_timeout_s && start_timeout_s.value) payload.start_timeout_s = parseFloat(start_timeout_s.value);
+    var idle_timeout_s = document.getElementById('s-idle_timeout_s');
+    if (idle_timeout_s && idle_timeout_s.value) payload.idle_timeout_s = parseFloat(idle_timeout_s.value);
+    var extra_args = document.getElementById('s-extra_args');
+    if (extra_args) payload.extra_args = extra_args.value.trim();
+  } else if (stype === 'llama-server-remote') {
+    var base_url = document.getElementById('s-base_url');
+    if (base_url) payload.base_url = base_url.value.trim();
+    var api_key_env = document.getElementById('s-api_key_env');
+    if (api_key_env) payload.api_key_env = api_key_env.value.trim();
+  } else if (stype === 'runpod') {
+    var api_key_env = document.getElementById('s-api_key_env');
+    if (api_key_env) payload.api_key_env = api_key_env.value.trim();
+  } else if (stype === 'openai') {
+    var base_url = document.getElementById('s-base_url');
+    if (base_url) payload.base_url = base_url.value.trim();
+    var api_key_env = document.getElementById('s-api_key_env');
+    if (api_key_env) payload.api_key_env = api_key_env.value.trim();
+  }
+  api('/admin/backends', {method: 'POST', body: payload})
+    .then(function () { notify('✓ ' + name + ' saved'); _editBackendName = null; showPanel('services'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function editBackend(name) {
+  _editBackendName = name;
+  // Look up backend from _svcBackends
+  var b = (_svcBackends || {})[name];
+  if (!b) { notify('✗ Backend not found', true); return; }
+  document.getElementById('s-name').value = b.name;
+  var stype = b.type;
+  if (b.mode === 'remote') stype = 'llama-server-remote';
+  document.getElementById('s-type').value = stype;
+  onSvcBackendChange();
+  // Populate fields
+  if (stype === 'llama-server') {
+    var el = document.getElementById('s-server_exe'); if (el && b.server_exe) el.value = b.server_exe;
+    el = document.getElementById('s-host'); if (el && b.host) el.value = b.host;
+    el = document.getElementById('s-port_base'); if (el && b.port_base) el.value = b.port_base;
+    el = document.getElementById('s-start_timeout_s'); if (el && b.start_timeout_s) el.value = b.start_timeout_s;
+    el = document.getElementById('s-idle_timeout_s'); if (el && b.idle_timeout_s) el.value = b.idle_timeout_s;
+    el = document.getElementById('s-extra_args'); if (el && b.extra_args) el.value = b.extra_args.join(' ');
+  } else if (stype === 'llama-server-remote') {
+    var el = document.getElementById('s-base_url'); if (el && b.base_url) el.value = b.base_url;
+    el = document.getElementById('s-api_key_env'); if (el && b.api_key_env) el.value = b.api_key_env;
+  } else if (stype === 'runpod') {
+    var el = document.getElementById('s-api_key_env'); if (el && b.api_key_env) el.value = b.api_key_env;
+  } else if (stype === 'openai') {
+    var el = document.getElementById('s-base_url'); if (el && b.base_url) el.value = b.base_url;
+    el = document.getElementById('s-api_key_env'); if (el && b.api_key_env) el.value = b.api_key_env;
+  }
+  document.querySelector('#modal .modal-title').textContent = '🔌 Services — editing ' + name;
+  document.getElementById('s-name').scrollIntoView({behavior: 'smooth'});
+}
+function deleteBackend(name) {
+  if (!confirm('Delete backend ' + name + '? This will remove the backend definition. Models on it become unreachable.')) return;
+  api('/admin/backends', {method: 'POST', body: {name: name, delete: true}})
+    .then(function () { notify('✓ ' + name + ' deleted'); _editBackendName = null; showPanel('services'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function cancelBackendEdit() {
+  _editBackendName = null;
+  showPanel('services');
 }
 function stopChild(backend, model) {
   api('/admin/llama-server/stop', {method: 'POST', body: {backend: backend, model: model}})
