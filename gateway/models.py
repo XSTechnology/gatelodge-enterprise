@@ -200,9 +200,13 @@ class _Instance:
     """One loaded GGUF + its lock.
 
     placement: '' = llama.cpp default, 'N' = whole model on card N,
-    'auto' = one model split across all cards (free-VRAM weighted)."""
+    'auto' = one model split across all cards (free-VRAM weighted).
+    embedding: True builds a pooling context (Llama(embedding=True)) —
+    such an instance serves /v1/embeddings ONLY, and a chat instance
+    can never embed (no pooling in its context)."""
 
-    def __init__(self, name: str, path: str, n_ctx: int, placement: str = ""):
+    def __init__(self, name: str, path: str, n_ctx: int, placement: str = "",
+                 embedding: bool = False):
         from llama_cpp import Llama  # heavy import — deferred until first use
 
         if not Path(path).exists():
@@ -216,6 +220,8 @@ class _Instance:
             flash_attn=True,
             verbose=False,
         )
+        if embedding:
+            common["embedding"] = True
         try:
             # q8_0 KV cache halves KV VRAM — but its 32-wide blocks must
             # divide the model's head width. Qwen (128-dim) is fine;
@@ -233,9 +239,11 @@ class _Instance:
         self.path = path
         self.name = name
         self.placement = _cfg_gpu(placement)
+        self.embedding = embedding
         self.lock = asyncio.Lock()
-        logger.info("Embedded LLM loaded: %s (%s) in %.2fs%s",
-                    name, path, self.load_s, _placement_desc(placement))
+        logger.info("Embedded LLM loaded: %s (%s) in %.2fs%s%s",
+                    name, path, self.load_s, _placement_desc(placement),
+                    " [embedding]" if embedding else "")
 
 
 # ─── Degenerate-reply detection ────────────────────────────────────────────
@@ -320,6 +328,11 @@ class EmbeddedEngine:
         self._config = config or get_gateway_config()
         self._instances: dict[str, _Instance] = {}
         self._instance_cfg: dict[str, tuple[str, int, str]] = {}
+        # Embedding instances live in their OWN registry: same GGUF file
+        # could appear in both, but the Llama objects differ (pooling vs
+        # generation context) and each has its own lock.
+        self._embed_instances: dict[str, _Instance] = {}
+        self._embed_instance_cfg: dict[str, tuple[str, int, str]] = {}
 
     # ── instance registry ──
 
@@ -380,24 +393,80 @@ class EmbeddedEngine:
             self._instance_cfg[name] = want
         return inst
 
+    def _get_embedding_instance(self, model_name: str | None) -> _Instance:
+        """Lazily load / return an EMBEDDING instance (config-defined only —
+        no auto-discovery: a chat GGUF mistaken for an embedder would
+        return garbage vectors, so embedding models must be explicit)."""
+        self._config.maybe_reload()
+        name = (model_name or "").strip()
+        entry = self._config.local_embedding_models().get(name)
+        if entry is None:
+            raise EmbeddedLLMError(
+                f"unknown embedding model {model_name!r} — define it under "
+                "backends.local.embedding_models in the gateway config")
+        path = self.resolve_gguf(entry.get("gguf", ""), self._config.models_dir)
+        if not path:
+            raise EmbeddedLLMError(
+                f"GGUF for embedding model {name!r} not found: "
+                f"{entry.get('gguf')!r} (looked in {self._config.models_dir})")
+        try:
+            ctx = int(entry.get("ctx") or 4096)
+        except (TypeError, ValueError):
+            ctx = 4096
+        placement = _cfg_gpu(entry.get("placement", ""))
+        want = (path, ctx, placement)
+        inst = self._embed_instances.get(name)
+        if inst is not None and self._embed_instance_cfg.get(name) != want:
+            logger.info("gateway embedding model %r config changed — reloading", name)
+            self._embed_instances.pop(name, None)
+            inst = None
+        if inst is None:
+            inst = _Instance(name, path, ctx, placement, embedding=True)
+            self._embed_instances[name] = inst
+            self._embed_instance_cfg[name] = want
+        return inst
+
+    async def embed(self, model: str, input: str | list[str]) -> dict[str, Any]:
+        """OpenAI-shaped embedding response from a local embedding GGUF.
+        llama_cpp's create_embedding already returns the wire format:
+        {object, data: [{object, embedding, index}], model, usage}."""
+        inst = self._get_embedding_instance(model)
+        inputs = [input] if isinstance(input, str) else list(input)
+        async with inst.lock:
+            try:
+                return await asyncio.to_thread(
+                    inst.llama.create_embedding, input=inputs)
+            except Exception as e:
+                raise EmbeddedLLMError(f"embedded embedding failed: {e}") from e
+
     def unload(self, which: str = "all") -> int:
-        """Drop instances to free VRAM. Returns number unloaded."""
-        names = (list(self._instances) if which == "all"
-                 else [which] if which in self._instances else [])
-        for n in names:
-            self._instances.pop(n, None)
-            self._instance_cfg.pop(n, None)
+        """Drop instances to free VRAM (chat AND embedding registries).
+        Returns number of instances unloaded."""
+        if which == "all":
+            names = list(self._instances) + list(self._embed_instances)
+        else:
+            names = ([which] if which in self._instances
+                     or which in self._embed_instances else [])
+        n = 0
+        for nm in names:
+            if self._instances.pop(nm, None) is not None:
+                self._instance_cfg.pop(nm, None)
+                n += 1
+            if self._embed_instances.pop(nm, None) is not None:
+                self._embed_instance_cfg.pop(nm, None)
+                n += 1
         gc.collect()
-        return len(names)
+        return n
 
     def is_loaded(self) -> bool:
-        return bool(self._instances)
+        return bool(self._instances) or bool(self._embed_instances)
 
     def loaded_models(self) -> list[dict[str, Any]]:
         """Currently loaded instances, Ollama-ps shaped (for /healthz in
-        Stage 2 and the console in Stage 5)."""
+        Stage 2 and the console in Stage 5). Embedding instances carry
+        role 'embed'."""
 
-        def _entry(inst: _Instance) -> dict[str, Any]:
+        def _entry(inst: _Instance, role: str = "gateway") -> dict[str, Any]:
             try:
                 size = Path(inst.path).stat().st_size
             except OSError:
@@ -409,7 +478,7 @@ class EmbeddedEngine:
                 "alias": inst.name,
                 "description": f"{inst.name} · {inst.path}",
                 "path": inst.path,
-                "role": "gateway",
+                "role": role,
                 "size_vram": size,
                 "size_vram_human": _human_size(size),
                 "size": size,
@@ -421,7 +490,8 @@ class EmbeddedEngine:
                 "digest": "",
             }
 
-        return [_entry(i) for i in self._instances.values()]
+        return ([_entry(i) for i in self._instances.values()]
+                + [_entry(i, role="embed") for i in self._embed_instances.values()])
 
     # ── tool-calling helpers ──
 

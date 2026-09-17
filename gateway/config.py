@@ -42,6 +42,10 @@ Semantics:
   entry only (hedge racing arrives in Stage 3). ``local_only`` aliases
   must never leave the machine (privacy guarantee once cloud exists).
 - Cloud requests get max_tokens capped at 800.
+- ``embedding_models`` (embedded backends, same {gguf, ctx, placement}
+  shape) are served by POST /v1/embeddings as SEPARATE instances —
+  Llama(embedding=True) builds a pooling context; chat GGUFs cannot
+  embed and embedding GGUFs are never auto-discovered.
 - Top-level keys present in the file replace the built-in defaults
   wholesale (defining "backends" overrides the default backends).
 - Secrets never live in the JSON — cloud backends name an env var
@@ -102,6 +106,29 @@ def _resolve_dir(raw: Any) -> str:
     return str(p)
 
 
+def _normalize_local_models(raw: Any, what: str = "local model") -> dict[str, dict[str, Any]]:
+    """Validate + normalize embedded model entries ({gguf, ctx, placement})."""
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for mname, m in raw.items():
+        if isinstance(m, str):
+            m = {"gguf": m}
+        if not isinstance(m, dict) or not (m.get("gguf") or "").strip():
+            logger.warning("gateway config: %s %r has no gguf — dropped", what, mname)
+            continue
+        try:
+            ctx = int(m.get("ctx") or 4096)
+        except (TypeError, ValueError):
+            ctx = 4096
+        out[str(mname)] = {
+            "gguf": str(m["gguf"]).strip(),
+            "ctx": ctx,
+            "placement": str(m.get("placement") or "").strip(),
+        }
+    return out
+
+
 def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
     """Validate + normalize backends; drop malformed entries with a warning."""
     out: dict[str, dict[str, Any]] = {}
@@ -118,23 +145,12 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
             continue
         entry: dict[str, Any] = {"type": btype}
         if btype == EMBEDDED_BACKEND:
-            models: dict[str, dict[str, Any]] = {}
-            for mname, m in (b.get("models") or {}).items():
-                if isinstance(m, str):
-                    m = {"gguf": m}
-                if not isinstance(m, dict) or not (m.get("gguf") or "").strip():
-                    logger.warning("gateway config: local model %r has no gguf — dropped", mname)
-                    continue
-                try:
-                    ctx = int(m.get("ctx") or 4096)
-                except (TypeError, ValueError):
-                    ctx = 4096
-                models[str(mname)] = {
-                    "gguf": str(m["gguf"]).strip(),
-                    "ctx": ctx,
-                    "placement": str(m.get("placement") or "").strip(),
-                }
-            entry["models"] = models
+            entry["models"] = _normalize_local_models(b.get("models"))
+            # Embedding GGUFs are SEPARATE instances (Llama(embedding=True) —
+            # pooling context); never auto-discovered (a chat GGUF mistaken
+            # for an embedder would return garbage vectors).
+            entry["embedding_models"] = _normalize_local_models(
+                b.get("embedding_models"), what="local embedding model")
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
             entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
@@ -268,6 +284,9 @@ class GatewayConfig:
     def local_models(self) -> dict[str, dict[str, Any]]:
         return dict(self.local_backend().get("models") or {})
 
+    def local_embedding_models(self) -> dict[str, dict[str, Any]]:
+        return dict(self.local_backend().get("embedding_models") or {})
+
     def local_backend_name(self) -> str:
         for name, b in self.backends.items():
             if b.get("type") == EMBEDDED_BACKEND:
@@ -333,6 +352,39 @@ class GatewayConfig:
     def resolve_model(self, name: str | None) -> tuple[str, str]:
         """Primary chain entry of resolve_chain (Stage-1 compatibility)."""
         return self.resolve_chain(name)["entries"][0]
+
+    def resolve_embedding(self, name: str | None) -> tuple[str, str]:
+        """Embedding ``model`` → (backend_name, model_key).
+
+        Direct 'backend:model': embedded backends resolve against
+        embedding_models ONLY (chat instances cannot embed — their context
+        is created without pooling); cloud backends resolve against models
+        (the remote endpoint decides chat vs embedding). Bare names search
+        local embedding_models first, then every cloud backend's models.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise GatewayConfigError("embedding model must not be empty")
+        if ":" in name:
+            backend_name, _, model_key = name.partition(":")
+            backend = self.backends.get(backend_name)
+            if backend is None:
+                raise GatewayConfigError(f"unknown backend in {name!r}")
+            where = ("embedding_models" if backend.get("type") == EMBEDDED_BACKEND
+                     else "models")
+            if model_key not in (backend.get(where) or {}):
+                raise GatewayConfigError(
+                    f"backend {backend_name!r} has no embedding model {model_key!r}")
+            return backend_name, model_key
+        local = self.local_backend_name()
+        if local and name in self.local_embedding_models():
+            return local, name
+        for bname, b in self.backends.items():
+            if b.get("type") != EMBEDDED_BACKEND and name in (b.get("models") or {}):
+                return bname, name
+        raise GatewayConfigError(
+            f"unknown embedding model: {name!r} (define it under "
+            "backends.<local>.embedding_models or a cloud backend)")
 
     def _resolve_entry(self, entry: str, alias: str | None = None) -> tuple[str, str]:
         backend_name, sep, model_key = entry.partition(":")

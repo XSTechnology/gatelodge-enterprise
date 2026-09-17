@@ -18,6 +18,12 @@ Implemented:
                               (native tool-call deltas); embedded buffers
                               content deltas then emits a delta.tool_calls
                               chunk at stream end (JSON-convention shim).
+  POST /v1/embeddings        — OpenAI embeddings. Embedded GGUFs configured
+                              under backends.<local>.embedding_models load
+                              as separate pooling instances (never
+                              auto-discovered); cloud backends pass through
+                              (dimensions forwarded, ignored for embedded).
+                              encoding_format float|base64 supported.
   GET  /healthz              — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
   GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
@@ -38,8 +44,7 @@ All data endpoints (including /healthz) require it when configured.
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Deferred to v2: /v1/completions, /v1/embeddings, worker pools,
-llama-server backend.
+Deferred to v2: /v1/completions, worker pools, llama-server backend.
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.
@@ -47,9 +52,11 @@ Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import json
 import logging
+import struct
 import threading
 import time
 import uuid
@@ -69,7 +76,7 @@ from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="0.5.0-stage5")
+app = FastAPI(title="LLM Gateway", version="0.6.0-v2")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
@@ -219,6 +226,9 @@ async def list_models() -> dict[str, Any]:
     local = cfg.local_backend_name() or "local"
     for g in installed_ggufs(cfg.models_dir):
         _add(g["name"], local)
+    # Configured embedding models (explicit only — never auto-discovered)
+    for mname in cfg.local_embedding_models():
+        _add(mname, local)
     return {"object": "list", "data": data}
 
 
@@ -556,6 +566,111 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                                       "X-Accel-Buffering": "no"})
 
 
+# ── POST /v1/embeddings ────────────────────────────────────────────────────
+
+class EmbeddingRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = ""
+    input: str | list[str] = Field(min_length=1)
+    encoding_format: str = "float"
+    dimensions: int | None = None
+
+
+def _b64_embeddings(data: list[dict[str, Any]]) -> None:
+    """Encode each embedding in-place to base64 little-endian float32
+    (OpenAI's base64 encoding_format)."""
+    for d in data:
+        vec = d.get("embedding") or []
+        d["embedding"] = base64.b64encode(
+            struct.pack(f"<{len(vec)}f", *vec)).decode("ascii")
+
+
+@app.post("/v1/embeddings")
+async def embeddings(body: EmbeddingRequest) -> Response:
+    """OpenAI embeddings — embedded GGUFs (config-defined, separate
+    pooling instances) or cloud passthrough (remote decides the model)."""
+    global _active_chats
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    t0 = time.perf_counter()
+    requested = body.model.strip()
+
+    fmt = (body.encoding_format or "float").strip().lower()
+    if fmt not in ("float", "base64"):
+        return _error(400, "encoding_format must be 'float' or 'base64'",
+                      param="encoding_format")
+
+    try:
+        backend_name, model_key = cfg.resolve_embedding(requested)
+    except GatewayConfigError as e:
+        _log_request(requested, "", False,
+                     int((time.perf_counter() - t0) * 1000), {}, 400)
+        return _error(400, str(e), param="model", code="model_not_found")
+
+    inputs: list[str] = ([body.input] if isinstance(body.input, str)
+                         else list(body.input))
+    if not any(s.strip() for s in inputs):
+        return _error(400, "input must not be empty", param="input")
+
+    # Same admission gate as chat — embedding requests serialize on their
+    # instance lock, so an unbounded pile-up would starve everything else.
+    engine = get_engine()
+    capacity = max(1, len(engine.loaded_models())) + cfg.queue["max_waiting"]
+    if _active_chats >= capacity:
+        _log_request(requested, "", False,
+                     int((time.perf_counter() - t0) * 1000), {}, 429)
+        return _error(429, "gateway busy — too many concurrent requests, "
+                      "retry shortly", err_type="rate_limit_error",
+                      code="rate_limited", headers={"Retry-After": "1"})
+
+    _active_chats += 1
+    try:
+        backend = cfg.backends[backend_name]
+        if backend.get("type") == "embedded":
+            if body.dimensions is not None:
+                # llama.cpp has no MRL-style truncation — the vector
+                # dimension is fixed by the model.
+                logger.warning("dimensions=%s ignored for embedded "
+                               "embedding model %r", body.dimensions, requested)
+            resp = await engine.embed(model_key, inputs)
+        else:
+            client = cloud.get_cloud_client(backend_name, backend,
+                                            timeout=cfg.queue["timeout_s"])
+            kwargs: dict[str, Any] = {
+                "model": backend["models"][model_key], "input": inputs}
+            if body.dimensions is not None:
+                kwargs["dimensions"] = body.dimensions
+            try:
+                r = await client.embeddings.create(**kwargs)
+            except Exception as e:
+                raise cloud.CloudBackendError(
+                    f"cloud backend {backend_name!r} embedding failed: {e}") from e
+            resp = (json.loads(r.model_dump_json())
+                    if hasattr(r, "model_dump_json") else dict(r))
+        data = resp.get("data") or []
+        if fmt == "base64":
+            _b64_embeddings(data)
+        out = {
+            "object": "list",
+            "data": data,
+            "model": requested,  # echo what the client asked for
+            "usage": resp.get("usage") or {},
+        }
+        ms = int((time.perf_counter() - t0) * 1000)
+        _log_request(requested, backend_name, False, ms,
+                     out["usage"], 200)
+        return JSONResponse(out)
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        logger.warning("gateway embedding failed (%s): %s", requested, e)
+        _log_request(requested, "", False, ms, {}, 502)
+        return _error(502, str(e), err_type="server_error",
+                      code="execution_error")
+    finally:
+        _release_chat_slot()
+
+
 # ── GET /healthz ───────────────────────────────────────────────────────────
 
 @app.get("/healthz")
@@ -682,7 +797,12 @@ async def admin_load(payload: LoadPayload) -> Response:
         return _error(400, "model must not be empty", param="model")
     engine = get_engine()
     try:
-        engine._get_instance(name)
+        # Embedding models FIRST — they're explicit config, and a name
+        # equal to a GGUF stem would otherwise auto-discover as CHAT.
+        if name in cfg.local_embedding_models():
+            engine._get_embedding_instance(name)
+        else:
+            engine._get_instance(name)
     except EmbeddedLLMError as e:
         return _error(400, str(e), param="model", code="model_not_found")
     return {"loaded": engine.loaded_models()}
