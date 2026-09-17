@@ -1,0 +1,329 @@
+"""RunPod backend — POD lifecycle management + SERVERLESS passthrough.
+
+POD mode: one lifecycle-managed RunPod GPU pod per model. On first
+request the gateway looks for an existing pod by name (tagged
+gw-<backend>-<model>), resumes it when stopped, deploys a new one when
+absent, then health-polls the pod's https://<pod-id>-<port>.proxy.runpod.net
+URL (llama.cpp's /health) until the model is serving. Requests proxy in
+native OpenAI wire format (reusing the llama-server HTTP bridge — pods
+run llama-server or any OpenAI-compatible image). Idle reaper:
+stop after idle_stop_s (keeps storage — cheap resume), terminate after
+idle_terminate_s (frees everything; with download-on-boot storage
+terminate is usually CHEAPER than stop). Pods are deliberately NOT
+touched on gateway shutdown — they cost money and may serve others.
+
+SERVERLESS mode: models with endpoint_id map to
+https://api.runpod.ai/v2/<endpoint_id>/openai/v1 (Bearer api key) and
+execute through the gateway's cloud-client path; the first request
+after scale-to-zero blocks during worker boot (cold start) — set the
+queue timeout accordingly.
+
+REST API (rest.runpod.io — the GraphQL API is deprecated):
+  POST   /v1/pods                    deploy (camelCase payload)
+  GET    /v1/pods                    list (find by name)
+  POST   /v1/pods/{podId}/start      resume a stopped pod
+  POST   /v1/pods/{podId}/stop       stop (keeps storage)
+  DELETE /v1/pods/{podId}            terminate
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+from typing import Any
+
+import httpx
+
+from . import llamaserver
+from .config import GatewayConfig
+
+logger = logging.getLogger(__name__)
+
+REST_BASE = "https://rest.runpod.io/v1"
+SERVERLESS_URL = "https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
+
+
+class RunPodError(Exception):
+    """RunPod API failure or pod never became healthy — maps to 502."""
+
+
+# ── REST client (module-level functions so tests can monkeypatch) ──────────
+
+def _api_key(api_key_env: str) -> str:
+    import os
+
+    key = os.environ.get(api_key_env, "")
+    if not key:
+        raise RunPodError(
+            f"runpod api key env var {api_key_env!r} is not set")
+    return key
+
+
+async def _rest(method: str, path: str, api_key_env: str,
+                json_body: dict[str, Any] | None = None) -> Any:
+    async with httpx.AsyncClient(timeout=60.0) as ac:
+        r = await ac.request(method, f"{REST_BASE}{path}",
+                             json=json_body,
+                             headers={"Authorization": f"Bearer {_api_key(api_key_env)}"})
+    if r.status_code >= 400:
+        raise RunPodError(f"runpod {method} {path} -> {r.status_code}: "
+                          f"{r.text[:300]}")
+    return r.json() if r.content else {}
+
+
+async def deploy_pod(payload: dict[str, Any], api_key_env: str) -> dict[str, Any]:
+    """POST /v1/pods → the created pod object (id expected)."""
+    out = await _rest("POST", "/pods", api_key_env, payload)
+    pod = out if isinstance(out, dict) else {}
+    if not (pod.get("id") or (isinstance(pod.get("pod"), dict) and pod["pod"].get("id"))):
+        raise RunPodError(f"runpod deploy returned no pod id: {str(out)[:300]}")
+    return pod.get("pod") if isinstance(pod.get("pod"), dict) else pod
+
+
+async def list_pods(api_key_env: str) -> list[dict[str, Any]]:
+    """GET /v1/pods → pod list (normalized to a list of dicts)."""
+    out = await _rest("GET", "/pods", api_key_env)
+    if isinstance(out, list):
+        return [p for p in out if isinstance(p, dict)]
+    if isinstance(out, dict):
+        for key in ("pods", "data", "items"):
+            if isinstance(out.get(key), list):
+                return [p for p in out[key] if isinstance(p, dict)]
+    return []
+
+
+async def start_pod(pod_id: str, api_key_env: str) -> Any:
+    return await _rest("POST", f"/pods/{pod_id}/start", api_key_env)
+
+
+async def stop_pod(pod_id: str, api_key_env: str) -> Any:
+    return await _rest("POST", f"/pods/{pod_id}/stop", api_key_env)
+
+
+async def terminate_pod(pod_id: str, api_key_env: str) -> Any:
+    return await _rest("DELETE", f"/pods/{pod_id}", api_key_env)
+
+
+def pod_state(pod: dict[str, Any]) -> str:
+    """Best-effort pod state: status / desiredStatus fields vary by API
+    version — upper-cased when present, else 'unknown'."""
+    for key in ("status", "state", "desiredStatus"):
+        val = pod.get(key)
+        if val:
+            return str(val).upper()
+    return "UNKNOWN"
+
+
+# ── Deploy payload builder ─────────────────────────────────────────────────
+
+def _pod_name(backend_name: str, model_key: str) -> str:
+    tag = re.sub(r"[^a-z0-9-]+", "-",
+                 f"gw-{backend_name}-{model_key}".lower()).strip("-")
+    return tag[:60]
+
+
+def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Config pod spec → POST /v1/pods payload. Convenience keys map to
+    the camelCase REST fields; the raw ``deploy`` dict always wins."""
+    payload: dict[str, Any] = {
+        "name": _pod_name(backend_name, model_key),
+        "imageName": spec.get("image"),
+        "dockerArgs": spec.get("docker_args"),
+        "ports": spec.get("ports"),
+        "gpuCount": spec.get("gpu_count"),
+        "containerDiskInGb": spec.get("container_disk_gb"),
+        "env": spec.get("env") or None,
+    }
+    if spec.get("gpu_type_ids"):
+        payload["gpuTypeIds"] = spec["gpu_type_ids"]
+    if spec.get("volume_gb"):
+        payload["volumeInGb"] = spec["volume_gb"]
+        payload["volumeMountPath"] = spec.get("volume_mount") or "/workspace"
+    if spec.get("spot"):
+        payload["spot"] = True
+    payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
+    payload.update(spec.get("deploy") or {})  # raw escape hatch wins
+    return payload
+
+
+# ── Serverless URL builder ─────────────────────────────────────────────────
+
+def serverless_base_url(endpoint_id: str) -> str:
+    return SERVERLESS_URL.format(endpoint_id=endpoint_id)
+
+
+# ── Pod manager ────────────────────────────────────────────────────────────
+
+class _PodManager:
+    """Lifecycle state for ONE runpod pod-backed model."""
+
+    def __init__(self, backend_name: str, model_key: str,
+                 api_key_env: str, spec: dict[str, Any]):
+        self.backend_name = backend_name
+        self.model_key = model_key
+        self.api_key_env = api_key_env
+        self.spec = spec
+        self.lock = asyncio.Lock()
+        self.pod_id: str | None = None
+        self.pod_status: str = "unknown"
+        self.ready = False
+        self.last_used = time.monotonic()
+        self.deployed_s: float | None = None
+
+    def base_url(self) -> str:
+        return f"https://{self.pod_id}-{self.spec['port']}.proxy.runpod.net"
+
+    def touch(self) -> None:
+        self.last_used = time.monotonic()
+
+    def is_ready(self) -> bool:
+        return self.ready and self.pod_id is not None
+
+    async def _find_pod(self) -> dict[str, Any] | None:
+        want = _pod_name(self.backend_name, self.model_key)
+        for p in await list_pods(self.api_key_env):
+            if p.get("name") == want or p.get("id") == self.pod_id:
+                return p
+        return None
+
+    async def ensure_ready(self) -> str:
+        """Find-or-deploy + health-wait. Returns the proxy base URL."""
+        self.touch()
+        async with self.lock:
+            if self.is_ready():
+                return self.base_url()
+            pod = await self._find_pod()
+            if pod is None:
+                payload = deploy_payload(self.backend_name, self.model_key,
+                                         self.spec)
+                logger.info("runpod deploy [%s/%s]: %s", self.backend_name,
+                            self.model_key, payload)
+                pod = await deploy_pod(payload, self.api_key_env)
+                self.deployed_s = time.monotonic()
+            self.pod_id = str(pod.get("id"))
+            state = pod_state(pod)
+            if state not in ("RUNNING", "READY", "UNKNOWN"):
+                logger.info("runpod pod %s is %s — starting", self.pod_id, state)
+                await start_pod(self.pod_id, self.api_key_env)
+            # health-poll the proxy URL (llama.cpp /health); pods take
+            # 30s–minutes (image pull + model download on boot)
+            deadline = time.monotonic() + float(self.spec.get("start_timeout_s") or 600)
+            while time.monotonic() < deadline:
+                self.pod_status = pod_state(
+                    await self._find_pod() or {"status": "UNKNOWN"})
+                if self.pod_status in ("EXITED", "FAILED", "TERMINATED", "CRASHED"):
+                    raise RunPodError(
+                        f"runpod pod {self.pod_id} entered {self.pod_status} "
+                        "during startup")
+                if await llamaserver.get_health(self.base_url(), timeout=10.0):
+                    self.ready = True
+                    logger.info("runpod pod ready [%s/%s] at %s",
+                                self.backend_name, self.model_key,
+                                self.base_url())
+                    return self.base_url()
+                await asyncio.sleep(5.0)
+            raise RunPodError(
+                f"runpod pod [{self.backend_name}/{self.model_key}] not "
+                f"healthy after {self.spec.get('start_timeout_s'):.0f}s "
+                f"(pod {self.pod_id})")
+
+    async def stop(self, terminate: bool) -> None:
+        pod_id, self.ready = self.pod_id, False
+        if not pod_id:
+            return
+        try:
+            if terminate:
+                logger.info("runpod terminate pod %s [%s/%s]", pod_id,
+                            self.backend_name, self.model_key)
+                await terminate_pod(pod_id, self.api_key_env)
+                self.pod_id = None
+            else:
+                logger.info("runpod stop pod %s [%s/%s]", pod_id,
+                            self.backend_name, self.model_key)
+                await stop_pod(pod_id, self.api_key_env)
+                self.pod_status = "STOPPED"
+        except Exception:  # noqa: BLE001 — lifecycle ops must never 500 a request
+            logger.warning("runpod stop/terminate %s failed", pod_id, exc_info=True)
+
+
+# ── Registry + reaper ──────────────────────────────────────────────────────
+
+_MANAGERS: dict[tuple[str, str], _PodManager] = {}
+_REAPER_TASK: asyncio.Task | None = None
+
+
+def get_manager(cfg: GatewayConfig, backend_name: str,
+                model_key: str) -> _PodManager:
+    """Manager for (backend, model). Spec is re-read every call (hot
+    reload-safe); pod identity is by NAME, so it survives gateway
+    restarts."""
+    backend = cfg.backends[backend_name]
+    key = (backend_name, model_key)
+    mgr = _MANAGERS.get(key)
+    if mgr is None:
+        mgr = _PodManager(backend_name, model_key,
+                          backend.get("api_key_env") or "RUNPOD_API_KEY",
+                          backend["models"][model_key])
+        _MANAGERS[key] = mgr
+    else:
+        mgr.spec = backend["models"][model_key]
+    return mgr
+
+
+async def _reaper_once() -> int:
+    """Idle-stop then idle-terminate pods. Returns count acted on."""
+    now = time.monotonic()
+    n = 0
+    for m in list(_MANAGERS.values()):
+        if not m.is_ready():
+            continue
+        idle = now - m.last_used
+        if (m.spec.get("idle_terminate_s", 0) > 0
+                and idle > m.spec["idle_terminate_s"]):
+            await m.stop(terminate=True)
+            n += 1
+        elif (m.spec.get("idle_stop_s", 0) > 0
+                and idle > m.spec["idle_stop_s"]):
+            await m.stop(terminate=False)
+            n += 1
+    return n
+
+
+async def _reaper_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _reaper_once()
+        except Exception:  # noqa: BLE001 — the reaper must never die
+            logger.warning("runpod reaper error", exc_info=True)
+
+
+def ensure_reaper() -> None:
+    global _REAPER_TASK
+    loop = asyncio.get_running_loop()
+    if _REAPER_TASK is None or _REAPER_TASK.get_loop() is not loop:
+        _REAPER_TASK = loop.create_task(_reaper_loop())
+
+
+def status() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for (b, k), m in _MANAGERS.items():
+        out.append({
+            "backend": b, "model": k, "alias": m.spec.get("alias", k),
+            "mode": "pod",
+            "pod_id": m.pod_id,
+            "state": ("running" if m.is_ready()
+                      else m.pod_status if m.pod_id else "not-deployed"),
+            "base_url": m.base_url() if m.is_ready() else None,
+            "idle_s": (round(time.monotonic() - m.last_used, 1)
+                       if m.is_ready() else None),
+            "idle_stop_s": m.spec.get("idle_stop_s", 0),
+            "idle_terminate_s": m.spec.get("idle_terminate_s", 0),
+        })
+    return out
+
+
+def reset_managers() -> None:
+    """Test helper — drop the registry without lifecycle calls."""
+    _MANAGERS.clear()

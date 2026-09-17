@@ -32,6 +32,15 @@ Implemented:
                               REMOTE mode (base_url — RunPod or any
                               llama-server over HTTP): OpenAI passthrough
                               via the cloud client path (api_key_env).
+  runpod backends            — type "runpod" (api_key_env). SERVERLESS
+                              models ({endpoint_id, remote_id}): OpenAI
+                              passthrough at
+                              api.runpod.ai/v2/<endpoint_id>/openai/v1.
+                              POD models ({gpu_type_ids, image,
+                              docker_args, ...}): lifecycle-managed GPU
+                              pods — find-or-deploy on first request,
+                              health-polled via the pod's proxy.runpod.net
+                              URL, idle-stop then idle-terminate.
   GET  /healthz              — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
   GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
@@ -52,7 +61,7 @@ All data endpoints (including /healthz) require it when configured.
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Deferred to v2: /v1/completions, worker pools, RunPod pod lifecycle.
+Deferred to v2: /v1/completions, worker pools.
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.
@@ -78,6 +87,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import cloud
 from . import llamaserver
+from . import runpod
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
@@ -254,9 +264,10 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     """Execute ONE chain entry → (openai_response_dict, backend, model_key).
 
     Embedded → the in-process engine (tools via the JSON convention).
-    llama-server subprocess → managed child (native batching/tools).
-    Cloud / remote llama-server → AsyncOpenAI (tools forwarded as-is,
-    max_tokens capped 800 for cloud-type only)."""
+    llama-server subprocess / runpod pod → managed lifecycle, native
+    OpenAI wire format. Cloud / remote llama-server / runpod serverless
+    → AsyncOpenAI (tools as-is; max_tokens capped 800 for cloud-type
+    only)."""
     backend_name, model_key = entry
     backend = cfg.backends[backend_name]
     btype = backend.get("type")
@@ -324,17 +335,52 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         resp["model"] = requested  # consistent echo; served_by carries truth
         return resp, backend_name, model_key
 
-    # openai-type cloud backend (or REMOTE llama-server — same wire shape)
-    client = cloud.get_cloud_client(backend_name, backend,
+    if btype == "runpod" and not backend["models"][model_key].get("endpoint_id"):
+        # Managed GPU POD: find-or-deploy + health-wait, then proxy in
+        # native OpenAI wire format through the pod's runpod.net URL.
+        runpod.ensure_reaper()
+        mgr = runpod.get_manager(cfg, backend_name, model_key)
+        base = await mgr.ensure_ready()
+        payload = {
+            "model": mgr.spec.get("alias", model_key),
+            "messages": body.messages,
+        }
+        if body.tools:
+            payload["tools"] = body.tools
+        if body.temperature is not None:
+            payload["temperature"] = body.temperature
+        if body.max_tokens:
+            payload["max_tokens"] = body.max_tokens
+        resp = await llamaserver.post_chat(base, payload,
+                                           cfg.queue["timeout_s"])
+        resp["model"] = requested
+        return resp, backend_name, model_key
+
+    # Cloud-shaped path: openai backends, REMOTE llama-server, and runpod
+    # SERVERLESS all speak OpenAI over HTTP with a bearer key.
+    remote_id = backend["models"][model_key]
+    client_name = backend_name
+    cloud_backend = backend
+    if btype == "runpod":
+        m = backend["models"][model_key]
+        remote_id = m["remote_id"]
+        # per-endpoint client cache (one backend may hold several endpoints)
+        client_name = f"runpod-{backend_name}-{model_key}"
+        cloud_backend = {
+            "base_url": runpod.serverless_base_url(m["endpoint_id"]),
+            "api_key_env": backend.get("api_key_env") or "RUNPOD_API_KEY",
+        }
+    client = cloud.get_cloud_client(client_name, cloud_backend,
                                     timeout=cfg.queue["timeout_s"])
     kwargs: dict[str, Any] = {
-        "model": backend["models"][model_key],  # remote model id
+        "model": remote_id,  # remote model id
         "messages": body.messages,
     }
     if body.temperature is not None:
         kwargs["temperature"] = body.temperature
     if body.max_tokens:
-        # cap for openai-type cloud (cost); local llama-server passes through
+        # cap for openai-type cloud (cost); local llama-server and runpod
+        # (per-second billing) pass through
         kwargs["max_tokens"] = (min(body.max_tokens, cloud.CLOUD_MAX_TOKENS_CAP)
                                 if btype == "openai" else body.max_tokens)
     if body.tools:
@@ -590,20 +636,57 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     if data == "[DONE]":
                         break
                     yield f"data: {data}\n\n"
+            elif (backend.get("type") == "runpod"
+                    and not backend["models"][model_key].get("endpoint_id")):
+                # Managed GPU POD — same native SSE passthrough as the
+                # llama-server subprocess, through the pod's proxy URL.
+                runpod.ensure_reaper()
+                mgr = runpod.get_manager(cfg, backend_name, model_key)
+                base = await mgr.ensure_ready()
+                payload = {
+                    "model": mgr.spec.get("alias", model_key),
+                    "messages": body.messages,
+                    "stream": True,
+                }
+                if body.tools:
+                    payload["tools"] = body.tools
+                if body.temperature is not None:
+                    payload["temperature"] = body.temperature
+                if body.max_tokens:
+                    payload["max_tokens"] = body.max_tokens
+                async for data in llamaserver.stream_chat(
+                        base, payload, cfg.queue["timeout_s"]):
+                    if data == "[DONE]":
+                        break
+                    yield f"data: {data}\n\n"
             else:
                 # cloud passthrough — the remote stream is already
-                # OpenAI-chunk-shaped (role/finish chunks included)
-                client = cloud.get_cloud_client(backend_name, backend,
+                # OpenAI-chunk-shaped (role/finish chunks included);
+                # remote llama-server and runpod serverless share this path
+                remote_id = backend["models"][model_key]
+                client_name = backend_name
+                cloud_backend = backend
+                if backend.get("type") == "runpod":
+                    m = backend["models"][model_key]
+                    remote_id = m["remote_id"]
+                    client_name = f"runpod-{backend_name}-{model_key}"
+                    cloud_backend = {
+                        "base_url": runpod.serverless_base_url(m["endpoint_id"]),
+                        "api_key_env": backend.get("api_key_env") or "RUNPOD_API_KEY",
+                    }
+                client = cloud.get_cloud_client(client_name, cloud_backend,
                                                 timeout=cfg.queue["timeout_s"])
                 kwargs: dict[str, Any] = {
-                    "model": backend["models"][model_key],
+                    "model": remote_id,
                     "messages": body.messages, "stream": True,
                 }
                 if body.temperature is not None:
                     kwargs["temperature"] = body.temperature
-                if body.max_tokens and backend.get("type") == "openai":
-                    kwargs["max_tokens"] = min(body.max_tokens,
-                                               cloud.CLOUD_MAX_TOKENS_CAP)
+                if body.max_tokens:
+                    kwargs["max_tokens"] = (min(body.max_tokens,
+                                                cloud.CLOUD_MAX_TOKENS_CAP)
+                                            if backend.get("type") == "openai"
+                                            else body.max_tokens)
                 if body.tools:
                     kwargs["tools"] = body.tools
                 stream = await client.chat.completions.create(**kwargs)
@@ -768,6 +851,7 @@ async def healthz() -> dict[str, Any]:
         "loaded_count": len(loaded),
         "loaded": loaded,  # Ollama-ps shaped: alias/path/size_vram/n_ctx/load_s
         "llama_server": llamaserver.status(),  # managed children (subprocess)
+        "runpod": runpod.status(),  # lifecycle-managed pods (serverless is stateless)
         "gpus": gpus,
     }
 

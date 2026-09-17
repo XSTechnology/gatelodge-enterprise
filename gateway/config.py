@@ -30,7 +30,16 @@ one so configs don't churn between stages):
         "batch": {"gguf": "qwen2.5-0.5b-instruct-q4_k_m", "ctx": 16384,
                    "placement": "", "parallel": 4}}},
     "runpod": {"type": "llama-server", "base_url": "https://api.runpod.ai/v2/ENDPOINT/openai/v1",
-               "api_key_env": "RUNPOD_API_KEY", "models": {"gpu-big": "model-id"}}
+               "api_key_env": "RUNPOD_API_KEY", "models": {"gpu-big": "model-id"}},
+    "rp":    {"type": "runpod", "api_key_env": "RUNPOD_API_KEY", "models": {
+        "fast": {"endpoint_id": "ep-abc", "remote_id": "model-name"},
+        "big":  {"gpu_type_ids": ["NVIDIA RTX A6000"], "spot": true,
+                  "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+                  "docker_args": "-m /workspace/model.gguf --host 0.0.0.0 --port 8080 -ngl 99 --jinja",
+                  "ports": "8080/http", "port": 8080, "start_timeout_s": 600,
+                  "idle_stop_s": 0, "idle_terminate_s": 0,
+                  "env": {"HF_URL": "https://huggingface.co/.../model.gguf"},
+                  "deploy": {}}}}
   },
   "aliases": {
     "smart": {"chain": ["local:big", "groq:cloud-fast"], "hedge_s": 8},
@@ -60,6 +69,19 @@ Semantics:
   REMOTE mode (base_url set — RunPod or any llama-server over HTTP) is
   a pure OpenAI passthrough: models map name → remote model id, optional
   api_key_env. local_only counts subprocess mode as local, remote as not.
+- ``runpod`` backends (api_key_env, default RUNPOD_API_KEY): SERVERLESS
+  models ({endpoint_id, remote_id?}) passthrough at
+  https://api.runpod.ai/v2/<endpoint_id>/openai/v1 (Bearer). POD models
+  ({gpu_type_ids, image, docker_args, ports, port, gpu_count,
+  container_disk_gb, volume_gb, volume_mount, spot, env, alias,
+  start_timeout_s, idle_stop_s, idle_terminate_s, deploy}) are
+  lifecycle-managed: deployed on first request (find-by-name → resume a
+  stopped pod → deploy new), health-polled via the pod's
+  <pod-id>-<port>.proxy.runpod.net URL, proxied in OpenAI wire format,
+  and idle-stopped (keeps storage) then idle-terminated per the two
+  knobs (0 = never). ``deploy`` is a raw dict merged verbatim into the
+  POST /v1/pods payload (escape hatch for REST fields the gateway
+  doesn't model). Pods are NOT touched on gateway shutdown.
 - Top-level keys present in the file replace the built-in defaults
   wholesale (defining "backends" overrides the default backends).
 - Secrets never live in the JSON — cloud backends name an env var
@@ -82,7 +104,9 @@ DEFAULT_MODELS_DIR = PROJECT_ROOT / "data" / "models"
 EMBEDDED_BACKEND = "embedded"
 OPENAI_BACKEND = "openai"
 LLAMA_SERVER_BACKEND = "llama-server"
-_BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND)
+RUNPOD_BACKEND = "runpod"
+_BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
+                  RUNPOD_BACKEND)
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -211,6 +235,59 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         m["parallel"] = 1
                     m["alias"] = str(m.get("alias") or mname).strip() or mname
                 entry["models"] = lsmodels
+        elif btype == RUNPOD_BACKEND:
+            # Two model shapes: SERVERLESS ({endpoint_id, remote_id?} →
+            # OpenAI passthrough at api.runpod.ai) and POD ({gpu_type_ids,
+            # image, docker_args, ...} → gateway-managed lifecycle: deploy
+            # on demand, proxy via the pod's runpod.net URL, idle
+            # stop/terminate). A raw `deploy` dict passes through verbatim.
+            entry["api_key_env"] = str(b.get("api_key_env") or "RUNPOD_API_KEY")
+            rmodels: dict[str, dict[str, Any]] = {}
+            for mname, m in (b.get("models") or {}).items():
+                if not isinstance(m, dict):
+                    logger.warning("gateway config: runpod model %r is not "
+                                   "an object — dropped", mname)
+                    continue
+                m = dict(m)
+                if m.get("endpoint_id"):
+                    # serverless — keep endpoint_id + remote_id only
+                    rmodels[str(mname)] = {
+                        "endpoint_id": str(m["endpoint_id"]).strip(),
+                        "remote_id": str(m.get("remote_id") or mname).strip(),
+                    }
+                else:
+                    # pod lifecycle — numbers coerced, deploy dict kept raw
+                    def _num(key: str, default: float) -> float:
+                        try:
+                            return float(m.get(key) or default)
+                        except (TypeError, ValueError):
+                            return default
+                    pod: dict[str, Any] = {
+                        "gpu_type_ids": [str(g).strip() for g in
+                                         (m.get("gpu_type_ids") or []) if str(g).strip()],
+                        "image": str(m.get("image") or "").strip(),
+                        "docker_args": str(m.get("docker_args") or "").strip(),
+                        "ports": str(m.get("ports") or "8080/http").strip(),
+                        "port": max(1, int(_num("port", 8080))),
+                        "gpu_count": max(1, int(_num("gpu_count", 1))),
+                        "container_disk_gb": int(_num("container_disk_gb", 20)),
+                        "volume_gb": int(_num("volume_gb", 0)),
+                        "volume_mount": str(m.get("volume_mount") or "").strip(),
+                        "spot": bool(m.get("spot")),
+                        "env": {str(k): str(v) for k, v in (m.get("env") or {}).items()}
+                               if isinstance(m.get("env") or {}, dict) else {},
+                        "alias": str(m.get("alias") or mname).strip() or mname,
+                        "start_timeout_s": _num("start_timeout_s", 600),
+                        "idle_stop_s": _num("idle_stop_s", 0),
+                        "idle_terminate_s": _num("idle_terminate_s", 0),
+                        "deploy": m.get("deploy") if isinstance(m.get("deploy"), dict) else {},
+                    }
+                    if not pod["image"]:
+                        logger.warning("gateway config: runpod pod model %r "
+                                       "has no image — dropped", mname)
+                        continue
+                    rmodels[str(mname)] = pod
+            entry["models"] = rmodels
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
             entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
@@ -411,13 +488,13 @@ class GatewayConfig:
 
     def _entry_is_local(self, backend_name: str) -> bool:
         """Embedded always; llama-server only in SUBPROCESS mode (remote
-        base_url — RunPod etc. — leaves the machine like a cloud backend)."""
+        base_url and runpod backends leave the machine like a cloud one)."""
         b = self.backends.get(backend_name) or {}
         if b.get("type") == EMBEDDED_BACKEND:
             return True
         if b.get("type") == LLAMA_SERVER_BACKEND:
             return not b.get("base_url")
-        return False
+        return False  # openai cloud, remote llama-server, runpod (all forms)
 
     def resolve_model(self, name: str | None) -> tuple[str, str]:
         """Primary chain entry of resolve_chain (Stage-1 compatibility)."""
