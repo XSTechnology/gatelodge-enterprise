@@ -89,6 +89,11 @@ def _default_raw() -> dict[str, Any]:
     return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
+def default_config_raw() -> dict[str, Any]:
+    """Public deep copy of the built-in defaults (admin config mutations)."""
+    return _default_raw()
+
+
 def _resolve_dir(raw: Any) -> str:
     """models_dir value → absolute path (relative anchors at project root)."""
     p = Path(str(raw or "").strip() or DEFAULT_MODELS_DIR)
@@ -221,10 +226,15 @@ class GatewayConfig:
         self.backends = _normalize_backends(raw.get("backends"))
         self.aliases = _normalize_aliases(raw.get("aliases"))
         queue = raw.get("queue") if isinstance(raw.get("queue"), dict) else {}
-        self.queue = {
-            "max_waiting": int(queue.get("max_waiting") or 4),
-            "timeout_s": float(queue.get("timeout_s") or 120),
-        }
+        try:
+            max_waiting = int(queue["max_waiting"])  # 0 is valid — no 'or' default
+        except (KeyError, TypeError, ValueError):
+            max_waiting = 4
+        try:
+            timeout_s = float(queue["timeout_s"])
+        except (KeyError, TypeError, ValueError):
+            timeout_s = 120.0
+        self.queue = {"max_waiting": max_waiting, "timeout_s": timeout_s}
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""
@@ -239,6 +249,12 @@ class GatewayConfig:
                 return False
             self._load()
         return True
+
+    def reload_now(self) -> None:
+        """Unconditional reload (admin mutations want determinism, not
+        mtime-granularity luck)."""
+        with self._lock:
+            self._load()
 
     # ── accessors ──
 

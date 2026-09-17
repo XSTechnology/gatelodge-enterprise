@@ -1,4 +1,5 @@
-"""OpenAI-compatible HTTP surface — Stages 1-3: local + cloud, chains + hedge.
+"""OpenAI-compatible HTTP surface — Stages 1-4: local + cloud, chains + hedge,
+auth + admin.
 
 Implemented:
   GET  /v1/models           — aliases + backend models + auto-discovered
@@ -7,26 +8,31 @@ Implemented:
                               engine (any GGUF stem in models_dir, multiple
                               models concurrently) AND openai-type cloud
                               backends. Alias chains execute with a hedge
-                              race: the primary runs; after hedge_s (or on
-                              its error) the next entry races it — first
-                              completion wins. local_only aliases never
-                              construct a cloud client. Non-streaming only
-                              for chains — streaming executes the primary
-                              entry. Cloud requests get max_tokens capped
-                              at 800.
+                              race; local_only aliases never construct a
+                              cloud client. Cloud max_tokens capped at 800.
+                              Over-capacity concurrent requests get 429 +
+                              Retry-After (queue.max_waiting).
   GET  /healthz             — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
+  GET/POST /admin/aliases   — list / upsert / delete aliases (persisted to
+                              data/gateway_config.json, applied immediately)
+  POST /admin/load          — preload an embedded instance (config model
+                              or discovered stem)
+  POST /admin/unload        — drop instances ({model} or {all: true})
+
+Auth: bearer tokens from gateway_keys in the config (hot-reload). Empty
+list = open (localhost trust). Clients pass the key as the OpenAI api_key.
+All endpoints (including /healthz) require it when configured.
 
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Arriving in later stages (per the design doc's stage plan):
-  bearer auth + admin endpoints (Stage 4), console page (Stage 5).
-  /v1/completions and /v1/embeddings are deferred to v2, as is streaming
-  tool-call deltas (stream + tools → 400 today).
+Arriving later: console page (Stage 5). /v1/completions and
+/v1/embeddings are deferred to v2, as is streaming tool-call deltas
+(stream + tools → 400 today).
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
-"code"}}. Requests are open (localhost trust) until Stage 4 adds keys.
+"code"}}.
 """
 from __future__ import annotations
 
@@ -44,27 +50,54 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import cloud
-from .config import (PROJECT_ROOT, GatewayConfigError, get_gateway_config)
+from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
+                     get_gateway_config)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
                      get_engine, installed_ggufs)
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="0.3.0-stage3")
+app = FastAPI(title="LLM Gateway", version="0.4.0-stage4")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
+
+# Concurrent chat completions in flight (queue admission control — the
+# event loop is single threaded, plain int arithmetic is safe)
+_active_chats = 0
 
 
 # ── OpenAI-shaped errors ───────────────────────────────────────────────────
 
 def _error(status: int, message: str, err_type: str = "invalid_request_error",
-           param: str | None = None, code: str | None = None) -> JSONResponse:
+           param: str | None = None, code: str | None = None,
+           headers: dict[str, str] | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": err_type,
                            "param": param, "code": code}},
+        headers=headers,
     )
+
+
+# ── Bearer auth (gateway_keys; empty list = open, localhost trust) ─────────
+
+@app.middleware("http")
+async def _bearer_auth(request: Request, call_next):
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    keys = cfg.gateway_keys
+    if keys:
+        auth = request.headers.get("authorization") or ""
+        token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        if token not in keys:
+            return JSONResponse(
+                status_code=401,
+                content={"error": {
+                    "message": "missing or invalid API key",
+                    "type": "invalid_request_error", "param": None,
+                    "code": "invalid_api_key"}})
+    return await call_next(request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -288,9 +321,22 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatRequest) -> Response:
+    global _active_chats
     cfg = get_gateway_config()
     cfg.maybe_reload()
     t0 = time.perf_counter()
+
+    # Queue admission: capacity = resident instances (min 1) + max_waiting.
+    # Over-limit requests get 429 + Retry-After instead of piling onto the
+    # serialized per-instance locks.
+    engine = get_engine()
+    capacity = max(1, len(engine.loaded_models())) + cfg.queue["max_waiting"]
+    if _active_chats >= capacity:
+        _log_request(body.model, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 429)
+        return _error(429, "gateway busy — too many concurrent requests, "
+                      "retry shortly", err_type="rate_limit_error",
+                      code="rate_limited", headers={"Retry-After": "1"})
 
     requested = body.model.strip() or cfg.default_alias
     try:
@@ -319,22 +365,33 @@ async def chat_completions(body: ChatRequest) -> Response:
         # Streaming executes the PRIMARY entry only — hedge racing is a
         # non-streaming feature (first-completion-wins has no stream analog
         # short of first-token hedging, which is a follow-up).
+        _active_chats += 1
         return _stream_chat(requested, entries[0], body)
 
+    _active_chats += 1
     try:
-        resp, winner, model_key = await _exec_chain(
-            cfg, entries, plan["hedge_s"], body, requested)
-    except Exception as e:
+        try:
+            resp, winner, model_key = await _exec_chain(
+                cfg, entries, plan["hedge_s"], body, requested)
+        except Exception as e:
+            ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning("gateway chat failed (%s): %s", requested, e)
+            _log_request(requested, "", body.stream, ms, {}, 502)
+            return _error(502, str(e), err_type="server_error",
+                          code="execution_error")
         ms = int((time.perf_counter() - t0) * 1000)
-        logger.warning("gateway chat failed (%s): %s", requested, e)
-        _log_request(requested, "", body.stream, ms, {}, 502)
-        return _error(502, str(e), err_type="server_error", code="execution_error")
+        resp.setdefault("served_by", {"backend": winner, "model": model_key,
+                                      "ms": ms})
+        _log_request(requested, winner, body.stream, ms,
+                     resp.get("usage") or {}, 200)
+        return JSONResponse(resp)
+    finally:
+        _release_chat_slot()
 
-    ms = int((time.perf_counter() - t0) * 1000)
-    resp.setdefault("served_by", {"backend": winner, "model": model_key, "ms": ms})
-    _log_request(requested, winner, body.stream, ms,
-                 resp.get("usage") or {}, 200)
-    return JSONResponse(resp)
+
+def _release_chat_slot() -> None:
+    global _active_chats
+    _active_chats = max(0, _active_chats - 1)
 
 
 # ── POST /v1/chat/completions (stream) ─────────────────────────────────────
@@ -413,6 +470,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                            "code": "execution_error"}}) + "\n\n"
             yield "data: [DONE]\n\n"
             _log_request(requested, backend_name, True, ms, {}, 502)
+        finally:
+            _release_chat_slot()
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -448,3 +507,118 @@ async def healthz() -> dict[str, Any]:
         "loaded": loaded,  # Ollama-ps shaped: alias/path/size_vram/n_ctx/load_s
         "gpus": gpus,
     }
+
+
+# ── Admin: alias CRUD + instance control (Stage 4) ─────────────────────────
+
+def _mutate_config(mutator) -> None:
+    """Read-modify-write data/gateway_config.json (created from the built-in
+    defaults when absent), then force the process config to reload."""
+    cfg = get_gateway_config()
+    if cfg.path.is_file():
+        try:
+            raw = json.loads(cfg.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = default_config_raw()
+        if not isinstance(raw, dict):
+            raw = default_config_raw()
+    else:
+        raw = default_config_raw()
+    mutator(raw)
+    cfg.path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    cfg.reload_now()
+
+
+class AliasPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    chain: list[str] | None = None
+    hedge_s: float | None = None
+    local_only: bool | None = None
+    delete: bool = False
+
+
+@app.get("/admin/aliases")
+async def admin_list_aliases() -> dict[str, Any]:
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    return {"aliases": cfg.aliases}
+
+
+@app.post("/admin/aliases")
+async def admin_upsert_alias(payload: AliasPayload) -> Response:
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    name = payload.name.strip()
+    if not name:
+        return _error(400, "alias name must not be empty", param="name")
+
+    if payload.delete:
+        if name not in cfg.aliases:
+            return _error(400, f"alias {name!r} not found", param="name",
+                          code="alias_not_found")
+        _mutate_config(lambda raw: raw.setdefault("aliases", {}).pop(name, None))
+        return {"deleted": name,
+                "aliases": get_gateway_config().aliases}
+
+    chain = [str(c).strip() for c in (payload.chain or []) if str(c).strip()]
+    if not chain:
+        return _error(400, "alias chain must list at least one "
+                      "'backend:model' entry", param="chain")
+    for entry in chain:  # validate against the CURRENT backends
+        try:
+            cfg._resolve_entry(entry)
+        except GatewayConfigError as e:
+            return _error(400, str(e), param="chain")
+
+    alias: dict[str, Any] = {"chain": chain}
+    if payload.hedge_s is not None:
+        alias["hedge_s"] = max(0.0, float(payload.hedge_s))
+    if payload.local_only:
+        alias["local_only"] = True
+
+    def _apply(raw: dict[str, Any]) -> None:
+        raw.setdefault("aliases", {})[name] = alias
+
+    _mutate_config(_apply)
+    return {"upserted": name, "alias": alias,
+            "aliases": get_gateway_config().aliases}
+
+
+class LoadPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = ""
+    all: bool = False  # noqa: A003 — 'all' matches the engine's unload API
+
+
+@app.post("/admin/load")
+async def admin_load(payload: LoadPayload) -> Response:
+    """Preload an embedded instance (config model or discovered stem)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    name = payload.model.strip()
+    if not name:
+        return _error(400, "model must not be empty", param="model")
+    engine = get_engine()
+    try:
+        engine._get_instance(name)
+    except EmbeddedLLMError as e:
+        return _error(400, str(e), param="model", code="model_not_found")
+    return {"loaded": engine.loaded_models()}
+
+
+@app.post("/admin/unload")
+async def admin_unload(payload: LoadPayload) -> Response:
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    engine = get_engine()
+    which = "all" if payload.all else payload.model.strip()
+    if not which:
+        return _error(400, "model must not be empty (or send "
+                      "{\"all\": true})", param="model")
+    n = engine.unload(which)
+    return {"unloaded": n, "loaded": engine.loaded_models()}
+
