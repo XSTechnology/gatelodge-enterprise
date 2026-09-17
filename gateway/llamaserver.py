@@ -87,6 +87,32 @@ async def stream_chat(base_url: str, payload: dict[str, Any],
                 yield line[6:]
 
 
+async def post_completions(base_url: str, payload: dict[str, Any],
+                           timeout: float) -> dict[str, Any]:
+    """Legacy POST /v1/completions — llama-server (and any OpenAI-compatible
+    server) answers the OpenAI text.completion shape natively."""
+    r = await _http().post(f"{base_url}/v1/completions", json=payload,
+                           timeout=timeout)
+    if r.status_code >= 400:
+        raise LlamaServerError(
+            f"llama-server {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+async def stream_completions(base_url: str, payload: dict[str, Any],
+                             timeout: float) -> AsyncIterator[str]:
+    """Streaming legacy completions — yields SSE data payloads."""
+    async with _http().stream("POST", f"{base_url}/v1/completions",
+                              json=payload, timeout=timeout) as r:
+        if r.status_code >= 400:
+            body = (await r.aread()).decode("utf-8", "replace")
+            raise LlamaServerError(
+                f"llama-server {r.status_code}: {body[:300]}")
+        async for line in r.aiter_lines():
+            if line.startswith("data: "):
+                yield line[6:]
+
+
 # ── GPU placement → llama-server CLI flags ─────────────────────────────────
 
 def _gpu_args(placement: str) -> list[str]:

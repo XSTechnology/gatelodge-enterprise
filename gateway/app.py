@@ -24,6 +24,12 @@ Implemented:
                               auto-discovered); cloud backends pass through
                               (dimensions forwarded, ignored for embedded).
                               encoding_format float|base64 supported.
+  POST /v1/completions       — legacy text completions: raw prompt in,
+                              text out (no chat template/tools/think-strip).
+                              All backend types serve it (embedded pools,
+                              llama-server children + pods natively, runpod
+                              runsync generate mode, cloud passthrough);
+                              executes the primary chain entry only.
   llama-server backends      — type "llama-server". SUBPROCESS mode (no
                               base_url): one managed child per model,
                               spawned lazily, continuous batching across
@@ -65,7 +71,7 @@ All data endpoints (including /healthz) require it when configured.
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Deferred to v2: /v1/completions.
+Deferred: PyInstaller exe (v2 remaining).
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.
@@ -892,6 +898,233 @@ async def embeddings(body: EmbeddingRequest) -> Response:
         ms = int((time.perf_counter() - t0) * 1000)
         logger.warning("gateway embedding failed (%s): %s", requested, e)
         _log_request(requested, "", False, ms, {}, 502)
+        return _error(502, str(e), err_type="server_error",
+                      code="execution_error")
+    finally:
+        _release_chat_slot()
+
+
+# ── POST /v1/completions (legacy text completions) ─────────────────────────
+
+class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = ""
+    prompt: str | list[str] = Field(min_length=1)
+    stream: bool = False
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
+@app.post("/v1/completions")
+async def legacy_completions(body: CompletionRequest) -> Response:
+    """Legacy text completions — raw prompt in, text out (no chat
+    template, no tools, no think-stripping). Every backend type serves it:
+    embedded via llama_cpp create_completion (worker pools), llama-server
+    subprocess/pods via the child's native /v1/completions, runpod
+    serverless runsync via the worker's generate mode ({"prompt": ...}),
+    and cloud/remote via client.completions passthrough. Executes the
+    PRIMARY chain entry only (no hedge)."""
+    global _active_chats
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    t0 = time.perf_counter()
+
+    requested = body.model.strip() or cfg.default_alias
+    try:
+        plan = cfg.resolve_chain(requested)
+    except GatewayConfigError as e:
+        if requested and EmbeddedEngine.resolve_gguf(requested, cfg.models_dir):
+            plan = {"entries": [(cfg.local_backend_name() or "local", requested)],
+                    "hedge_s": 0.0, "local_only": False}
+        else:
+            _log_request(requested, "", body.stream,
+                         int((time.perf_counter() - t0) * 1000), {}, 400)
+            return _error(400, str(e), param="model", code="model_not_found")
+    backend_name, model_key = plan["entries"][0]
+    backend = cfg.backends[backend_name]
+    btype = backend.get("type")
+
+    engine = get_engine()
+    capacity = (max(1, len(engine.loaded_models()))
+                + llamaserver.running_count() + cfg.queue["max_waiting"])
+    if _active_chats >= capacity:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 429)
+        return _error(429, "gateway busy — too many concurrent requests, "
+                      "retry shortly", err_type="rate_limit_error",
+                      code="rate_limited", headers={"Retry-After": "1"})
+
+    prompts: list[str] = ([body.prompt] if isinstance(body.prompt, str)
+                          else list(body.prompt))
+    if not any(p.strip() for p in prompts):
+        return _error(400, "prompt must not be empty", param="prompt")
+
+    _active_chats += 1
+    try:
+        # embedded — llama_cpp raw completion (worker pool checkout)
+        if btype == "embedded":
+            if body.stream:
+                async def _gen() -> AsyncIterator[str]:
+                    chat_id = f"cmpl-gw-{uuid.uuid4().hex[:12]}"
+                    created = int(time.time())
+
+                    def _chunk(delta: dict[str, Any], finish: str | None = None) -> str:
+                        return f"data: {json.dumps({'id': chat_id, 'object': 'text.completion.chunk', 'created': created, 'model': requested, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
+
+                    try:
+                        yield _chunk({"role": "assistant", "content": ""})
+                        stream = await engine.complete(
+                            model_key, prompts[0], stream=True,
+                            temperature=body.temperature,
+                            max_tokens=body.max_tokens)
+                        async for ch in stream:
+                            text = (ch.get("choices") or [{}])[0].get("text")
+                            if text:
+                                yield _chunk({"content": text})
+                        yield _chunk({}, finish="stop")
+                        yield "data: [DONE]\n\n"
+                        ms = int((time.perf_counter() - t0) * 1000)
+                        _log_request(requested, backend_name, True, ms, {}, 200)
+                    except Exception as e:
+                        yield "data: " + json.dumps(
+                            {"error": {"message": str(e), "type": "server_error",
+                                       "code": "execution_error"}}) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                        _log_request(requested, backend_name, True,
+                                     int((time.perf_counter() - t0) * 1000), {}, 502)
+                    finally:
+                        _release_chat_slot()
+                return StreamingResponse(_gen(), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache",
+                                                  "X-Accel-Buffering": "no"})
+            resp = await engine.complete(
+                model_key, prompts[0], temperature=body.temperature,
+                max_tokens=body.max_tokens)
+            d = dict(resp)
+            d["model"] = requested
+            ms = int((time.perf_counter() - t0) * 1000)
+            _log_request(requested, backend_name, False, ms,
+                         d.get("usage") or {}, 200)
+            return JSONResponse(d)
+
+        # llama-server subprocess / runpod pod — native /v1/completions
+        if btype == "llama-server" and not backend.get("base_url"):
+            llamaserver.ensure_reaper()
+            mgr = llamaserver.get_manager(cfg, backend_name, model_key)
+            base = await mgr.ensure_ready()
+            payload = {"model": mgr.alias, "prompt": prompts[0]}
+            if body.temperature is not None:
+                payload["temperature"] = body.temperature
+            if body.max_tokens:
+                payload["max_tokens"] = body.max_tokens
+            if body.stream:
+                async def _gen_ls() -> AsyncIterator[str]:
+                    try:
+                        payload_s = {**payload, "stream": True}
+                        async for data in llamaserver.stream_completions(
+                                base, payload_s, cfg.queue["timeout_s"]):
+                            if data == "[DONE]":
+                                break
+                            yield f"data: {data}\n\n"
+                        yield "data: [DONE]\n\n"
+                        _log_request(requested, backend_name, True,
+                                     int((time.perf_counter() - t0) * 1000), {}, 200)
+                    except Exception as e:
+                        yield "data: " + json.dumps(
+                            {"error": {"message": str(e), "type": "server_error",
+                                       "code": "execution_error"}}) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                        _log_request(requested, backend_name, True,
+                                     int((time.perf_counter() - t0) * 1000), {}, 502)
+                    finally:
+                        _release_chat_slot()
+                return StreamingResponse(_gen_ls(), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache",
+                                                  "X-Accel-Buffering": "no"})
+            resp = await llamaserver.post_completions(
+                base, payload, cfg.queue["timeout_s"])
+            resp["model"] = requested
+            ms = int((time.perf_counter() - t0) * 1000)
+            _log_request(requested, backend_name, False, ms,
+                         resp.get("usage") or {}, 200)
+            return JSONResponse(resp)
+
+        if btype == "runpod" and not backend["models"][model_key].get("endpoint_id"):
+            runpod.ensure_reaper()
+            mgr = runpod.get_manager(cfg, backend_name, model_key)
+            base = await mgr.ensure_ready()
+            payload = {"model": mgr.spec.get("alias", model_key),
+                       "prompt": prompts[0]}
+            if body.temperature is not None:
+                payload["temperature"] = body.temperature
+            if body.max_tokens:
+                payload["max_tokens"] = body.max_tokens
+            resp = await llamaserver.post_completions(
+                base, payload, cfg.queue["timeout_s"])
+            resp["model"] = requested
+            ms = int((time.perf_counter() - t0) * 1000)
+            _log_request(requested, backend_name, False, ms,
+                         resp.get("usage") or {}, 200)
+            return JSONResponse(resp)
+
+        # runpod serverless runsync — worker generate mode
+        if btype == "runpod" and backend["models"][model_key].get("transport") == "runsync":
+            m = backend["models"][model_key]
+            body_input: dict[str, Any] = {"model": m["remote_id"],
+                                         "prompt": prompts[0]}
+            if body.temperature is not None:
+                body_input["temperature"] = body.temperature
+            if body.max_tokens:
+                body_input["max_tokens"] = body.max_tokens
+            out = await runpod.runsync_chat(
+                m["endpoint_id"], body_input,
+                backend.get("api_key_env") or "RUNPOD_API_KEY",
+                m.get("timeout_s") or cfg.queue["timeout_s"],
+                policy=m.get("policy"))
+            resp = runpod.ollama_generate_output_to_openai(out, requested)
+            ms = int((time.perf_counter() - t0) * 1000)
+            _log_request(requested, backend_name, False, ms,
+                         resp.get("usage") or {}, 200)
+            return JSONResponse(resp)
+
+        # cloud-shaped passthrough: openai backends, remote llama-server,
+        # runpod serverless (openai transport)
+        remote_id = backend["models"][model_key]
+        client_name = backend_name
+        cloud_backend = backend
+        if btype == "runpod":
+            m = backend["models"][model_key]
+            remote_id = m["remote_id"]
+            client_name = f"runpod-{backend_name}-{model_key}"
+            cloud_backend = {
+                "base_url": runpod.serverless_base_url(m["endpoint_id"]),
+                "api_key_env": backend.get("api_key_env") or "RUNPOD_API_KEY",
+            }
+        client = cloud.get_cloud_client(client_name, cloud_backend,
+                                        timeout=cfg.queue["timeout_s"])
+        kwargs: dict[str, Any] = {"model": remote_id, "prompt": body.prompt}
+        if body.temperature is not None:
+            kwargs["temperature"] = body.temperature
+        if body.max_tokens:
+            kwargs["max_tokens"] = (min(body.max_tokens, cloud.CLOUD_MAX_TOKENS_CAP)
+                                    if btype == "openai" else body.max_tokens)
+        try:
+            resp = await client.completions.create(**kwargs)
+        except Exception as e:
+            raise cloud.CloudBackendError(
+                f"cloud backend {backend_name!r} completion failed: {e}") from e
+        d = (json.loads(resp.model_dump_json())
+             if hasattr(resp, "model_dump_json") else dict(resp))
+        d["model"] = requested
+        ms = int((time.perf_counter() - t0) * 1000)
+        _log_request(requested, backend_name, False, ms,
+                     d.get("usage") or {}, 200)
+        return JSONResponse(d)
+    except Exception as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        logger.warning("gateway completion failed (%s): %s", requested, e)
+        _log_request(requested, "", body.stream, ms, {}, 502)
         return _error(502, str(e), err_type="server_error",
                       code="execution_error")
     finally:

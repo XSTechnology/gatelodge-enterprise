@@ -300,8 +300,10 @@ def test_pod_cold_deploy_and_chat(wired, gguf, monkeypatch):
     assert payload["gpuTypeIds"] == ["NVIDIA RTX A6000"]
     assert payload["interruptible"] is True  # spot → interruptible (live schema)
     assert payload["ports"] == ["8080/http"]  # array (live schema)
-    assert payload["dockerStartCmd"][0] == "-m"  # docker args → string array
-    assert "--port" in payload["dockerStartCmd"]
+    # dockerStartCmd is a FULL command: RunPod replaces the image CMD, so
+    # bare args made the container exec "-m" and die (live-verified bug)
+    assert payload["dockerStartCmd"][0] == "/llama-server"
+    assert payload["dockerStartCmd"][1:3] == ["-m", "/workspace/m.gguf"]
     # health-polled + proxied through the pod's proxy.runpod.net URL
     assert any(c["health"] == f"https://{POD_ID}-8080.proxy.runpod.net"
                for c in http)
@@ -330,6 +332,22 @@ def test_pod_deploy_payload_mapping(wired, gguf, monkeypatch):
     assert "interruptible" not in payload  # spot false → omitted
     assert payload["imageName"] == "custom/img:latest"  # raw deploy wins
     assert payload["zzz"] == 1  # unknown raw fields pass through
+
+
+def test_pod_deploy_full_command_knobs(wired, gguf, monkeypatch):
+    """docker_cmd (full command) wins over the docker_args prefix;
+    docker_entrypoint passes through."""
+    cfg = _rp_config(gguf, docker_cmd="/custom/llama-server -m /m.gguf",
+                     docker_entrypoint=["/bin/sh", "-c"])
+    wired(cfg)
+    rest = _patch_rest(monkeypatch)
+    _patch_pod_http(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    payload = [c for c in rest.calls if c[0] == "deploy"][0][1]
+    assert payload["dockerStartCmd"] == ["/custom/llama-server", "-m", "/m.gguf"]
+    assert payload["dockerEntrypoint"] == ["/bin/sh", "-c"]
 
 
 def test_pod_reuse_when_running(wired, gguf, monkeypatch):

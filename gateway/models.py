@@ -520,6 +520,71 @@ class EmbeddedEngine:
             except Exception as e:
                 raise EmbeddedLLMError(f"embedded embedding failed: {e}") from e
 
+    # ── legacy text completions (POST /v1/completions) ──
+
+    async def complete(self, model: str, prompt: str, *,
+                       temperature: float | None = None,
+                       max_tokens: int | None = None,
+                       stream: bool = False):
+        """Raw text completion (no chat template, no tools, no
+        think-stripping — legacy /v1/completions semantics). Returns the
+        llama_cpp wire shape (already OpenAI text.completion) or, when
+        stream=True, an async iterator of text.completion.chunk chunks."""
+        inst = await self._acquire(model)
+        llm_kwargs: dict[str, Any] = {
+            "temperature": temperature if temperature is not None else 0.8}
+        if max_tokens:
+            llm_kwargs["max_tokens"] = max_tokens
+        if stream:
+            return self._stream_completion(model, inst, prompt, llm_kwargs)
+        try:
+            return await asyncio.to_thread(
+                inst.llama.create_completion, prompt, **llm_kwargs)
+        except EmbeddedLLMError:
+            raise
+        except Exception as e:
+            raise EmbeddedLLMError(f"embedded completion failed: {e}") from e
+        finally:
+            self._release(model, inst)
+
+    async def _stream_completion(self, model_name: str | None,
+                                 inst: _Instance, prompt: str,
+                                 llm_kwargs: dict) -> AsyncIterator[dict]:
+        """Bridge the sync llama_cpp completion stream into async — raw
+        text deltas, no think-hold-back (legacy semantics)."""
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def _emit(text: str) -> None:
+            loop.call_soon_threadsafe(
+                q.put_nowait, ("chunk", {"choices": [{"text": text}]}))
+
+        def _worker() -> None:
+            try:
+                sync_iter = inst.llama.create_completion(
+                    prompt=prompt, stream=True, **llm_kwargs)
+                for chunk in sync_iter:
+                    text = (chunk.get("choices") or [{}])[0].get("text")
+                    if text:
+                        _emit(text)
+                loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+            except Exception as e:
+                loop.call_soon_threadsafe(q.put_nowait, ("error", e))
+
+        try:
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+            while True:
+                kind, payload = await q.get()
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise EmbeddedLLMError(
+                        f"embedded completion stream failed: {payload}")
+                yield payload
+        finally:
+            self._release(model_name, inst)
+
     def unload(self, which: str = "all") -> int:
         """Drop pools/instances to free VRAM (chat AND embedding).
         Returns number of instances unloaded."""

@@ -183,7 +183,14 @@ def _pod_name(backend_name: str, model_key: str) -> str:
 def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> dict[str, Any]:
     """Config pod spec → POST /v1/pods payload (field names verified
     against the live schema: interruptible, dockerStartCmd as an ARRAY,
-    ports as an ARRAY). The raw ``deploy`` dict always wins."""
+    ports as an ARRAY). The raw ``deploy`` dict always wins.
+
+    dockerStartCmd: ``docker_cmd`` (FULL command incl. the binary, e.g.
+    "/llama-server -m ...") wins; else ``docker_args`` is prefixed with
+    /llama-server — RunPod's dockerStartCmd REPLACES the image CMD, so
+    bare args made the container exec "-hf ..." and die (live-verified
+    failure mode). ``docker_entrypoint`` (array) passes through for full
+    control."""
     payload: dict[str, Any] = {
         "name": _pod_name(backend_name, model_key),
         "imageName": spec.get("image"),
@@ -192,8 +199,13 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> d
         "containerDiskInGb": spec.get("container_disk_gb"),
         "env": spec.get("env") or None,
     }
-    if spec.get("docker_args"):
-        payload["dockerStartCmd"] = shlex.split(spec["docker_args"])
+    if spec.get("docker_cmd"):
+        payload["dockerStartCmd"] = shlex.split(spec["docker_cmd"])
+    elif spec.get("docker_args"):
+        payload["dockerStartCmd"] = ["/llama-server",
+                                     *shlex.split(spec["docker_args"])]
+    if spec.get("docker_entrypoint"):
+        payload["dockerEntrypoint"] = list(spec["docker_entrypoint"])
     if spec.get("gpu_type_ids"):
         payload["gpuTypeIds"] = spec["gpu_type_ids"]
     if spec.get("volume_gb"):
@@ -329,6 +341,42 @@ def ollama_chunk_content(chunk: Any) -> tuple[str, bool, str]:
         return "", False, ""
     content = (chunk.get("message") or {}).get("content") or ""
     return content, bool(chunk.get("done")), str(chunk.get("done_reason") or "")
+
+
+def ollama_generate_output_to_openai(output: Any, model_echo: str) -> dict[str, Any]:
+    """RunPod Ollama-worker GENERATE output (input {"prompt": ...}) →
+    OpenAI text.completion. Handles the single-dict shape ({response,
+    eval_count, ...}) and a list of chunk dicts/JSON-strings; chunks carry
+    incremental "response" pieces, the done chunk the stats."""
+    parts: list[str] = []
+    final: dict[str, Any] = {}
+    for it in (output if isinstance(output, list) else [output]):
+        if isinstance(it, str):
+            try:
+                it = json.loads(it)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if not isinstance(it, dict):
+            continue
+        if it.get("response"):
+            parts.append(it["response"])
+        if it.get("done"):
+            final = it
+    pt = int(final.get("prompt_eval_count") or 0)
+    ct = int(final.get("eval_count") or 0)
+    return {
+        "id": f"cmpl-rp-{time.time_ns():x}",
+        "object": "text.completion",
+        "created": int(time.time()),
+        "model": model_echo,
+        "choices": [{
+            "index": 0,
+            "text": "".join(parts),
+            "finish_reason": final.get("done_reason") or "stop",
+        }],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                  "total_tokens": pt + ct},
+    }
 
 
 def ollama_output_to_openai(output: Any, model_echo: str) -> dict[str, Any]:

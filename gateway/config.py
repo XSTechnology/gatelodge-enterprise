@@ -294,6 +294,12 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                                          (m.get("gpu_type_ids") or []) if str(g).strip()],
                         "image": str(m.get("image") or "").strip(),
                         "docker_args": str(m.get("docker_args") or "").strip(),
+                        # FULL command incl. binary (overrides docker_args
+                        # prefixing) + optional entrypoint passthrough
+                        "docker_cmd": str(m.get("docker_cmd") or "").strip(),
+                        "docker_entrypoint": [str(a) for a in
+                                              (m.get("docker_entrypoint") or [])
+                                              if str(a).strip()],
                         # REST API wants an ARRAY ("8080/http" → ["8080/http"])
                         "ports": [p.strip() for p in
                                   str(m.get("ports") or "8080/http").split(",")
