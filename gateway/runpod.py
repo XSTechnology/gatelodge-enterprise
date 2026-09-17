@@ -56,6 +56,40 @@ class RunPodStreamUnavailable(RunPodError):
     callers may fall back to collect-then-emit (runsync)."""
 
 
+# 429 backoff (docs: "Implement retry logic with exponential backoff" —
+# rate limits are dynamic, scaling with the endpoint's worker count)
+_RETRY_429_ATTEMPTS = 3
+_RETRY_429_BASE_S = 0.5
+
+
+async def _request(method: str, url: str, hdr: dict[str, str],
+                   timeout: float, json_body: dict | None = None) -> httpx.Response:
+    """One HTTP call with 429 exponential-backoff retry."""
+    delay = _RETRY_429_BASE_S
+    r = None
+    for attempt in range(_RETRY_429_ATTEMPTS + 1):
+        async with httpx.AsyncClient(timeout=timeout) as ac:
+            r = await (ac.post(url, json=json_body, headers=hdr)
+                       if method == "POST" else ac.get(url, headers=hdr))
+        if r.status_code != 429 or attempt == _RETRY_429_ATTEMPTS:
+            return r
+        await asyncio.sleep(delay)
+        delay *= 2
+    return r  # unreachable
+
+
+async def _cancel_best_effort(base: str, job_id: str | None,
+                              hdr: dict[str, str]) -> None:
+    """POST /cancel/{id} — fire and forget (a timed-out queued job would
+    otherwise keep consuming worker time)."""
+    if not job_id:
+        return
+    try:
+        await _request("POST", f"{base}/cancel/{job_id}", hdr, timeout=15.0)
+    except Exception:  # noqa: BLE001 — cleanup must never mask the real error
+        logger.warning("runpod cancel %s failed", job_id, exc_info=True)
+
+
 # ── REST client (module-level functions so tests can monkeypatch) ──────────
 
 def _api_key(api_key_env: str) -> str:
@@ -181,19 +215,24 @@ def serverless_base_url(endpoint_id: str) -> str:
 # ── Serverless RAW job protocol (transport "runsync") ──────────────────────
 
 async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
-                       api_key_env: str, timeout: float = 120.0) -> Any:
-    """POST /v2/<ep>/runsync with {"input": {...}}; poll /status/{id} while
-    the job queues or runs (scale-to-zero cold start). ?wait= keeps RunPod
-    itself waiting up to 300s before bouncing IN_QUEUE. Returns the job's
-    OUTPUT verbatim (worker-specific shape — map with ollama_output_to_openai
-    or your own)."""
+                       api_key_env: str, timeout: float = 120.0,
+                       policy: dict[str, Any] | None = None) -> Any:
+    """POST /v2/<ep>/runsync with {"input": {...}} (+ optional ``policy``
+    — executionTimeout/ttl/lowPriority, per the docs); poll /status/{id}
+    while the job queues or runs (scale-to-zero cold start). ?wait= keeps
+    RunPod itself waiting up to 300s before bouncing IN_QUEUE. On OUR
+    timeout the queued job is cancelled (best-effort /cancel). Returns
+    the job's OUTPUT verbatim (worker-specific shape — map with
+    ollama_output_to_openai or your own)."""
     base = SERVERLESS_API.format(endpoint_id=endpoint_id)
     hdr = {"Authorization": f"Bearer {_api_key(api_key_env)}"}
     # docs: ?wait is 1000-300000 ms — RunPod holds the sync window open
     wait_ms = max(1000, min(int(timeout * 1000), 300000))
-    async with httpx.AsyncClient(timeout=timeout) as ac:
-        r = await ac.post(f"{base}/runsync?wait={wait_ms}",
-                          json={"input": body_input}, headers=hdr)
+    payload: dict[str, Any] = {"input": body_input}
+    if isinstance(policy, dict) and policy:
+        payload["policy"] = policy
+    r = await _request("POST", f"{base}/runsync?wait={wait_ms}", hdr,
+                       timeout, payload)
     if r.status_code >= 400:
         raise RunPodError(f"runpod serverless runsync -> {r.status_code}: "
                           f"{r.text[:300]}")
@@ -201,11 +240,13 @@ async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
     deadline = time.monotonic() + timeout
     while job.get("status") in ("IN_QUEUE", "IN_PROGRESS"):
         if time.monotonic() >= deadline:
+            await _cancel_best_effort(base, job.get("id"), hdr)
             raise RunPodError(f"runpod serverless job {job.get('id')} still "
-                              f"{job.get('status')} after {timeout:.0f}s")
+                              f"{job.get('status')} after {timeout:.0f}s "
+                              "(cancelled)")
         await asyncio.sleep(1.0)
-        async with httpx.AsyncClient(timeout=timeout) as ac:
-            r = await ac.get(f"{base}/status/{job.get('id')}", headers=hdr)
+        r = await _request("GET", f"{base}/status/{job.get('id')}", hdr,
+                           timeout)
         if r.status_code >= 400:
             raise RunPodError(f"runpod serverless status -> {r.status_code}: "
                               f"{r.text[:300]}")
@@ -217,13 +258,17 @@ async def runsync_chat(endpoint_id: str, body_input: dict[str, Any],
 
 
 async def run_job(endpoint_id: str, body_input: dict[str, Any],
-                  api_key_env: str, timeout: float = 120.0) -> str:
+                  api_key_env: str, timeout: float = 120.0,
+                  policy: dict[str, Any] | None = None) -> str:
     """POST /v2/<ep>/run (async) → job id. Pair with stream_job for
     incremental results."""
     base = SERVERLESS_API.format(endpoint_id=endpoint_id)
-    async with httpx.AsyncClient(timeout=timeout) as ac:
-        r = await ac.post(f"{base}/run", json={"input": body_input},
-                          headers={"Authorization": f"Bearer {_api_key(api_key_env)}"})
+    payload: dict[str, Any] = {"input": body_input}
+    if isinstance(policy, dict) and policy:
+        payload["policy"] = policy
+    r = await _request("POST", f"{base}/run", hdr={
+        "Authorization": f"Bearer {_api_key(api_key_env)}"},
+        timeout=timeout, json_body=payload)
     if r.status_code >= 400:
         raise RunPodError(f"runpod serverless run -> {r.status_code}: "
                           f"{r.text[:300]}")

@@ -278,6 +278,9 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         "remote_id": str(m.get("remote_id") or mname).strip(),
                         "transport": transport if transport in ("openai", "runsync") else "openai",
                         "timeout_s": tmo,
+                        # docs: policy {executionTimeout, ttl, lowPriority}
+                        # merged into every job submission for this model
+                        "policy": dict(m["policy"]) if isinstance(m.get("policy"), dict) else {},
                     }
                 else:
                     # pod lifecycle — numbers coerced, deploy dict kept raw

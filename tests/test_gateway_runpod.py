@@ -497,9 +497,11 @@ OLLAMA_CHUNKS = [
 
 
 def _patch_runsync(monkeypatch, output=None, error=None, calls=None):
-    async def fake_runsync(endpoint_id, body_input, api_key_env, timeout=120.0):
+    async def fake_runsync(endpoint_id, body_input, api_key_env,
+                            timeout=120.0, policy=None):
         if calls is not None:
-            calls.append({"endpoint_id": endpoint_id, "input": body_input})
+            calls.append({"endpoint_id": endpoint_id, "input": body_input,
+                          "policy": policy})
         if error:
             raise rp.RunPodError(error)
         return output
@@ -566,7 +568,8 @@ def test_runsync_transport_job_failed_502(wired, gguf, monkeypatch):
 
 def _patch_run_stream(monkeypatch, chunks=None, unavailable=False):
     """Fake run_job + stream_job for the streaming path."""
-    async def fake_run(endpoint_id, body_input, api_key_env, timeout=120.0):
+    async def fake_run(endpoint_id, body_input, api_key_env,
+                       timeout=120.0, policy=None):
         return "job-123"
 
     async def fake_stream(endpoint_id, job_id, api_key_env, timeout=300.0):
@@ -672,6 +675,139 @@ def test_ollama_chunk_content_shapes():
     # garbage tolerated
     assert rp.ollama_chunk_content("not json") == ("", False, "")
     assert rp.ollama_chunk_content(42) == ("", False, "")
+
+
+# ── docs refinements: policy passthrough, 429 backoff, cancel-on-timeout ──
+
+def test_runsync_policy_passthrough(wired, gguf, monkeypatch):
+    """Config policy (executionTimeout/ttl) reaches the job submission."""
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["smollm"] = {
+        "endpoint_id": "ep-xyz", "transport": "runsync",
+        "policy": {"executionTimeout": 300000, "ttl": 600000}}
+    wired(cfg)
+    calls: list[dict] = []
+    _patch_runsync(monkeypatch, output=OLLAMA_SINGLE, calls=calls)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "smollm",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert calls[0]["policy"] == {"executionTimeout": 300000,
+                                  "ttl": 600000}
+
+
+def test_serverless_policy_normalized(wired, gguf):
+    """policy survives config normalization; non-dict values are dropped."""
+    cfg = _rp_config(gguf)
+    cfg["backends"]["rp"]["models"]["a"] = {
+        "endpoint_id": "e1", "policy": {"ttl": 60000}}
+    cfg["backends"]["rp"]["models"]["b"] = {
+        "endpoint_id": "e2", "policy": "garbage"}
+    _, c, _ = wired(cfg)
+    models = c.backends["rp"]["models"]
+    assert models["a"]["policy"] == {"ttl": 60000}
+    assert models["b"]["policy"] == {}
+
+
+# ── runsync_chat internals (fake httpx) ────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, status_code, json_data=None):
+        self.status_code = status_code
+        self._json = json_data
+        self.text = ""
+
+    def json(self):
+        return self._json
+
+
+class _FakeAsyncClient:
+    """Scripted responses; records every call. Class-level state (tests
+    set .responses before awaiting the function under test)."""
+    responses: list[_FakeResp] = []
+    calls: list[tuple] = []
+
+    def __init__(self, timeout=None):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        _FakeAsyncClient.calls.append(("POST", url, json))
+        return _FakeAsyncClient.responses.pop(0)
+
+    async def get(self, url, headers=None):
+        _FakeAsyncClient.calls.append(("GET", url, None))
+        return _FakeAsyncClient.responses.pop(0)
+
+
+@pytest.fixture()
+def fake_httpx(monkeypatch):
+    """Patch rp.httpx.AsyncClient with the scripted fake + fast backoff."""
+    _FakeAsyncClient.responses = []
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr(rp.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(rp, "_RETRY_429_BASE_S", 0.01)
+    monkeypatch.setenv("RUNPOD_API_KEY_TEST", "x")
+    return _FakeAsyncClient
+
+
+async def test_runsync_429_backoff(fake_httpx):
+    """429 then 200 → the POST retried (docs: exponential backoff)."""
+    fake_httpx.responses = [
+        _FakeResp(429),
+        _FakeResp(200, {"status": "COMPLETED", "id": "j1", "output": ["x"]}),
+    ]
+    out = await rp.runsync_chat("ep", {"prompt": "hi"},
+                                "RUNPOD_API_KEY_TEST", timeout=10.0)
+    assert out == ["x"]
+    posts = [c for c in fake_httpx.calls if c[0] == "POST"]
+    assert len(posts) == 2  # one retry
+    assert "runsync?wait=" in posts[0][1]
+
+
+async def test_runsync_policy_in_payload(fake_httpx):
+    fake_httpx.responses = [
+        _FakeResp(200, {"status": "COMPLETED", "id": "j1", "output": []}),
+    ]
+    await rp.runsync_chat("ep", {"prompt": "hi"}, "RUNPOD_API_KEY_TEST",
+                          timeout=10.0, policy={"executionTimeout": 60000})
+    body = fake_httpx.calls[0][2]
+    assert body["policy"] == {"executionTimeout": 60000}
+    assert body["input"] == {"prompt": "hi"}
+
+
+async def test_runsync_cancel_on_timeout(fake_httpx):
+    """Polling timeout → the queued job is CANCELLED before the error."""
+    fake_httpx.responses = [
+        _FakeResp(200, {"status": "IN_QUEUE", "id": "job-stuck"}),
+        _FakeResp(200, {"status": "IN_QUEUE", "id": "job-stuck"}),  # poll
+        _FakeResp(200, {"status": "cancelled"}),  # /cancel response
+    ]
+    with pytest.raises(rp.RunPodError) as ei:
+        await rp.runsync_chat("ep", {"prompt": "hi"},
+                              "RUNPOD_API_KEY_TEST", timeout=0.05)
+    assert "cancelled" in str(ei.value) or "IN_QUEUE" in str(ei.value)
+    kinds = [(m, url) for m, url, _ in fake_httpx.calls]
+    assert ("POST", "https://api.runpod.ai/v2/ep/cancel/job-stuck") in kinds
+
+
+async def test_run_job_policy_and_backoff(fake_httpx):
+    fake_httpx.responses = [
+        _FakeResp(429),
+        _FakeResp(200, {"id": "job-9", "status": "IN_QUEUE"}),
+    ]
+    jid = await rp.run_job("ep", {"prompt": "hi"}, "RUNPOD_API_KEY_TEST",
+                           timeout=10.0, policy={"ttl": 60000})
+    assert jid == "job-9"
+    posts = [c for c in fake_httpx.calls if c[0] == "POST"]
+    assert len(posts) == 2  # 429 retried
+    assert posts[0][2]["policy"] == {"ttl": 60000}
 
 
 async def test_pod_idle_reaper_stop_then_terminate(wired, gguf, monkeypatch):

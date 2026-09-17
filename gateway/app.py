@@ -377,7 +377,8 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         out = await runpod.runsync_chat(
             m["endpoint_id"], body_input,
             backend.get("api_key_env") or "RUNPOD_API_KEY",
-            m.get("timeout_s") or cfg.queue["timeout_s"])
+            m.get("timeout_s") or cfg.queue["timeout_s"],
+            policy=m.get("policy"))
         resp = runpod.ollama_output_to_openai(out, requested)
         return resp, backend_name, model_key
 
@@ -707,7 +708,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 finish = "stop"
                 try:
                     job_id = await runpod.run_job(m["endpoint_id"],
-                                                  body_input, api_env, tmo)
+                                                  body_input, api_env, tmo,
+                                                  policy=m.get("policy"))
                     got_any = False
                     async for chunk in runpod.stream_job(
                             m["endpoint_id"], job_id, api_env, tmo):
@@ -725,7 +727,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     out = await runpod.runsync_chat(
                         m["endpoint_id"],
                         {k: v for k, v in body_input.items() if k != "stream"},
-                        api_env, tmo)
+                        api_env, tmo, policy=m.get("policy"))
                     resp = runpod.ollama_output_to_openai(out, requested)
                     choice = resp["choices"][0]
                     if choice["message"].get("content"):
