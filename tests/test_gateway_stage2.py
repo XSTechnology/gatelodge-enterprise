@@ -4,7 +4,8 @@ SSE chunks must parse as OpenAI stream events (chat.completion.chunk,
 role delta first, finish chunk, `data: [DONE]` terminator); the engine's
 think-hold-back must never leak reasoning deltas (whole, and when the
 `</think>` closer splits across chunks); non-thinking output flushes at
-stream end; stream+tools and unknown models 400; /healthz reports
+stream end; stream+tools on embedded buffers content then emits
+delta.tool_calls at stream end; unknown models 400; /healthz reports
 backends, loaded instances, GPUs with free VRAM, discovered count.
 """
 import json
@@ -211,16 +212,63 @@ def test_stream_non_thinking_flushes_at_end(wired, gguf):
     _with_fake_llama(fn, stream_script=["Just ", "answer"])
 
 
-def test_stream_tools_rejected(wired, gguf):
+def test_stream_tools_embedded(wired, gguf):
+    """Streaming with tools on embedded: content deltas streamed live,
+    tool call parsed at stream end → delta.tool_calls chunk."""
+    wired(_local_config(gguf))
+    tools = [{"type": "function", "function": {
+        "name": "f", "description": "d",
+        "parameters": {"type": "object", "properties": {"x": {"type": "integer"}}}}}]
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            status, lines = _stream_lines(client, {
+                "model": "fast", "stream": True, "tools": tools,
+                "messages": [{"role": "user", "content": "call f"}]})
+        assert status == 200
+        events, done = _parse_sse(lines)
+        assert done
+        # Content deltas streamed live (the JSON tool call text)
+        content_events = [e for e in events if e["choices"][0]["delta"].get("content")]
+        assert len(content_events) >= 1
+        # Tool-call delta at end
+        tc_events = [e for e in events if e["choices"][0]["delta"].get("tool_calls")]
+        assert len(tc_events) == 1
+        tc_delta = tc_events[0]["choices"][0]["delta"]["tool_calls"][0]
+        assert tc_delta["index"] == 0
+        assert tc_delta["type"] == "function"
+        assert tc_delta["function"]["name"] == "f"
+        # Finish reason = tool_calls (not stop)
+        finish_events = [e for e in events
+                         if e["choices"][0].get("finish_reason") == "tool_calls"]
+        assert len(finish_events) == 1
+
+    _with_fake_llama(fn, stream_script=['{"tool": "f", "arguments": {"x": 1}}'])
+
+
+def test_stream_tools_no_call_just_text(wired, gguf):
+    """Tools offered but model returns plain text → normal stop finish."""
     wired(_local_config(gguf))
     tools = [{"type": "function", "function": {
         "name": "f", "description": "d", "parameters": {"type": "object"}}}]
-    with TestClient(gw_app.app) as client:
-        r = client.post("/v1/chat/completions", json={
-            "model": "fast", "stream": True, "tools": tools,
-            "messages": [{"role": "user", "content": "hi"}]})
-    assert r.status_code == 400
-    assert "tools" in r.json()["error"]["message"]
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            status, lines = _stream_lines(client, {
+                "model": "fast", "stream": True, "tools": tools,
+                "messages": [{"role": "user", "content": "hello"}]})
+        assert status == 200
+        events, done = _parse_sse(lines)
+        assert done
+        # No tool_calls delta — just content + stop
+        tc_events = [e for e in events if e["choices"][0]["delta"].get("tool_calls")]
+        assert len(tc_events) == 0
+        assert _content(events) == "Hello world"
+        finish_events = [e for e in events
+                         if e["choices"][0].get("finish_reason") == "stop"]
+        assert len(finish_events) == 1
+
+    _with_fake_llama(fn, stream_script=["Hello", " world"])
 
 
 def test_stream_unknown_model_400(wired, gguf):

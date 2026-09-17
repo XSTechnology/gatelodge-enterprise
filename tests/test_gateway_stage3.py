@@ -393,6 +393,25 @@ def test_cloud_stream_passthrough(wired, gguf, monkeypatch):
     assert fake.calls[0]["model"] == "llama-3.1-8b-instant"
 
 
+def test_cloud_stream_with_tools(wired, gguf, monkeypatch):
+    """Streaming with tools on cloud: tools forwarded as-is to the client."""
+    wired(_config(gguf))
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+    tools = [{"type": "function", "function": {
+        "name": "get_weather", "description": "d",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+    with TestClient(gw_app.app) as client:
+        with client.stream("POST", "/v1/chat/completions", json={
+            "model": "groq:cloud-fast", "stream": True, "tools": tools,
+            "messages": [{"role": "user", "content": "weather in sf"}]}) as r:
+            assert r.status_code == 200
+            lines = [ln for ln in r.iter_lines() if ln.strip()]
+    assert lines[-1] == "data: [DONE]"
+    # Tools were forwarded to the cloud client
+    assert fake.calls[0].get("tools") == tools
+    assert fake.calls[0]["stream"] is True
+
+
 def test_stream_executes_primary_only(wired, gguf, monkeypatch):
     """Streaming ignores chain fallbacks — primary entry only."""
     wired(_config(gguf, aliases={

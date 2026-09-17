@@ -1,4 +1,4 @@
-"""OpenAI-compatible HTTP surface — Stages 1-5: full gateway + console.
+"""OpenAI-compatible HTTP surface — Stages 1-5 + streaming tool deltas: full gateway + console.
 
 Implemented:
   GET  /                     — single-page console (config / models /
@@ -14,6 +14,10 @@ Implemented:
                               cloud client. Cloud max_tokens capped at 800.
                               Over-capacity concurrent requests get 429 +
                               Retry-After (queue.max_waiting).
+                              Streaming with tools: cloud forwarded as-is
+                              (native tool-call deltas); embedded buffers
+                              content deltas then emits a delta.tool_calls
+                              chunk at stream end (JSON-convention shim).
   GET  /healthz              — backends, loaded instances (VRAM/ctx),
                               GPUs with free VRAM, discovered model count
   GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
@@ -34,8 +38,8 @@ All data endpoints (including /healthz) require it when configured.
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
 
-Deferred to v2: /v1/completions, /v1/embeddings, streaming tool-call
-deltas (stream + tools → 400 today), worker pools, llama-server backend.
+Deferred to v2: /v1/completions, /v1/embeddings, worker pools,
+llama-server backend.
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}.
@@ -402,14 +406,6 @@ async def chat_completions(body: ChatRequest) -> Response:
     entries = plan["entries"]
 
     if body.stream:
-        if body.tools:
-            # The engine's stream path yields content deltas only — a JSON
-            # tool call would arrive as plain text, not delta.tool_calls.
-            _log_request(requested, "", True,
-                         int((time.perf_counter() - t0) * 1000), {}, 400)
-            return _error(400, "streaming with tools is not supported yet — "
-                          "tool-call deltas arrive in a later stage",
-                          code="stream_tools_unsupported")
         # Streaming executes the PRIMARY entry only — hedge racing is a
         # non-streaming feature (first-completion-wins has no stream analog
         # short of first-token hedging, which is a follow-up).
@@ -450,7 +446,13 @@ def _stream_chat(requested: str, entry: tuple[str, str],
 
     OpenAI wire format: role chunk → content chunks → finish chunk →
     `data: [DONE]` (cloud chunks pass through in their native shape).
-    Mid-flight errors become an OpenAI-shaped error object + [DONE]."""
+    Mid-flight errors become an OpenAI-shaped error object + [DONE].
+
+    Streaming with tools:
+      — cloud: forwarded as-is (native tool-call deltas)
+      — embedded: content deltas streamed live; at stream end the buffered
+        text is parsed for a JSON tool call → emitted as a delta.tool_calls
+        chunk (JSON-convention shim has no token-level tool boundaries)."""
     chat_id = f"chatcmpl-gw-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     backend_name, model_key = entry
@@ -472,17 +474,43 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 stream = await engine.chat.completions.create(
                     model=model_key,
                     messages=body.messages,
-                    tools=None,
+                    tools=body.tools,
                     temperature=body.temperature,
                     max_tokens=body.max_tokens,
                     stream=True,
                 )
                 yield _chunk({"role": "assistant", "content": ""})
+                # Buffer content for post-stream tool-call parsing
+                content_buf: list[str] = []
                 async for ch in stream:
                     for c in ch.choices:
                         text = c.delta.get("content")
                         if text:
+                            content_buf.append(text)
                             yield _chunk({"content": text})
+                # If tools were offered, check buffered content for a tool call
+                if body.tools and content_buf:
+                    tc = engine._parse_tool_call("".join(content_buf), body.tools)
+                    if tc is not None:
+                        yield _chunk({
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }]
+                        })
+                        yield _chunk({}, finish="tool_calls")
+                        yield "data: [DONE]\n\n"
+                        ms = int((time.perf_counter() - t0) * 1000)
+                        logger.info("gateway stream ok (%s / %s) in %dms [tool]",
+                                    backend_name, model_key, ms)
+                        _log_request(requested, backend_name, True, ms, {}, 200)
+                        _release_chat_slot()
+                        return
                 yield _chunk({}, finish="stop")
             else:
                 # cloud passthrough — the remote stream is already
@@ -498,6 +526,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 if body.max_tokens:
                     kwargs["max_tokens"] = min(body.max_tokens,
                                                cloud.CLOUD_MAX_TOKENS_CAP)
+                if body.tools:
+                    kwargs["tools"] = body.tools
                 stream = await client.chat.completions.create(**kwargs)
                 async for chunk in stream:
                     data = (chunk.model_dump_json()
