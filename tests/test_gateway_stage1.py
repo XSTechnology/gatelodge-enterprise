@@ -26,9 +26,10 @@ from gateway.models import EmbeddedLLMError  # noqa: E402
 
 # ── FakeLlama (sys.modules injection) ──────────────────────────────────────
 
-def _with_fake_llama(fn, script=None):
+def _with_fake_llama(fn, script=None, stream_script=None):
     """Run fn with a fake llama_cpp module; records Llama(**kwargs) loads and
-    every create_chat_completion(**kwargs) call."""
+    every create_chat_completion(**kwargs) call. `stream_script` = content
+    pieces yielded as stream chunks (default ["Hello", " world"])."""
     records: list[dict] = []
     mod = types.ModuleType("llama_cpp")
 
@@ -36,9 +37,19 @@ def _with_fake_llama(fn, script=None):
         def __init__(self, **kwargs):
             records.append({"load": kwargs})
             self.script = list(script or [])
+            self.n_ctx = kwargs.get("n_ctx", 4096)
 
         def create_chat_completion(self, **kwargs):
             records.append({"call": kwargs})
+            if kwargs.get("stream"):
+                pieces = (list(stream_script) if stream_script is not None
+                          else ["Hello", " world"])
+
+                def _gen():
+                    for p in pieces:
+                        yield {"choices": [{"delta": {"content": p}}]}
+
+                return _gen()
             if self.script:
                 return self.script.pop(0)
             return {"choices": [{"message": {"content": "ok"}}],
@@ -567,14 +578,22 @@ def test_chat_unknown_model_400_openai_shaped(wired, gguf):
     assert "unknown model" in err["message"]
 
 
-def test_chat_stream_rejected_stage1(wired, gguf):
+def test_chat_stream_now_implemented(wired, gguf):
+    """Stage 2 wired SSE — stream:true now succeeds (see test_gateway_stage2
+    for the full format assertions). Smoke check only."""
     wired(_local_config(gguf))
-    with TestClient(gw_app.app) as client:
-        r = client.post("/v1/chat/completions", json={
-            "model": "fast", "stream": True,
-            "messages": [{"role": "user", "content": "hi"}]})
-    assert r.status_code == 400
-    assert "streaming" in r.json()["error"]["message"]
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            with client.stream("POST", "/v1/chat/completions", json={
+                "model": "fast", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}) as r:
+                assert r.status_code == 200
+                assert r.headers["content-type"].startswith("text/event-stream")
+                lines = [ln for ln in r.iter_lines() if ln.strip()]
+        assert lines[-1] == "data: [DONE]"
+
+    _with_fake_llama(fn, stream_script=["Hi", " there"])
 
 
 def test_chat_cloud_backend_rejected_stage1(wired, gguf):

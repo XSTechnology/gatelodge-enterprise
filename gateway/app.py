@@ -1,40 +1,47 @@
-"""OpenAI-compatible HTTP surface — Stage 1: local backend, non-streaming.
+"""OpenAI-compatible HTTP surface — Stages 1-2: local backend, chat + SSE.
 
 Implemented:
   GET  /v1/models           — aliases + backend models + auto-discovered
                               GGUF stems from models_dir
-  POST /v1/chat/completions — non-streaming; embedded backend only. Any
+  POST /v1/chat/completions — non-streaming AND streaming (SSE,
+                              `stream:true`); embedded backend only. Any
                               GGUF stem in models_dir is servable without
                               config; multiple models load lazily and run
-                              concurrently (per-instance locks).
+                              concurrently (per-instance locks). Streamed
+                              reasoning is held back — think-tags never
+                              leak into content deltas.
+  GET  /healthz             — backends, loaded instances (VRAM/ctx),
+                              GPUs with free VRAM, discovered model count
 
 Arriving in later stages (per the design doc's stage plan):
-  streaming SSE (Stage 2), /healthz (Stage 2), cloud backends + alias
-  chains + hedge + JSONL request log (Stage 3), bearer auth + admin
-  endpoints (Stage 4), console page (Stage 5). /v1/completions and
-  /v1/embeddings are deferred to v2.
+  cloud backends + alias chains + hedge + JSONL request log (Stage 3),
+  bearer auth + admin endpoints (Stage 4), console page (Stage 5).
+  /v1/completions and /v1/embeddings are deferred to v2, as is streaming
+  tool-call deltas (stream + tools → 400 today).
 
 Error bodies are OpenAI-shaped: {"error": {"message", "type", "param",
 "code"}}. Requests are open (localhost trust) until Stage 4 adds keys.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import GatewayConfigError, get_gateway_config
-from .models import EmbeddedEngine, EmbeddedLLMError, get_engine, installed_ggufs
+from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
+                     get_engine, installed_ggufs)
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="0.1.0-stage1")
+app = FastAPI(title="LLM Gateway", version="0.2.0-stage2")
 
 
 # ── OpenAI-shaped errors ───────────────────────────────────────────────────
@@ -104,7 +111,7 @@ async def list_models() -> dict[str, Any]:
 # ── POST /v1/chat/completions ──────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: ChatRequest) -> JSONResponse:
+async def chat_completions(body: ChatRequest) -> Response:
     cfg = get_gateway_config()
     cfg.maybe_reload()
 
@@ -128,8 +135,13 @@ async def chat_completions(body: ChatRequest) -> JSONResponse:
                       "available yet — cloud backends arrive in Stage 3",
                       param="model", code="backend_unavailable")
     if body.stream:
-        return _error(400, "streaming is not implemented yet (Stage 2) — "
-                      "send stream=false", code="stream_unsupported")
+        if body.tools:
+            # The engine's stream path yields content deltas only — a JSON
+            # tool call would arrive as plain text, not delta.tool_calls.
+            return _error(400, "streaming with tools is not supported yet — "
+                          "tool-call deltas arrive in a later stage",
+                          code="stream_tools_unsupported")
+        return _stream_chat(requested, backend_name, model_key, body)
 
     engine = get_engine()
     t0 = time.perf_counter()
@@ -181,3 +193,88 @@ async def chat_completions(body: ChatRequest) -> JSONResponse:
         # Gateway provenance (non-standard, harmless for OpenAI clients)
         "served_by": {"backend": backend_name, "model": model_key, "ms": ms},
     })
+
+
+# ── POST /v1/chat/completions (stream) ─────────────────────────────────────
+
+def _stream_chat(requested: str, backend_name: str, model_key: str,
+                 body: ChatRequest) -> StreamingResponse:
+    """SSE bridge over the engine's async `_stream` (think-hold-back).
+
+    OpenAI wire format: role chunk → content chunks → finish chunk →
+    `data: [DONE]`. Mid-flight engine errors become an OpenAI-shaped
+    error object followed by [DONE]."""
+    engine = get_engine()
+    chat_id = f"chatcmpl-gw-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    def _chunk(delta: dict[str, Any], finish: str | None = None) -> str:
+        event = {"id": chat_id, "object": "chat.completion.chunk",
+                 "created": created, "model": requested,
+                 "choices": [{"index": 0, "delta": delta,
+                              "finish_reason": finish}]}
+        return f"data: {json.dumps(event)}\n\n"
+
+    async def _gen() -> AsyncIterator[str]:
+        t0 = time.perf_counter()
+        try:
+            stream = await engine.chat.completions.create(
+                model=model_key,
+                messages=body.messages,
+                tools=None,
+                temperature=body.temperature,
+                max_tokens=body.max_tokens,
+                stream=True,
+            )
+            yield _chunk({"role": "assistant", "content": ""})
+            async for ch in stream:
+                for c in ch.choices:
+                    text = c.delta.get("content")
+                    if text:
+                        yield _chunk({"content": text})
+            yield _chunk({}, finish="stop")
+            yield "data: [DONE]\n\n"
+            logger.info("gateway stream ok (%s / %s) in %dms",
+                        backend_name, model_key, int((time.perf_counter() - t0) * 1000))
+        except EmbeddedLLMError as e:
+            logger.warning("gateway stream failed (%s / %s): %s",
+                           backend_name, model_key, e)
+            yield "data: " + json.dumps(
+                {"error": {"message": str(e), "type": "server_error",
+                           "code": "embedded_error"}}) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+# ── GET /healthz ───────────────────────────────────────────────────────────
+
+@app.get("/healthz")
+async def healthz() -> dict[str, Any]:
+    """Backend status, VRAM, loaded instances (design doc, Stage 2)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    engine = get_engine()
+
+    gpus = detect_gpus()
+    for g in gpus:
+        g["free_mb"] = max(g["total_mb"] - g["used_mb"], 0)
+
+    loaded = engine.loaded_models()
+    discovered = installed_ggufs(cfg.models_dir)
+    return {
+        "status": "ok",
+        "version": app.version,
+        "bind": cfg.bind,
+        "port": cfg.port,
+        "models_dir": cfg.models_dir,
+        "backends": {name: {"type": b.get("type"),
+                            "configured_models": len(b.get("models") or {})}
+                     for name, b in cfg.backends.items()},
+        "discovered_models": len(discovered),
+        "loaded_count": len(loaded),
+        "loaded": loaded,  # Ollama-ps shaped: alias/path/size_vram/n_ctx/load_s
+        "gpus": gpus,
+    }
