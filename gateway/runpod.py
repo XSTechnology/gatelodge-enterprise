@@ -115,7 +115,7 @@ async def _rest(method: str, path: str, api_key_env: str,
 
 async def deploy_pod(payload: dict[str, Any], api_key_env: str) -> dict[str, Any]:
     """POST /v2/pods → the created pod object (id expected)."""
-    out = await _rest("POST", "/v2/pods", api_key_env, payload)
+    out = await _rest("POST", "/pods", api_key_env, payload)
     pod = out if isinstance(out, dict) else {}
     if not (pod.get("id") or (isinstance(pod.get("pod"), dict) and pod["pod"].get("id"))):
         raise RunPodError(f"runpod deploy returned no pod id: {str(out)[:300]}")
@@ -124,7 +124,7 @@ async def deploy_pod(payload: dict[str, Any], api_key_env: str) -> dict[str, Any
 
 async def list_pods(api_key_env: str) -> list[dict[str, Any]]:
     """GET /v2/pods → pod list (handles paginated response: {"pods": [...], "pagination": {...}})."""
-    out = await _rest("GET", "/v2/pods", api_key_env)
+    out = await _rest("GET", "/pods", api_key_env)
     if isinstance(out, list):
         return [p for p in out if isinstance(p, dict)]
     if isinstance(out, dict):
@@ -136,7 +136,7 @@ async def list_pods(api_key_env: str) -> list[dict[str, Any]]:
 
 async def list_endpoints(api_key_env: str) -> list[dict[str, Any]]:
     """GET /v2/serverless → endpoint list (handles paginated response)."""
-    out = await _rest("GET", "/v2/serverless", api_key_env)
+    out = await _rest("GET", "/serverless", api_key_env)
     if isinstance(out, list):
         return [e for e in out if isinstance(e, dict)]
     if isinstance(out, dict):
@@ -147,15 +147,15 @@ async def list_endpoints(api_key_env: str) -> list[dict[str, Any]]:
 
 
 async def start_pod(pod_id: str, api_key_env: str) -> Any:
-    return await _rest("POST", f"/v2/pods/{pod_id}/action", api_key_env, {"action": "start"})
+    return await _rest("POST", f"/pods/{pod_id}/action", api_key_env, {"action": "start"})
 
 
 async def stop_pod(pod_id: str, api_key_env: str) -> Any:
-    return await _rest("POST", f"/v2/pods/{pod_id}/action", api_key_env, {"action": "stop"})
+    return await _rest("POST", f"/pods/{pod_id}/action", api_key_env, {"action": "stop"})
 
 
 async def terminate_pod(pod_id: str, api_key_env: str) -> Any:
-    return await _rest("POST", f"/v2/pods/{pod_id}/action", api_key_env, {"action": "terminate"})
+    return await _rest("POST", f"/pods/{pod_id}/action", api_key_env, {"action": "terminate"})
 
 
 def pod_state(pod: dict[str, Any]) -> str:

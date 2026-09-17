@@ -1928,6 +1928,171 @@ async def admin_runpod_stop(payload: StopPayload) -> Response:
             "terminated": payload.terminate}
 
 
+class RunPodActionPayload(BaseModel):
+    """Payload for runpod pod lifecycle actions."""
+    model_config = ConfigDict(extra="ignore")
+    pod_id: str = ""
+    action: str = ""  # start, stop, terminate
+
+
+@app.post("/admin/runpod/action")
+async def admin_runpod_action(payload: RunPodActionPayload) -> Response:
+    """Direct pod lifecycle action on any pod (managed or BYO).
+    Actions: start (resume stopped), stop (keep storage), terminate (delete)."""
+    if not payload.pod_id:
+        return _error(400, "pod_id required")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    rp_backends = {n: b for n, b in cfg.backends.items() if b.get("type") == "runpod"}
+    if not rp_backends:
+        return _error(400, "no runpod backends configured")
+    api_key_env = list(rp_backends.values())[0].get("api_key_env", "RUNPOD_API_KEY")
+    try:
+        if payload.action == "start":
+            await runpod.start_pod(payload.pod_id, api_key_env)
+        elif payload.action == "stop":
+            await runpod.stop_pod(payload.pod_id, api_key_env)
+        elif payload.action == "terminate":
+            await runpod.terminate_pod(payload.pod_id, api_key_env)
+        else:
+            return _error(400, f"unknown action: {payload.action!r}. Use start/stop/terminate")
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    return {"ok": True, "pod_id": payload.pod_id, "action": payload.action}
+
+
+class RunPodDeployPayload(BaseModel):
+    """Payload for deploying a new runpod pod."""
+    model_config = ConfigDict(extra="ignore")
+    backend: str = ""
+    model: str = ""
+    # Pod spec fields (snake_case, matches gateway config)
+    gpu_type_ids: list[str] | None = None
+    image: str = ""
+    docker_cmd: str = ""
+    docker_args: str = ""
+    docker_entrypoint: list[str] | None = None
+    ports: str = ""
+    port: int = 8080
+    container_disk_gb: int = 10
+    volume_gb: int = 0
+    volume_mount: str = "/workspace"
+    spot: bool = False
+    env: dict[str, str] | None = None
+    start_timeout_s: float = 600
+    idle_stop_s: float = 0
+    idle_terminate_s: float = 0
+    alias: str = ""
+
+
+@app.post("/admin/runpod/deploy")
+async def admin_runpod_deploy(payload: RunPodDeployPayload) -> Response:
+    """Deploy a new runpod pod and add it to config.
+    If model name already exists in the backend, it replaces the config entry."""
+    if not payload.backend or not payload.model:
+        return _error(400, "backend and model required")
+    if not payload.image:
+        return _error(400, "image required")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    rp_backends = {n: b for n, b in cfg.backends.items() if b.get("type") == "runpod"}
+    if payload.backend not in rp_backends:
+        return _error(400, f"backend {payload.backend!r} is not a runpod backend")
+    api_key_env = rp_backends[payload.backend].get("api_key_env", "RUNPOD_API_KEY")
+    # Build pod spec
+    spec: dict[str, Any] = {
+        "image": payload.image,
+        "ports": payload.ports or f"{payload.port}/http",
+        "port": payload.port,
+        "container_disk_gb": payload.container_disk_gb,
+        "start_timeout_s": payload.start_timeout_s,
+        "idle_stop_s": payload.idle_stop_s,
+        "idle_terminate_s": payload.idle_terminate_s,
+    }
+    if payload.gpu_type_ids:
+        spec["gpu_type_ids"] = payload.gpu_type_ids
+    if payload.docker_cmd:
+        spec["docker_cmd"] = payload.docker_cmd
+    elif payload.docker_args:
+        spec["docker_args"] = payload.docker_args
+    if payload.docker_entrypoint:
+        spec["docker_entrypoint"] = payload.docker_entrypoint
+    if payload.volume_gb:
+        spec["volume_gb"] = payload.volume_gb
+        spec["volume_mount"] = payload.volume_mount
+    if payload.spot:
+        spec["spot"] = True
+    if payload.env:
+        spec["env"] = payload.env
+    if payload.alias:
+        spec["alias"] = payload.alias
+    # Build deploy payload and send to RunPod
+    deploy_payload = runpod.deploy_payload(payload.backend, payload.model, spec)
+    try:
+        pod = await runpod.deploy_pod(deploy_payload, api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    pod_id = pod.get("id")
+    # Add pod_id to spec so the gateway manages it
+    spec["pod_id"] = pod_id
+    # Update config
+    def mutator(raw: dict):
+        models = raw.setdefault("backends", {}).setdefault(payload.backend, {}).setdefault("models", {})
+        models[payload.model] = spec
+    _mutate_config(mutator)
+    return {"ok": True, "pod_id": pod_id, "backend": payload.backend,
+            "model": payload.model, "name": pod.get("name")}
+
+
+class RunPodServerlessPayload(BaseModel):
+    """Payload for managing runpod serverless endpoints."""
+    model_config = ConfigDict(extra="ignore")
+    backend: str = ""
+    model: str = ""
+    endpoint_id: str = ""
+    remote_id: str = ""
+    transport: str = "openai"  # openai or runsync
+    timeout_s: float = 120.0
+    policy: dict[str, Any] | None = None
+    delete: bool = False
+
+
+@app.post("/admin/runpod/serverless")
+async def admin_runpod_serverless(payload: RunPodServerlessPayload) -> Response:
+    """Add or remove a serverless endpoint model from config.
+    Does NOT create the endpoint on RunPod — that must be done in the
+    RunPod console or via their API directly."""
+    if not payload.backend or not payload.model:
+        return _error(400, "backend and model required")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    rp_backends = {n: b for n, b in cfg.backends.items() if b.get("type") == "runpod"}
+    if payload.backend not in rp_backends:
+        return _error(400, f"backend {payload.backend!r} is not a runpod backend")
+    if payload.delete:
+        def mutator(raw: dict):
+            models = raw.get("backends", {}).get(payload.backend, {}).get("models", {})
+            models.pop(payload.model, None)
+        _mutate_config(mutator)
+        return {"ok": True, "deleted": f"{payload.backend}:{payload.model}"}
+    if not payload.endpoint_id:
+        return _error(400, "endpoint_id required for new serverless model")
+    spec: dict[str, Any] = {
+        "endpoint_id": payload.endpoint_id,
+        "remote_id": payload.remote_id,
+        "transport": payload.transport,
+        "timeout_s": payload.timeout_s,
+    }
+    if payload.policy:
+        spec["policy"] = payload.policy
+    def mutator(raw: dict):
+        models = raw.setdefault("backends", {}).setdefault(payload.backend, {}).setdefault("models", {})
+        models[payload.model] = spec
+    _mutate_config(mutator)
+    return {"ok": True, "backend": payload.backend, "model": payload.model,
+            "endpoint_id": payload.endpoint_id}
+
+
 class ParamsPayload(BaseModel):
     """Structured parameters for the console — avoids raw JSON editing."""
     model_config = ConfigDict(extra="ignore")

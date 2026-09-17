@@ -624,7 +624,9 @@ function buildBackendTable(defs) {
       var actions = '<button class="btn btn-sm" onclick="editBackend(\'' + esc(b.name) + '\')">edit</button> ' +
         '<button class="btn btn-sm btn-danger" onclick="deleteBackend(\'' + esc(b.name) + '\')">delete</button>';
       if (b.type === 'runpod') {
-        actions += ' <button class="btn btn-sm" onclick="checkRunpodInventory()">🔍 inventory</button>';
+        actions += ' <button class="btn btn-sm" onclick="checkRunpodInventory()">🔍 inventory</button> ' +
+          '<button class="btn btn-sm" onclick="showDeployPod()">+ deploy</button> ' +
+          '<button class="btn btn-sm" onclick="showAddServerless()">+ serverless</button>';
       }
       html += '<tr><td><b>' + esc(b.name) + '</b> <span class="muted">(' + modelCount + ' models)</span></td>' +
         '<td><span class="badge ' + esc(b.type) + '">' + esc(b.type) + '</span></td>' +
@@ -760,9 +762,14 @@ function checkRunpodInventory() {
     } else {
       html += '<h4>Live pods (' + d.pods.length + ')</h4>';
       if (d.pods.length) {
-        html += '<table><thead><tr><th>id</th><th>name</th><th>status</th></tr></thead><tbody>';
+        html += '<table><thead><tr><th>id</th><th>name</th><th>status</th><th></th></tr></thead><tbody>';
         d.pods.forEach(function (p) {
-          html += '<tr><td><code>' + esc(p.id) + '</code></td><td>' + esc(p.name) + '</td><td>' + esc(p.status) + '</td></tr>';
+          html += '<tr><td><code>' + esc(p.id) + '</code></td><td>' + esc(p.name) + '</td><td>' + esc(p.status) + '</td>' +
+            '<td>' +
+            '<button class="btn btn-sm" onclick="runpodAction(\'' + esc(p.id) + '\',\'start\')">start</button> ' +
+            '<button class="btn btn-sm" onclick="runpodAction(\'' + esc(p.id) + '\',\'stop\')">stop</button> ' +
+            '<button class="btn btn-sm btn-danger" onclick="runpodAction(\'' + esc(p.id) + '\',\'terminate\')">terminate</button>' +
+            '</td></tr>';
         });
         html += '</tbody></table>';
       } else {
@@ -801,6 +808,86 @@ function removeStaleModel(backend, model) {
   if (!confirm('Remove ' + backend + ':' + model + ' from config?')) return;
   api('/admin/models', {method: 'POST', body: {name: model, backend: backend, delete: true}})
     .then(function () { notify('✓ removed'); checkRunpodInventory(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function runpodAction(podId, action) {
+  var msg = action === 'terminate' ? 'Terminate pod ' + podId + '? This cannot be undone.' :
+    action + ' pod ' + podId + '?';
+  if (!confirm(msg)) return;
+  api('/admin/runpod/action', {method: 'POST', body: {pod_id: podId, action: action}})
+    .then(function () { notify('✓ pod ' + action + 'd'); checkRunpodInventory(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function showDeployPod() {
+  var html = '<div class="widget"><h3>Deploy RunPod Pod</h3>' +
+    '<form onsubmit="event.preventDefault(); deployPod();">' +
+    '<div class="form-row"><label>Backend</label><input id="dp-backend" value="rp"></div>' +
+    '<div class="form-row"><label>Model name</label><input id="dp-model" placeholder="my-model" required></div>' +
+    '<div class="form-row"><label>Image</label><input id="dp-image" placeholder="ghcr.io/ggml-org/llama.cpp:server-cuda" required></div>' +
+    '<div class="form-row"><label>GPU type</label><input id="dp-gpu" placeholder="NVIDIA GeForce RTX 3090"></div>' +
+    '<div class="form-row"><label>Docker args</label><input id="dp-docker_args" placeholder="-m /workspace/model.gguf --host 0.0.0.0 --port 8080 -ngl 99"></div>' +
+    '<div class="form-row"><label>Port</label><input id="dp-port" type="number" value="8080"></div>' +
+    '<div class="form-row"><label>Disk GB</label><input id="dp-disk" type="number" value="10"></div>' +
+    '<div class="form-row"><label>Volume GB (optional)</label><input id="dp-volume" type="number" value="0"></div>' +
+    '<div class="form-row"><label>Spot (cheaper)</label><input id="dp-spot" type="checkbox"></div>' +
+    '<div class="form-row"><label>Alias (optional)</label><input id="dp-alias" placeholder="display name"></div>' +
+    '<button type="submit" class="btn">Deploy</button> ' +
+    '<button type="button" class="btn" onclick="closeModal()">Cancel</button>' +
+    '</form></div>';
+  document.getElementById('modal-title').textContent = '🚀 Deploy Pod';
+  document.getElementById('modal-body').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+}
+function deployPod() {
+  var backend = document.getElementById('dp-backend').value.trim();
+  var model = document.getElementById('dp-model').value.trim();
+  var image = document.getElementById('dp-image').value.trim();
+  if (!model || !image) { notify('✗ Model name and image required', true); return; }
+  var body = {backend: backend, model: model, image: image,
+    port: parseInt(document.getElementById('dp-port').value) || 8080,
+    container_disk_gb: parseInt(document.getElementById('dp-disk').value) || 10,
+    spot: document.getElementById('dp-spot').checked};
+  var gpu = document.getElementById('dp-gpu').value.trim();
+  if (gpu) body.gpu_type_ids = [gpu];
+  var args = document.getElementById('dp-docker_args').value.trim();
+  if (args) body.docker_args = args;
+  var vol = parseInt(document.getElementById('dp-volume').value) || 0;
+  if (vol) body.volume_gb = vol;
+  var alias = document.getElementById('dp-alias').value.trim();
+  if (alias) body.alias = alias;
+  api('/admin/runpod/deploy', {method: 'POST', body: body})
+    .then(function (d) { notify('✓ Deployed ' + d.pod_id); closeModal(); showPanel('services'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function showAddServerless() {
+  var html = '<div class="widget"><h3>Add Serverless Endpoint</h3>' +
+    '<div class="muted">Create the endpoint in the RunPod console first, then add it here.</div>' +
+    '<form onsubmit="event.preventDefault(); addServerless();">' +
+    '<div class="form-row"><label>Backend</label><input id="sl-backend" value="rp"></div>' +
+    '<div class="form-row"><label>Model name</label><input id="sl-model" placeholder="my-endpoint" required></div>' +
+    '<div class="form-row"><label>Endpoint ID</label><input id="sl-endpoint_id" placeholder="xc0i5r8ejntk8p" required></div>' +
+    '<div class="form-row"><label>Remote model ID</label><input id="sl-remote_id" placeholder="smollm2:135m"></div>' +
+    '<div class="form-row"><label>Transport</label>' +
+    '<select id="sl-transport"><option value="openai">openai</option><option value="runsync">runsync</option></select></div>' +
+    '<div class="form-row"><label>Timeout (s)</label><input id="sl-timeout" type="number" value="120"></div>' +
+    '<button type="submit" class="btn">Add</button> ' +
+    '<button type="button" class="btn" onclick="closeModal()">Cancel</button>' +
+    '</form></div>';
+  document.getElementById('modal-title').textContent = '☁️ Add Serverless';
+  document.getElementById('modal-body').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+}
+function addServerless() {
+  var backend = document.getElementById('sl-backend').value.trim();
+  var model = document.getElementById('sl-model').value.trim();
+  var endpointId = document.getElementById('sl-endpoint_id').value.trim();
+  if (!model || !endpointId) { notify('✗ Model name and endpoint ID required', true); return; }
+  var body = {backend: backend, model: model, endpoint_id: endpointId,
+    remote_id: document.getElementById('sl-remote_id').value.trim(),
+    transport: document.getElementById('sl-transport').value,
+    timeout_s: parseFloat(document.getElementById('sl-timeout').value) || 120};
+  api('/admin/runpod/serverless', {method: 'POST', body: body})
+    .then(function () { notify('✓ Added ' + backend + ':' + model); closeModal(); showPanel('services'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
