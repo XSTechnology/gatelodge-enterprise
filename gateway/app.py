@@ -1676,6 +1676,110 @@ async def admin_models() -> Response:
             "loaded": engine.loaded_models()}
 
 
+class ModelConfigPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = ""
+    gguf: str = ""
+    ctx: int | None = None
+    placement: str = ""  # '' = default, 'N' = pin card, 'auto' = split
+    workers: int | None = None
+    parallel: int | None = None  # for llama-server subprocess
+    backend: str = "local"  # which backend to add to
+    role: str = "chat"  # 'chat' or 'embed'
+    delete: bool = False
+    # Remote / cloud specific
+    remote_id: str = ""  # model ID on remote server (llama-server-remote, openai)
+    endpoint_id: str = ""  # runpod serverless endpoint ID
+    transport: str = ""  # runpod: "openai" or "runsync"
+    timeout_s: int | None = None  # runpod serverless timeout
+    pod_id: str = ""  # runpod pod pin
+
+
+@app.post("/admin/models")
+async def admin_upsert_model(payload: ModelConfigPayload) -> Response:
+    """Create or update a model configuration entry.
+
+    For embedded backends: {gguf, ctx, placement, workers}
+    For llama-server subprocess: {gguf, ctx, placement, parallel}
+    Role 'embed' puts it in embedding_models, 'chat' in models.
+    """
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    name = payload.name.strip()
+    if not name:
+        return _error(400, "model name must not be empty", param="name")
+
+    if payload.delete:
+        _mutate_config(lambda raw: _remove_model_from_config(
+            raw, payload.backend, name, payload.role))
+        return {"deleted": name, "backend": payload.backend}
+
+    # Validate backend exists
+    backend = cfg.backends.get(payload.backend)
+    if not backend:
+        return _error(400, f"backend {payload.backend!r} not found",
+                      param="backend")
+
+    # Build model config based on backend type
+    model_cfg: dict[str, Any] = {}
+    btype = backend.get("type", "")
+    bmode = backend.get("mode", "")
+
+    if payload.gguf:
+        model_cfg["gguf"] = payload.gguf
+    if payload.ctx is not None:
+        model_cfg["ctx"] = payload.ctx
+    if payload.placement:
+        model_cfg["placement"] = payload.placement
+    if payload.workers is not None:
+        model_cfg["workers"] = payload.workers
+    if payload.parallel is not None:
+        model_cfg["parallel"] = payload.parallel
+
+    # Remote / cloud specific fields
+    if btype == "llama-server" and bmode == "remote":
+        if payload.remote_id:
+            model_cfg["name"] = payload.remote_id  # remote uses "name" key
+    elif btype == "openai":
+        if payload.remote_id:
+            model_cfg["name"] = payload.remote_id
+    elif btype == "runpod":
+        if payload.endpoint_id:
+            model_cfg["endpoint_id"] = payload.endpoint_id
+        if payload.transport and payload.transport != "openai":
+            model_cfg["transport"] = payload.transport
+        if payload.timeout_s is not None:
+            model_cfg["timeout_s"] = payload.timeout_s
+        if payload.pod_id:
+            model_cfg["pod_id"] = payload.pod_id
+
+    # Determine target dict (models vs embedding_models)
+    target_key = "embedding_models" if payload.role == "embed" else "models"
+
+    _mutate_config(lambda raw: _upsert_model_in_config(
+        raw, payload.backend, name, model_cfg, target_key))
+    return {"saved": name, "backend": payload.backend, "role": payload.role}
+
+
+def _upsert_model_in_config(raw: dict, backend: str, name: str,
+                            model_cfg: dict, target_key: str) -> None:
+    """Add or update a model in the config dict."""
+    backends = raw.setdefault("backends", {})
+    backend_cfg = backends.setdefault(backend, {})
+    models = backend_cfg.setdefault(target_key, {})
+    models[name] = model_cfg
+
+
+def _remove_model_from_config(raw: dict, backend: str, name: str,
+                              role: str) -> None:
+    """Remove a model from the config dict."""
+    target_key = "embedding_models" if role == "embed" else "models"
+    backends = raw.get("backends", {})
+    backend_cfg = backends.get(backend, {})
+    models = backend_cfg.get(target_key, {})
+    models.pop(name, None)
+
+
 @app.get("/admin/secrets")
 async def admin_secrets() -> Response:
     """API-key STATUS for the console — which env vars the configured

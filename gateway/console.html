@@ -235,38 +235,296 @@ function stopTimers() {
 }
 
 // ---------- Models ----------
+var _editModelName = null; // tracks which model we're editing
 function showModels(ui) {
   ui.title.textContent = '🧠 Models';
+  _editModelName = null;
   Promise.all([api('/admin/models'), api('/admin/backends')]).then(function (r) {
     var d = r[0], defs = r[1];
-    var configured = {};
+    // Store backend info for form rendering
+    _modelBackends = {};
+    (defs.backends || []).forEach(function (b) {
+      _modelBackends[b.name] = {type: b.type, mode: b.mode};
+    });
+    var configured = {}; // name -> {backend, role, cfg}
     (defs.backends || []).forEach(function (b) {
       var mm = Object.assign({}, b.models || {}, b.embedding_models || {});
-      Object.keys(mm).forEach(function (n) { configured[n] = b.name; }); });
-    var html = '<div class="widget"><h3>Loaded instances</h3>';
-    if (!(d.loaded || []).length) html += '<div class="muted">Nothing resident — models load lazily on first request.</div>';
-    else {
-      html += '<table><thead><tr><th>model</th><th>role</th><th>worker</th><th class="num">ctx</th><th class="num">VRAM</th><th class="num">load</th><th></th></tr></thead><tbody>';
-      d.loaded.forEach(function (m) {
-        html += '<tr><td><b>' + esc(m.alias) + '</b> <span class="muted">' + esc(m.name) + '</span></td>' +
-          '<td>' + esc(m.role) + '</td><td>' + (m.worker != null ? m.worker : '—') + '</td>' +
-          '<td class="num">' + m.n_ctx + '</td><td class="num">' + esc(m.size_vram_human) + '</td>' +
-          '<td class="num">' + m.load_s + 's</td>' +
-          '<td><button class="btn btn-sm btn-danger" onclick="unload(\'' + esc(m.alias) + '\')">unload</button></td></tr>';
+      Object.keys(mm).forEach(function (n) {
+        configured[n] = {backend: b.name, role: (b.embedding_models && b.embedding_models[n]) ? 'embed' : 'chat', cfg: mm[n], btype: b.type, bmode: b.mode};
       });
-      html += '</tbody></table>';
-    }
-    html += '</div><div class="widget"><h3>On-disk GGUFs (servable by stem)</h3><div class="chips">';
-    (d.discovered || []).forEach(function (g) {
-      html += '<span class="chip"><b>' + esc(g.name) + '</b>' +
-        '<span class="muted">' + esc(g.size_human) + ' · ' + esc(g.quantization) +
-        (configured[g.name] ? ' · ' + esc(configured[g.name]) : '') + '</span>' +
-        '<button onclick="loadModel(\'' + esc(g.name) + '\')">load</button></span>';
     });
-    if (!(d.discovered || []).length) html += '<span class="muted">models_dir is empty.</span>';
-    html += '</div><div class="muted">Config-defined models (custom ctx / workers / placement) shadow same-named stems. Worker pools grow lazily under concurrency.</div></div>';
+    _configuredModels = configured;
+    var html = buildModelForm(defs, d.discovered || []) +
+      buildConfiguredTable(configured, d) +
+      buildLoadedTable(d.loaded || []) +
+      buildDiscoveredChips(d.discovered || [], configured);
     ui.body.innerHTML = html;
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+
+function buildModelForm(defs, discovered) {
+  var backends = defs.backends || [];
+  var ggufNames = (discovered || []).map(function (g) { return g.name; });
+  var html = '<div class="widget"><h3>' + (_editModelName ? 'Edit model' : 'Add / Edit model') + '</h3>';
+  // Name
+  html += '<div class="srow"><label>Name</label><input id="m-name" placeholder="my-model"></div>';
+  // Backend selector
+  html += '<div class="srow"><label>Backend</label><select id="m-backend" onchange="onBackendChange()">';
+  backends.forEach(function (b) {
+    var label = b.name + ' (' + b.type;
+    if (b.mode) label += ' ' + b.mode;
+    label += ')';
+    html += '<option value="' + esc(b.name) + '">' + esc(label) + '</option>';
+  });
+  html += '</select></div>';
+  // Role
+  html += '<div class="srow"><label>Role</label><select id="m-role" onchange="onBackendChange()">' +
+    '<option value="chat">Chat</option><option value="embed">Embeddings</option></select></div>';
+  // Dynamic fields container
+  html += '<div id="m-fields"></div>';
+  // Buttons
+  html += '<div style="margin-top:10px;display:flex;gap:8px;">' +
+    '<button class="btn btn-primary" onclick="saveModel()">Save</button>' +
+    '<button class="btn" onclick="cancelModelEdit()">Cancel</button></div>';
+  html += '<div class="muted" style="margin-top:6px">Fields change based on backend type. GGUF path can be a filename or full path inside models_dir.</div>';
+  html += '</div>';
+  // Trigger field render
+  setTimeout(function () { onBackendChange(); }, 50);
+  return html;
+}
+
+function onBackendChange() {
+  var backendName = document.getElementById('m-backend').value;
+  var role = document.getElementById('m-role').value;
+  // Find backend type
+  var btype = '', bmode = '';
+  // We need to look up the backend type from the stored backends data
+  // Store it in the option's data attribute — but we already rendered.
+  // Instead, parse from the option text or store a map.
+  // Simpler: store type in a global when showModels runs.
+  var container = document.getElementById('m-fields');
+  if (!container) return;
+  // Get backend info from _modelBackends map populated by showModels
+  var binfo = (_modelBackends || {})[backendName] || {};
+  btype = binfo.type || '';
+  bmode = binfo.mode || '';
+
+  var html = '';
+  if (role === 'embed') {
+    // Embedding models: just gguf + ctx
+    html += buildGgufRow(binfo);
+    html += '<div class="srow"><label>Context size</label><input id="m-ctx" type="number" min="256" step="1" placeholder="4096"></div>';
+  } else if (btype === 'embedded') {
+    html += buildGgufRow(binfo);
+    html += '<div class="srow"><label>Context size</label><input id="m-ctx" type="number" min="256" step="1" placeholder="4096"></div>';
+    html += '<div class="srow"><label>GPU placement</label><select id="m-placement">' +
+      '<option value="">Default (auto-detect)</option>' +
+      '<option value="auto">Auto split (multi-GPU)</option>' +
+      '<option value="0">Pin GPU 0</option><option value="1">Pin GPU 1</option></select></div>';
+    html += '<div class="srow"><label>Workers (pool size)</label><input id="m-workers" type="number" min="1" step="1" value="1" placeholder="1"></div>';
+  } else if (btype === 'llama-server' && bmode === 'remote') {
+    html += '<div class="srow"><label>Remote model ID</label><input id="m-remote_id" placeholder="qwen2.5-7b-instruct" style="flex:1;min-width:260px"></div>' +
+      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Model name as known by the remote server.</div>';
+  } else if (btype === 'llama-server') {
+    // Subprocess mode
+    html += buildGgufRow(binfo);
+    html += '<div class="srow"><label>Context size (total)</label><input id="m-ctx" type="number" min="256" step="1" placeholder="16384"></div>';
+    html += '<div class="srow"><label>GPU placement</label><select id="m-placement">' +
+      '<option value="">Default (auto-detect)</option>' +
+      '<option value="auto">Auto split (multi-GPU)</option>' +
+      '<option value="0">Pin GPU 0</option><option value="1">Pin GPU 1</option></select></div>';
+    html += '<div class="srow"><label>Parallel slots</label><input id="m-parallel" type="number" min="1" step="1" value="1" placeholder="1"></div>';
+  } else if (btype === 'runpod') {
+    html += '<div class="srow"><label>Endpoint ID (serverless)</label><input id="m-endpoint_id" placeholder="xc0i5r8ejntk8p" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>Pod ID (BYO pod)</label><input id="m-pod_id" placeholder="h8jrfftx3cq7s9" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>Transport</label><select id="m-transport">' +
+      '<option value="openai">OpenAI shim</option><option value="runsync">RunSync (raw job)</option></select></div>' +
+      '<div class="srow"><label>Timeout (s, 0 = default)</label><input id="m-timeout_s" type="number" min="0" step="1" placeholder="120"></div>' +
+      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Use endpoint_id for serverless, pod_id for BYO pods. Not both.</div>';
+  } else if (btype === 'openai') {
+    html += '<div class="srow"><label>Remote model ID</label><input id="m-remote_id" placeholder="gpt-4o-mini" style="flex:1;min-width:260px"></div>';
+  }
+  container.innerHTML = html;
+}
+
+function buildGgufRow(binfo) {
+  // We don't have discovered list here — use a text input with placeholder
+  return '<div class="srow"><label>GGUF file</label><input id="m-gguf" placeholder="model-name.gguf or path/to/file" style="flex:1;min-width:260px"></div>';
+}
+
+function buildConfiguredTable(configured, data) {
+  var names = Object.keys(configured);
+  var html = '<div class="widget"><h3>Configured models (' + names.length + ')</h3>';
+  if (!names.length) {
+    html += '<div class="muted">No models configured — add one above or use auto-discovery.</div>';
+  } else {
+    html += '<table><thead><tr><th>name</th><th>backend</th><th>role</th><th>details</th><th></th></tr></thead><tbody>';
+    names.forEach(function (n) {
+      var info = configured[n];
+      var cfg = info.cfg || {};
+      var details = [];
+      if (cfg.gguf) details.push('file: ' + esc(cfg.gguf));
+      if (cfg.remote_id) details.push('remote: ' + esc(cfg.remote_id));
+      if (cfg.endpoint_id) details.push('ep: ' + esc(cfg.endpoint_id));
+      if (cfg.pod_id) details.push('pod: ' + esc(cfg.pod_id));
+      if (cfg.ctx) details.push('ctx: ' + cfg.ctx);
+      if (cfg.workers && cfg.workers > 1) details.push('×' + cfg.workers + ' workers');
+      if (cfg.parallel && cfg.parallel > 1) details.push('×' + cfg.parallel + ' slots');
+      if (cfg.placement) details.push('GPU: ' + esc(cfg.placement));
+      if (cfg.transport) details.push(cfg.transport);
+      if (cfg.timeout_s) details.push('timeout: ' + cfg.timeout_s + 's');
+      // Check if loaded
+      var loaded = (data.loaded || []).find(function (m) { return m.alias === n; });
+      var statusBadge = loaded ? '<span class="badge ok">loaded</span>' : '<span class="badge dim">not loaded</span>';
+      html += '<tr><td><b>' + esc(n) + '</b> ' + statusBadge + '</td>' +
+        '<td><span class="badge ' + esc(info.btype) + '">' + esc(info.backend) + '</span></td>' +
+        '<td>' + esc(info.role) + '</td>' +
+        '<td class="muted">' + (details.length ? details.join(' · ') : '—') + '</td>' +
+        '<td><button class="btn btn-sm" onclick="editModel(\'' + esc(n) + '\',\'' + esc(info.backend) + '\',\'' + esc(info.role) + '\')">edit</button> ' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteModel(\'' + esc(n) + '\',\'' + esc(info.backend) + '\',\'' + esc(info.role) + '\')">delete</button></td></tr>';
+    });
+    html += '</tbody></table>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function buildLoadedTable(loaded) {
+  var html = '<div class="widget"><h3>Loaded instances</h3>';
+  if (!loaded.length) html += '<div class="muted">Nothing resident — models load lazily on first request.</div>';
+  else {
+    html += '<table><thead><tr><th>model</th><th>role</th><th>worker</th><th class="num">ctx</th><th class="num">VRAM</th><th class="num">load</th><th></th></tr></thead><tbody>';
+    loaded.forEach(function (m) {
+      html += '<tr><td><b>' + esc(m.alias) + '</b> <span class="muted">' + esc(m.name) + '</span></td>' +
+        '<td>' + esc(m.role) + '</td><td>' + (m.worker != null ? m.worker : '—') + '</td>' +
+        '<td class="num">' + m.n_ctx + '</td><td class="num">' + esc(m.size_vram_human) + '</td>' +
+        '<td class="num">' + m.load_s + 's</td>' +
+        '<td><button class="btn btn-sm btn-danger" onclick="unload(\'' + esc(m.alias) + '\')">unload</button></td></tr>';
+    });
+    html += '</tbody></table>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function buildDiscoveredChips(discovered, configured) {
+  var html = '<div class="widget"><h3>On-disk GGUFs</h3><div class="chips">';
+  discovered.forEach(function (g) {
+    var cfg = configured[g.name];
+    html += '<span class="chip"><b>' + esc(g.name) + '</b>' +
+      '<span class="muted">' + esc(g.size_human) + ' · ' + esc(g.quantization) +
+      (cfg ? ' · ' + esc(cfg.backend) : '') + '</span>' +
+      '<button onclick="loadModel(\'' + esc(g.name) + '\')">load</button></span>';
+  });
+  if (!discovered.length) html += '<span class="muted">models_dir is empty.</span>';
+  html += '</div><div class="muted">Config-defined models (custom ctx / workers / placement) shadow same-named stems. Worker pools grow lazily under concurrency.</div></div>';
+  return html;
+}
+
+// Store backend info for form rendering
+var _modelBackends = {};
+var _configuredModels = {}; // name -> {backend, role, cfg, btype, bmode}
+
+// ---------- Model CRUD actions ----------
+function saveModel() {
+  var name = document.getElementById('m-name').value.trim();
+  var backend = document.getElementById('m-backend').value;
+  var role = document.getElementById('m-role').value;
+  if (!name) { notify('✗ Name is required', true); return; }
+  var payload = {name: name, backend: backend, role: role};
+  // Get backend info
+  var binfo = (_modelBackends || {})[backend] || {};
+  var btype = binfo.type || '';
+  var bmode = binfo.mode || '';
+  if (role === 'embed') {
+    var gguf = document.getElementById('m-gguf');
+    if (gguf) payload.gguf = gguf.value.trim();
+    var ctx = document.getElementById('m-ctx');
+    if (ctx && ctx.value) payload.ctx = parseInt(ctx.value);
+  } else if (btype === 'embedded') {
+    var gguf = document.getElementById('m-gguf');
+    if (gguf) payload.gguf = gguf.value.trim();
+    var ctx = document.getElementById('m-ctx');
+    if (ctx && ctx.value) payload.ctx = parseInt(ctx.value);
+    var placement = document.getElementById('m-placement');
+    if (placement && placement.value) payload.placement = placement.value;
+    var workers = document.getElementById('m-workers');
+    if (workers && workers.value) payload.workers = parseInt(workers.value);
+  } else if (btype === 'llama-server' && bmode === 'remote') {
+    var remote_id = document.getElementById('m-remote_id');
+    if (remote_id) payload.remote_id = remote_id.value.trim();
+  } else if (btype === 'llama-server') {
+    var gguf = document.getElementById('m-gguf');
+    if (gguf) payload.gguf = gguf.value.trim();
+    var ctx = document.getElementById('m-ctx');
+    if (ctx && ctx.value) payload.ctx = parseInt(ctx.value);
+    var placement = document.getElementById('m-placement');
+    if (placement && placement.value) payload.placement = placement.value;
+    var parallel = document.getElementById('m-parallel');
+    if (parallel && parallel.value) payload.parallel = parseInt(parallel.value);
+  } else if (btype === 'runpod') {
+    var endpoint_id = document.getElementById('m-endpoint_id');
+    if (endpoint_id) payload.endpoint_id = endpoint_id.value.trim();
+    var transport = document.getElementById('m-transport');
+    if (transport) payload.transport = transport.value;
+    var timeout_s = document.getElementById('m-timeout_s');
+    if (timeout_s && timeout_s.value) payload.timeout_s = parseInt(timeout_s.value);
+    var pod_id = document.getElementById('m-pod_id');
+    if (pod_id) payload.pod_id = pod_id.value.trim();
+  } else if (btype === 'openai') {
+    var remote_id = document.getElementById('m-remote_id');
+    if (remote_id) payload.remote_id = remote_id.value.trim();
+  }
+  api('/admin/models', {method: 'POST', body: payload})
+    .then(function () { notify('✓ ' + name + ' saved'); _editModelName = null; showPanel('models'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function editModel(name, backend, role) {
+  _editModelName = name;
+  // Set form values
+  document.getElementById('m-name').value = name;
+  document.getElementById('m-backend').value = backend;
+  document.getElementById('m-role').value = role;
+  onBackendChange();
+  // Populate fields from stored config
+  var info = (_configuredModels || {})[name];
+  if (info) {
+    var cfg = info.cfg || {};
+    var btype = info.btype || '';
+    var bmode = info.bmode || '';
+    var ggufEl = document.getElementById('m-gguf');
+    var remoteIdEl = document.getElementById('m-remote_id');
+    var endpointIdEl = document.getElementById('m-endpoint_id');
+    if (ggufEl && cfg.gguf) ggufEl.value = cfg.gguf;
+    if (remoteIdEl && cfg.remote_id) remoteIdEl.value = cfg.remote_id;
+    if (endpointIdEl && cfg.endpoint_id) endpointIdEl.value = cfg.endpoint_id;
+    var ctxEl = document.getElementById('m-ctx');
+    if (ctxEl && cfg.ctx) ctxEl.value = cfg.ctx;
+    var placementEl = document.getElementById('m-placement');
+    if (placementEl && cfg.placement) placementEl.value = cfg.placement;
+    var workersEl = document.getElementById('m-workers');
+    if (workersEl && cfg.workers) workersEl.value = cfg.workers;
+    var parallelEl = document.getElementById('m-parallel');
+    if (parallelEl && cfg.parallel) parallelEl.value = cfg.parallel;
+    var transportEl = document.getElementById('m-transport');
+    if (transportEl && cfg.transport) transportEl.value = cfg.transport;
+    var timeoutEl = document.getElementById('m-timeout_s');
+    if (timeoutEl && cfg.timeout_s) timeoutEl.value = cfg.timeout_s;
+  }
+  // Update title
+  document.querySelector('#modal .modal-title').textContent = '🧠 Models — editing ' + name;
+  // Scroll to form
+  document.getElementById('m-name').scrollIntoView({behavior: 'smooth'});
+}
+function deleteModel(name, backend, role) {
+  if (!confirm('Delete model ' + name + ' from ' + backend + '?')) return;
+  api('/admin/models', {method: 'POST', body: {name: name, backend: backend, role: role, delete: true}})
+    .then(function () { notify('✓ ' + name + ' deleted'); _editModelName = null; showPanel('models'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function cancelModelEdit() {
+  _editModelName = null;
+  showPanel('models');
 }
 function loadModel(name) {
   api('/admin/load', {method: 'POST', body: {model: name}})
