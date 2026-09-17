@@ -90,8 +90,11 @@ def test_console_served(wired, gguf):
         r = client.get("/")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
-    for pane in ("pane-config", "pane-models", "pane-perf", "pane-logs"):
-        assert pane in r.text
+    # the v2 admin console: 8 panels behind the category grid
+    for panel in ("models", "services", "perf", "syslog",
+                  "params", "keys", "health", "aliases"):
+        assert f"showPanel('{panel}')" in r.text
+    assert "admin/backends" in r.text and "admin/secrets" in r.text
 
 
 def test_console_shell_loads_without_key(wired, gguf):

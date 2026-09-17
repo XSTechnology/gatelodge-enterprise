@@ -378,7 +378,8 @@ def test_completions_runsync_generate(wired, gguf, monkeypatch):
     monkeypatch.setattr(rp, "runsync_chat", fake_runsync)
     with TestClient(gw_app.app) as client:
         r = client.post("/v1/completions", json={
-            "model": "rp:raw", "prompt": "hi", "temperature": 0.7})
+            "model": "rp:raw", "prompt": "hi", "temperature": 0.7,
+            "max_tokens": 5})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["object"] == "text.completion"
@@ -386,10 +387,11 @@ def test_completions_runsync_generate(wired, gguf, monkeypatch):
     assert body["choices"][0]["text"] == "generated text"
     assert body["usage"] == {"prompt_tokens": 4, "completion_tokens": 6,
                              "total_tokens": 10}
-    # worker generate mode: prompt, not messages
+    # worker generate mode: prompt, not messages; max_tokens → num_predict
     assert calls[0]["input"]["prompt"] == "hi"
     assert calls[0]["input"]["model"] == "smollm2:135m"
     assert calls[0]["input"]["temperature"] == 0.7
+    assert calls[0]["input"].get("options") == {"num_predict": 5}
     assert "messages" not in calls[0]["input"]
 
 

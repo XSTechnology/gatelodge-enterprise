@@ -1076,7 +1076,9 @@ async def legacy_completions(body: CompletionRequest) -> Response:
             if body.temperature is not None:
                 body_input["temperature"] = body.temperature
             if body.max_tokens:
-                body_input["max_tokens"] = body.max_tokens
+                # Ollama generate caps via options.num_predict (the worker
+                # ignores bare max_tokens — live-verified)
+                body_input["options"] = {"num_predict": body.max_tokens}
             out = await runpod.runsync_chat(
                 m["endpoint_id"], body_input,
                 backend.get("api_key_env") or "RUNPOD_API_KEY",
@@ -1377,4 +1379,146 @@ async def admin_stats() -> Response:
 async def admin_events() -> Response:
     """Recent gateway log events (in-memory ring, newest last)."""
     return {"events": list(_event_ring().events)}
+
+
+# ── Admin: service definitions, models, secrets (console v2) ───────────────
+
+@app.get("/admin/backends")
+async def admin_backends() -> Response:
+    """Structured SERVICE DEFINITIONS for the console — every backend with
+    its type, connection parameters, and models. Secrets never appear:
+    cloud/runpod backends carry only the env-var NAME (api_key_env)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    out = []
+    for name, b in cfg.backends.items():
+        entry: dict[str, Any] = {"name": name, "type": b.get("type")}
+        if b.get("type") == "embedded":
+            entry["models"] = b.get("models") or {}
+            entry["embedding_models"] = b.get("embedding_models") or {}
+        elif b.get("type") == "llama-server":
+            if b.get("base_url"):
+                entry["mode"] = "remote"
+                entry["base_url"] = b["base_url"]
+                entry["api_key_env"] = b.get("api_key_env") or ""
+                entry["models"] = b.get("models") or {}
+            else:
+                entry["mode"] = "subprocess"
+                for k in ("server_exe", "host", "port_base", "start_timeout_s",
+                          "idle_timeout_s", "extra_args"):
+                    entry[k] = b.get(k)
+                entry["models"] = b.get("models") or {}
+        elif b.get("type") == "runpod":
+            entry["api_key_env"] = b.get("api_key_env") or "RUNPOD_API_KEY"
+            entry["models"] = b.get("models") or {}
+        else:  # openai cloud
+            entry["base_url"] = b.get("base_url") or "(OpenAI default)"
+            entry["api_key_env"] = b.get("api_key_env") or ""
+            entry["models"] = b.get("models") or {}
+        out.append(entry)
+    return {"backends": out, "queue": cfg.queue, "default_alias": cfg.default_alias,
+            "bind": cfg.bind, "port": cfg.port, "models_dir": cfg.models_dir,
+            "gateway_keys_configured": bool(cfg.gateway_keys)}
+
+
+@app.get("/admin/models")
+async def admin_models() -> Response:
+    """Model inventory for the console: every GGUF on disk (auto-
+    discovered, servable by stem) + currently loaded instances."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    engine = get_engine()
+    return {"discovered": installed_ggufs(cfg.models_dir),
+            "loaded": engine.loaded_models()}
+
+
+@app.get("/admin/secrets")
+async def admin_secrets() -> Response:
+    """API-key STATUS for the console — which env vars the configured
+    backends need, and whether each is available (env, OS keyring via the
+    boot bridge, or missing). NEVER returns key values."""
+    import os
+
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    needed: dict[str, list[str]] = {}
+    for bname, b in cfg.backends.items():
+        env = b.get("api_key_env")
+        if env:
+            needed.setdefault(env, []).append(bname)
+    rows = []
+    for env_name, backends in sorted(needed.items()):
+        in_env = bool(os.environ.get(env_name))
+        in_keyring = False
+        if not in_env:
+            try:
+                import keyring
+                in_keyring = bool(keyring.get_password("Workshop", env_name))
+            except Exception:
+                in_keyring = False
+        rows.append({
+            "name": env_name,
+            "backends": backends,
+            "source": ("env" if in_env else
+                       "keyring" if in_keyring else "missing"),
+        })
+    return {"api_keys": rows,
+            "gateway_keys_configured": bool(cfg.gateway_keys),
+            "hint": ("missing keys 502 on first use — set the env var or "
+                      "store it in the OS keyring (service 'Workshop', "
+                      "username = env var name) and restart the gateway")}
+
+
+# ── Admin: recovery actions ────────────────────────────────────────────────
+
+class StopPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    backend: str = ""
+    model: str = ""
+    all: bool = False  # noqa: A003
+    terminate: bool = False
+
+
+@app.post("/admin/llama-server/stop")
+async def admin_llama_server_stop(payload: StopPayload) -> Response:
+    """Recovery: stop managed llama-server children ({backend, model} or
+    {all: true}). The next request respawns lazily."""
+    if payload.all:
+        llamaserver.kill_all()
+        return {"stopped": "all"}
+    if not payload.backend or not payload.model:
+        return _error(400, "backend and model required (or {\"all\": true})")
+    mgr = llamaserver._MANAGERS.get((payload.backend, payload.model))
+    if mgr is None:
+        return _error(404, f"no managed llama-server child for "
+                      f"{payload.backend}:{payload.model}", code="not_found")
+    mgr.stop()
+    return {"stopped": f"{payload.backend}:{payload.model}"}
+
+
+@app.post("/admin/runpod/stop")
+async def admin_runpod_stop(payload: StopPayload) -> Response:
+    """Recovery: stop (or terminate) a managed runpod pod. terminate=true
+    frees all storage — the next request redeploys from scratch."""
+    if not payload.backend or not payload.model:
+        return _error(400, "backend and model required")
+    mgr = runpod._MANAGERS.get((payload.backend, payload.model))
+    if mgr is None:
+        return _error(404, f"no managed pod for "
+                      f"{payload.backend}:{payload.model}", code="not_found")
+    await mgr.stop(terminate=payload.terminate)
+    return {"stopped": f"{payload.backend}:{payload.model}",
+            "terminated": payload.terminate}
+
+
+@app.post("/admin/reload")
+async def admin_reload() -> Response:
+    """Force a config reload now (same as the console's reload button)."""
+    cfg = get_gateway_config()
+    cfg.reload_now()
+    return {"ok": True,
+            "backends": {n: len(b.get("models") or {})
+                         for n, b in cfg.backends.items()},
+            "aliases": sorted(cfg.aliases)}
 

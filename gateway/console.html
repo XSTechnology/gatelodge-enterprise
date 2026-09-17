@@ -3,252 +3,595 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LLM Gateway</title>
+<meta name="theme-color" content="#0f0f12">
+<title>LLM Gateway Admin</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: #101114; color: #d7d7db;
-         font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
-  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-           padding: 10px 16px; background: #17181c; border-bottom: 1px solid #2a2b31; }
-  header h1 { font-size: 16px; margin: 0; color: #4ec9b0; }
-  #status { color: #9a9aa2; font-size: 12px; }
-  #keybar { margin-left: auto; display: none; gap: 6px; }
-  #keybar.show { display: flex; }
-  input, button, textarea { font: inherit; border-radius: 6px; border: 1px solid #33343b;
-    background: #1d1e23; color: #d7d7db; padding: 4px 8px; }
-  button { cursor: pointer; }
-  button:hover { border-color: #4ec9b0; }
-  button.danger:hover { border-color: #e05555; color: #e05555; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px 16px; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-  section { background: #17181c; border: 1px solid #2a2b31; border-radius: 10px;
-            padding: 12px; min-width: 0; }
-  section h2 { font-size: 13px; margin: 0 0 10px; color: #4ec9b0;
-               text-transform: uppercase; letter-spacing: .08em; }
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #232429;
-           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
-  th { color: #8a8a92; font-weight: 500; }
-  td.num, th.num { text-align: right; }
-  .muted { color: #8a8a92; }
-  .err { color: #e05555; }
-  .ok { color: #6fbf73; }
-  #cfg-raw { width: 100%; height: 220px; font: 12px/1.4 Consolas, monospace;
-             white-space: pre; resize: vertical; }
-  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
-  #logs { font: 11.5px/1.5 Consolas, monospace; max-height: 340px; overflow-y: auto;
-          background: #101114; border: 1px solid #232429; border-radius: 6px; padding: 6px; }
-  #logs .INFO { color: #9a9aa2; } #logs .WARNING { color: #d9a659; }
-  #logs .ERROR { color: #e05555; } #logs .ts { color: #5c5c64; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
-  .chip { border: 1px solid #33343b; border-radius: 999px; padding: 2px 10px;
-          font-size: 12px; display: inline-flex; gap: 8px; align-items: center; }
-  .chip .own { color: #5c5c64; font-size: 10.5px; }
-  .toast { position: fixed; bottom: 14px; right: 14px; background: #1d1e23;
-           border: 1px solid #4ec9b0; border-radius: 8px; padding: 8px 14px;
-           display: none; }
+:root {
+  --bg: #f0f2f5; --bg-deep: #e8ebf0; --card: #ffffff; --card-hover: #f5f7fa;
+  --border: #d0d5dd; --text: #1a1a2e; --text-dim: #555; --text-faint: #888;
+  --primary: #2563eb; --primary-soft: rgba(37,99,235,.1);
+  --warning: #d97706; --danger: #dc2626; --success: #16a34a;
+  --radius: 14px; --radius-sm: 8px;
+  --shadow: 0 2px 12px rgba(0,0,0,.08);
+  --transition: .2s cubic-bezier(.4,0,.2,1);
+}
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+body { background:var(--bg); color:var(--text);
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif; min-height:100vh; padding:20px;
+  background-image:radial-gradient(ellipse 80% 50% at 20% 0%,rgba(37,99,235,.05),transparent),
+    radial-gradient(ellipse 60% 40% at 80% 100%,rgba(37,99,235,.03),transparent);
+  background-attachment:fixed; -webkit-font-smoothing:antialiased; }
+.header { display:flex; align-items:center; gap:10px; margin-bottom:8px; max-width:860px; margin-left:auto; margin-right:auto; }
+.header h1 { font-size:1.3rem; font-weight:600; color:var(--primary); }
+.header .spacer { flex:1; }
+#conn { font-size:.78rem; color:var(--text-faint); }
+#conn.ok { color:var(--success); } #conn.bad { color:var(--danger); }
+#key { padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  background:var(--card); color:var(--text); font-size:.82rem; width:180px; font-family:inherit; }
+#key:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-soft); }
+.subheader { max-width:860px; margin:0 auto 16px; font-size:.8rem; color:var(--text-dim);
+  display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.subheader b { color:var(--text); }
+.settings-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; max-width:860px; margin:0 auto; }
+.cat-btn { display:flex; flex-direction:column; align-items:center; gap:6px; padding:14px 8px;
+  border:1px solid var(--border); background:var(--card); color:var(--text-dim); font-size:.8rem;
+  font-weight:500; cursor:pointer; border-radius:var(--radius); transition:var(--transition);
+  font-family:inherit; text-align:center; }
+.cat-btn:hover { color:var(--text); background:var(--primary-soft); border-color:var(--primary); transform:translateY(-1px); }
+.cat-btn:active { transform:scale(.97); }
+.cat-btn .cat-icon { font-size:1.6rem; line-height:1; }
+.cat-btn.dashed { border-style:dashed; }
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.4); backdrop-filter:blur(3px);
+  display:none; align-items:center; justify-content:center; z-index:2000; padding:20px; }
+.modal-overlay.show { display:flex; animation:fadeIn .2s ease; }
+@keyframes fadeIn { from{opacity:0} to{opacity:1} }
+.modal { background:var(--card); border-radius:var(--radius); padding:24px; width:100%; max-width:860px;
+  box-shadow:var(--shadow); border:1px solid var(--border); max-height:90vh; overflow-y:auto;
+  scrollbar-width:thin; }
+.modal::-webkit-scrollbar { width:6px; } .modal::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+.modal-title { font-size:1.2rem; font-weight:600; margin-bottom:14px; color:var(--primary); }
+.modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
+.btn { padding:8px 20px; border:1px solid var(--border); border-radius:var(--radius-sm); font-size:.9rem;
+  cursor:pointer; font-family:inherit; background:var(--card); color:var(--text); transition:var(--transition); }
+.btn:hover { border-color:var(--primary); color:var(--primary); }
+.btn:active { transform:scale(.97); }
+.btn-sm { padding:4px 12px; font-size:.78rem; }
+.btn-primary { background:var(--primary); color:#fff; border-color:var(--primary); }
+.btn-primary:hover { filter:brightness(1.1); color:#fff; }
+.btn-danger:hover { border-color:var(--danger); color:var(--danger); }
+table { width:100%; border-collapse:collapse; font-size:.82rem; }
+th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--bg-deep); white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis; max-width:260px; }
+th { color:var(--text-faint); font-weight:600; font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; }
+td.num, th.num { text-align:right; }
+.badge { display:inline-block; font-size:.68rem; font-weight:600; padding:2px 8px; border-radius:6px;
+  color:#fff; vertical-align:middle; }
+.badge.embedded { background:#2e7d32; } .badge.llama-server { background:#1565c0; }
+.badge.runpod { background:#7b1fa2; } .badge.openai { background:#e65100; }
+.badge.ok { background:var(--success); } .badge.warn { background:var(--warning); }
+.badge.err { background:var(--danger); } .badge.dim { background:#9e9e9e; }
+.widget { padding:12px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); margin-bottom:12px; }
+.widget h3 { font-size:.85rem; margin-bottom:8px; color:var(--text); }
+.bar { height:18px; background:var(--border); border-radius:9px; overflow:hidden; }
+.bar-fill { height:100%; width:0%; border-radius:9px; background:linear-gradient(90deg,#4CAF50,#66BB6A); transition:width .5s; }
+.bar-fill.warn { background:linear-gradient(90deg,#FFA726,#FB8C00); }
+.bar-fill.err { background:linear-gradient(90deg,#EF5350,#E53935); }
+.logs { max-height:56vh; overflow-y:auto; font-family:'Cascadia Code',Consolas,monospace; font-size:.78rem;
+  line-height:1.5; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px; }
+.log-entry { padding:1px 0; } .log-time { color:var(--text-faint); }
+.log-level { font-weight:600; }
+.log-level.INFO { color:var(--text-dim); } .log-level.WARNING { color:var(--warning); }
+.log-level.ERROR { color:var(--danger); } .log-msg { color:var(--text); }
+.chips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+.chip { border:1px solid var(--border); border-radius:999px; padding:3px 12px; font-size:.75rem;
+  display:inline-flex; gap:8px; align-items:center; background:var(--card); }
+.chip .muted { color:var(--text-faint); font-size:.68rem; }
+.chip button { border:none; background:none; cursor:pointer; color:var(--primary); font-size:.72rem; padding:0; font-family:inherit; }
+.chip button:hover { text-decoration:underline; }
+.srow { display:flex; align-items:center; gap:8px; margin-bottom:6px; padding:4px 0; flex-wrap:wrap; }
+.srow label { flex:1; font-size:.85rem; color:var(--text-dim); min-width:140px; }
+.srow input, .srow select { width:220px; padding:6px 10px; border:1px solid var(--border);
+  border-radius:var(--radius-sm); background:var(--bg); color:var(--text); font-size:.85rem; font-family:inherit; }
+.srow input:focus, .srow select:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-soft); }
+.srow .info-value { font-size:.82rem; color:var(--text-faint); font-style:italic; }
+#cfg-raw { width:100%; height:260px; font:12px/1.4 Consolas,monospace; white-space:pre; resize:vertical;
+  border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--bg); color:var(--text); padding:10px; }
+.notif { position:fixed; top:20px; right:20px; z-index:3000; background:var(--success); color:#000;
+  padding:10px 16px; border-radius:var(--radius-sm); font-size:.85rem; font-weight:600;
+  box-shadow:var(--shadow); animation:slideIn .3s ease; max-width:350px; }
+.notif.error { background:var(--danger); color:#fff; }
+@keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
+.loading { text-align:center; padding:40px; color:var(--text-faint); font-size:.9rem; }
+.svc-card { border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px; margin-bottom:10px; background:var(--bg); }
+.svc-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+.svc-head b { font-size:.95rem; }
+.svc-params { font-size:.75rem; color:var(--text-dim); margin-bottom:6px; font-family:Consolas,monospace; }
+.svc-models { font-size:.78rem; color:var(--text-dim); }
+.kv { font-size:.78rem; color:var(--text-dim); margin:2px 0; }
+.kv b { color:var(--text); font-weight:600; }
+.muted { color:var(--text-faint); font-size:.75rem; }
+@media (max-width:600px){ body{padding:12px} .settings-grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+  .cat-btn{padding:12px 6px;font-size:.75rem} .modal{padding:16px} }
 </style>
 </head>
 <body>
-<header>
-  <h1>LLM Gateway</h1>
-  <span id="status">connecting…</span>
-  <span id="keybar">
-    <input id="key" type="password" placeholder="API key" style="width:180px">
-    <button id="key-save">Save</button>
-  </span>
-</header>
-<div class="grid">
 
-  <section id="pane-config">
-    <h2>Config</h2>
-    <div class="row">
-      <input id="al-name" placeholder="alias name" style="width:140px">
-      <input id="al-chain" placeholder="chain: local:model, groq:fast" style="flex:1;min-width:220px">
-      <input id="al-hedge" placeholder="hedge_s" style="width:80px" type="number" min="0" step="0.5">
-      <label class="muted"><input type="checkbox" id="al-local"> local_only</label>
-      <button id="al-add">Upsert alias</button>
-    </div>
-    <table id="aliases"><thead><tr><th>alias</th><th>chain</th><th class="num">hedge_s</th><th>local_only</th><th></th></tr></thead><tbody></tbody></table>
-    <div class="row" style="margin-top:10px">
-      <button id="cfg-save">Save config JSON</button>
-      <span class="muted" id="cfg-path"></span>
-    </div>
-    <textarea id="cfg-raw" spellcheck="false"></textarea>
-  </section>
-
-  <section id="pane-models">
-    <h2>Models</h2>
-    <div class="muted" id="gpus"></div>
-    <table id="loaded"><thead><tr><th>loaded</th><th>ctx</th><th class="num">vram</th><th class="num">load_s</th><th></th></tr></thead><tbody></tbody></table>
-    <div class="muted" style="margin-top:10px">available (aliases + config models + discovered stems)</div>
-    <div class="chips" id="available"></div>
-  </section>
-
-  <section id="pane-perf">
-    <h2>Performance</h2>
-    <table id="perf"><thead><tr><th>model</th><th>backend</th><th class="num">reqs</th><th class="num">avg ms</th><th class="num">max ms</th><th class="num">tokens</th><th class="num">errors</th></tr></thead><tbody></tbody></table>
-    <div class="muted" id="perf-total" style="margin-top:8px"></div>
-  </section>
-
-  <section id="pane-logs">
-    <h2>Logs</h2>
-    <div id="logs"></div>
-  </section>
-
+<div class="header">
+  <h1>🧠 LLM Gateway Admin</h1>
+  <span class="spacer"></span>
+  <span id="conn">connecting…</span>
+  <input id="key" type="password" placeholder="API key (blank = open)" style="display:none">
 </div>
-<div class="toast" id="toast"></div>
+<div class="subheader" id="subheader">
+  <span id="sh-version"></span> <span id="sh-backends"></span>
+  <span id="sh-models"></span> <span id="sh-gpus"></span>
+</div>
+
+<div class="settings-grid" id="grid">
+  <button class="cat-btn" onclick="showPanel('models')" title="Loaded instances, worker pools, on-disk GGUFs, load/unload">
+    <span class="cat-icon">🧠</span><span>Models</span></button>
+  <button class="cat-btn" onclick="showPanel('services')" title="Backend service definitions: connection params, models, live children & pods">
+    <span class="cat-icon">🔌</span><span>Services</span></button>
+  <button class="cat-btn" onclick="showPanel('perf')" title="GPU memory, per-model latency/token stats, recent requests">
+    <span class="cat-icon">📊</span><span>Performance</span></button>
+  <button class="cat-btn dashed" onclick="showPanel('syslog')" title="Live gateway log events">
+    <span class="cat-icon">📋</span><span>Syslog</span></button>
+  <button class="cat-btn" onclick="showPanel('params')" title="Port, bind, queue, models_dir, gateway keys + raw config JSON">
+    <span class="cat-icon">⚙️</span><span>Parameters</span></button>
+  <button class="cat-btn" onclick="showPanel('keys')" title="API key status per backend (env / keyring / missing)">
+    <span class="cat-icon">🔑</span><span>API Keys</span></button>
+  <button class="cat-btn" onclick="showPanel('health')" title="Health overview + recovery: stop children, stop pods, unload all, reload config">
+    <span class="cat-icon">🩺</span><span>Health &amp; Recovery</span></button>
+  <button class="cat-btn" onclick="showPanel('aliases')" title="Alias chains with hedge racing">
+    <span class="cat-icon">🧭</span><span>Aliases</span></button>
+</div>
+
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <div class="modal-title" id="modal-title"></div>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Close</button>
+    </div>
+  </div>
+</div>
 
 <script>
-"use strict";
-const $ = (id) => document.getElementById(id);
-const KEY = localStorage.getItem("gw_key") || "";
+'use strict';
+var KEY = localStorage.getItem('gw_key') || '';
+var _syslogTimer = null, _perfTimer = null;
 
-function toast(msg, isErr) {
-  const t = $("toast");
-  t.textContent = msg;
-  t.style.borderColor = isErr ? "#e05555" : "#4ec9b0";
-  t.style.display = "block";
-  setTimeout(() => { t.style.display = "none"; }, 2500);
+// ---------- api ----------
+function api(path, opts) {
+  opts = opts || {};
+  var headers = opts.headers || {};
+  headers['Content-Type'] = 'application/json';
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  return fetch(path, {method: opts.method || 'GET', headers: headers,
+                      body: opts.body ? JSON.stringify(opts.body) : undefined})
+    .then(function (r) {
+      if (r.status === 401) { setConn('bad', '401 — wrong API key'); throw new Error('401 unauthorized'); }
+      if (!r.ok) return r.json().then(function (b) {
+        throw new Error((b && b.error && b.error.message) || ('HTTP ' + r.status));
+      });
+      return r.json();
+    });
 }
-
-async function api(path, opts = {}) {
-  const headers = Object.assign({"Content-Type": "application/json"}, opts.headers || {});
-  if (KEY) headers["Authorization"] = "Bearer " + KEY;
-  const r = await fetch(path, Object.assign({}, opts, {headers}));
-  if (r.status === 401) { $("keybar").classList.add("show"); throw new Error("401"); }
-  return r;
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function setConn(cls, txt) { var el = document.getElementById('conn');
+  el.className = cls || ''; el.textContent = txt; }
+function notify(msg, isErr) {
+  var d = document.createElement('div');
+  d.className = 'notif' + (isErr ? ' error' : '');
+  d.textContent = msg; document.body.appendChild(d);
+  setTimeout(function () { d.remove(); }, 3200);
 }
+function fmtMB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB'; }
 
-$("key-save").onclick = () => {
-  localStorage.setItem("gw_key", $("key").value);
-  location.reload();
-};
-
-/* ── Config pane ── */
-async function refreshConfig() {
-  const r = await api("/admin/config").catch(() => null);
-  if (!r || !r.ok) return;
-  const d = await r.json();
-  $("cfg-raw").value = d.text;
-  $("cfg-path").textContent = d.path;
-  const ra = await api("/admin/aliases").then(x => x.json()).catch(() => ({aliases: {}}));
-  const tb = $("aliases").querySelector("tbody");
-  tb.innerHTML = "";
-  for (const [name, a] of Object.entries(ra.aliases || {})) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${esc(name)}</td><td>${esc((a.chain || []).join(" → "))}</td>` +
-      `<td class="num">${a.hedge_s ?? 0}</td><td>${a.local_only ? "🔒" : ""}</td>` +
-      `<td><button class="danger" data-del="${esc(name)}">del</button></td>`;
-    tb.appendChild(tr);
-  }
-  tb.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
-    const r = await api("/admin/aliases", {method: "POST",
-      body: JSON.stringify({name: b.dataset.del, delete: true})});
-    if (r.ok) { toast("alias deleted"); refreshAll(); } else toast("delete failed", true);
+// ---------- boot ----------
+function boot() {
+  var keyEl = document.getElementById('key');
+  keyEl.style.display = '';
+  keyEl.value = KEY;
+  keyEl.addEventListener('change', function () {
+    KEY = keyEl.value.trim(); localStorage.setItem('gw_key', KEY); refreshHeader();
   });
+  refreshHeader();
+  setInterval(refreshHeader, 15000);
+}
+function refreshHeader() {
+  api('/healthz').then(function (h) {
+    setConn('ok', '● connected');
+    document.getElementById('sh-version').innerHTML = '<b>' + esc(h.version) + '</b>';
+    var types = Object.keys(h.backends || {}).map(function (n) {
+      return '<span class="badge ' + esc(h.backends[n].type) + '">' + esc(n) + '</span>'; }).join(' ');
+    document.getElementById('sh-backends').innerHTML = types;
+    document.getElementById('sh-models').textContent =
+      h.loaded_count + ' loaded · ' + h.discovered_models + ' on disk';
+    var g = (h.gpus || [])[0];
+    document.getElementById('sh-gpus').textContent = g
+      ? (g.name + ' · ' + fmtMB(g.free_mb) + ' free') : '';
+  }).catch(function (e) { setConn('bad', '✗ ' + e.message); });
 }
 
-$("al-add").onclick = async () => {
-  const chain = $("al-chain").value.split(",").map(s => s.trim()).filter(Boolean);
-  const body = {name: $("al-name").value.trim(), chain};
-  const h = parseFloat($("al-hedge").value);
-  if (!isNaN(h)) body.hedge_s = h;
-  if ($("al-local").checked) body.local_only = true;
-  const r = await api("/admin/aliases", {method: "POST", body: JSON.stringify(body)});
-  if (r.ok) { toast("alias saved"); refreshAll(); }
-  else toast((await r.json()).error.message, true);
-};
-
-$("cfg-save").onclick = async () => {
-  const r = await api("/admin/config", {method: "PUT",
-    body: JSON.stringify({text: $("cfg-raw").value})});
-  if (r.ok) { toast("config saved + reloaded"); refreshAll(); }
-  else toast((await r.json()).error.message, true);
-};
-
-/* ── Models pane ── */
-async function refreshModels() {
-  const h = await api("/healthz").then(r => r.json()).catch(() => null);
-  if (!h) { $("status").textContent = "unreachable"; return; }
-  $("status").textContent = `${h.version} · ${h.loaded_count} loaded · ` +
-    (h.gpus || []).map(g => `${g.name}: ${g.used_mb}/${g.total_mb} MB (free ${g.free_mb})`).join(" · ");
-  $("gpus").textContent = (h.gpus || []).map(g =>
-    `${g.name} — used ${fmtMB(g.used_mb)} / ${fmtMB(g.total_mb)}, free ${fmtMB(g.free_mb)}`).join(" | ");
-  const tb = $("loaded").querySelector("tbody");
-  tb.innerHTML = "";
-  for (const m of h.loaded || []) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td title="${esc(m.path)}">${esc(m.alias)}</td><td class="num">${m.n_ctx}</td>` +
-      `<td class="num">${esc(m.size_vram_human)}</td><td class="num">${m.load_s}s</td>` +
-      `<td><button class="danger" data-un="${esc(m.alias)}">unload</button></td>`;
-    tb.appendChild(tr);
-  }
-  tb.querySelectorAll("[data-un]").forEach(b => b.onclick = async () => {
-    const r = await api("/admin/unload", {method: "POST",
-      body: JSON.stringify({model: b.dataset.un})});
-    if (r.ok) refreshAll(); else toast("unload failed", true);
-  });
-  const models = await api("/v1/models").then(r => r.json()).catch(() => ({data: []}));
-  const chips = $("available");
-  chips.innerHTML = "";
-  for (const m of models.data || []) {
-    const el = document.createElement("span");
-    el.className = "chip";
-    el.innerHTML = `<span>${esc(m.id)}</span><span class="own">${esc(m.owned_by)}</span>` +
-      `<button data-load="${esc(m.id)}" title="preload">↑</button>`;
-    chips.appendChild(el);
-  }
-  chips.querySelectorAll("[data-load]").forEach(b => b.onclick = async () => {
-    b.textContent = "…";
-    const r = await api("/admin/load", {method: "POST",
-      body: JSON.stringify({model: b.dataset.load})});
-    if (r.ok) { toast("loaded"); refreshAll(); }
-    else { b.textContent = "↑"; toast((await r.json()).error.message, true); }
-  });
+// ---------- modal ----------
+function showPanel(name) {
+  document.getElementById('modal').classList.add('show');
+  stopTimers();
+  var t = document.getElementById('modal-title'), b = document.getElementById('modal-body');
+  b.innerHTML = '<div class="loading">Loading…</div>';
+  ({models: showModels, services: showServices, perf: showPerf,
+    syslog: showSyslog, params: showParams, keys: showKeys,
+    health: showHealth, aliases: showAliases}[name] || function(){})(
+      {title: t, body: b});
+}
+function closeModal() {
+  document.getElementById('modal').classList.remove('show'); stopTimers();
+}
+function stopTimers() {
+  if (_syslogTimer) { clearInterval(_syslogTimer); _syslogTimer = null; }
+  if (_perfTimer) { clearInterval(_perfTimer); _perfTimer = null; }
 }
 
-/* ── Performance pane ── */
-async function refreshPerf() {
-  const s = await api("/admin/stats").then(r => r.json()).catch(() => null);
-  if (!s) return;
-  const tb = $("perf").querySelector("tbody");
-  tb.innerHTML = "";
-  for (const r of s.per_model || []) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${esc(r.model)}</td><td>${esc(r.backend)}</td>` +
-      `<td class="num">${r.n}</td><td class="num">${r.avg_ms}</td>` +
-      `<td class="num">${r.max_ms}</td><td class="num">${r.total_tokens}</td>` +
-      `<td class="num ${r.errors ? "err" : ""}">${r.errors}</td>`;
-    tb.appendChild(tr);
-  }
-  $("perf-total").textContent = `${s.total} requests logged` +
-    (s.recent ? ` — last: ${esc(s.recent[s.recent.length - 1]?.model || "")}` : "");
+// ---------- Models ----------
+function showModels(ui) {
+  ui.title.textContent = '🧠 Models';
+  Promise.all([api('/admin/models'), api('/admin/backends')]).then(function (r) {
+    var d = r[0], defs = r[1];
+    var configured = {};
+    (defs.backends || []).forEach(function (b) {
+      var mm = Object.assign({}, b.models || {}, b.embedding_models || {});
+      Object.keys(mm).forEach(function (n) { configured[n] = b.name; }); });
+    var html = '<div class="widget"><h3>Loaded instances</h3>';
+    if (!(d.loaded || []).length) html += '<div class="muted">Nothing resident — models load lazily on first request.</div>';
+    else {
+      html += '<table><thead><tr><th>model</th><th>role</th><th>worker</th><th class="num">ctx</th><th class="num">VRAM</th><th class="num">load</th><th></th></tr></thead><tbody>';
+      d.loaded.forEach(function (m) {
+        html += '<tr><td><b>' + esc(m.alias) + '</b> <span class="muted">' + esc(m.name) + '</span></td>' +
+          '<td>' + esc(m.role) + '</td><td>' + (m.worker != null ? m.worker : '—') + '</td>' +
+          '<td class="num">' + m.n_ctx + '</td><td class="num">' + esc(m.size_vram_human) + '</td>' +
+          '<td class="num">' + m.load_s + 's</td>' +
+          '<td><button class="btn btn-sm btn-danger" onclick="unload(\'' + esc(m.alias) + '\')">unload</button></td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '</div><div class="widget"><h3>On-disk GGUFs (servable by stem)</h3><div class="chips">';
+    (d.discovered || []).forEach(function (g) {
+      html += '<span class="chip"><b>' + esc(g.name) + '</b>' +
+        '<span class="muted">' + esc(g.size_human) + ' · ' + esc(g.quantization) +
+        (configured[g.name] ? ' · ' + esc(configured[g.name]) : '') + '</span>' +
+        '<button onclick="loadModel(\'' + esc(g.name) + '\')">load</button></span>';
+    });
+    if (!(d.discovered || []).length) html += '<span class="muted">models_dir is empty.</span>';
+    html += '</div><div class="muted">Config-defined models (custom ctx / workers / placement) shadow same-named stems. Worker pools grow lazily under concurrency.</div></div>';
+    ui.body.innerHTML = html;
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function loadModel(name) {
+  api('/admin/load', {method: 'POST', body: {model: name}})
+    .then(function () { notify('✓ ' + name + ' loaded'); showPanel('models'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function unload(name) {
+  api('/admin/unload', {method: 'POST', body: {model: name}})
+    .then(function (r) { notify('✓ unloaded ' + (r.unloaded || 0)); showPanel('models'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
-/* ── Logs pane ── */
-async function refreshLogs() {
-  const ev = await api("/admin/events").then(r => r.json()).catch(() => null);
-  const st = await api("/admin/stats").then(r => r.json()).catch(() => null);
-  const box = $("logs");
-  const lines = [];
-  for (const e of (ev && ev.events) || [])
-    lines.push(`<div class="${e.level}"><span class="ts">${e.ts}</span> ${e.level} ${esc(e.logger)}: ${esc(e.message)}</div>`);
-  for (const r of ((st && st.recent) || []).slice(-15).reverse())
-    lines.push(`<div class="INFO"><span class="ts">${r.ts}</span> REQ ${esc(r.model)} ${r.backend} ${r.stream ? "stream" : ""} ${r.ms}ms <span class="${r.status >= 400 ? "err" : "ok"}">${r.status}</span></div>`);
-  box.innerHTML = lines.slice(-250).join("");
+// ---------- Services ----------
+function showServices(ui) {
+  ui.title.textContent = '🔌 Service Definitions';
+  Promise.all([api('/admin/backends'), api('/healthz')]).then(function (r) {
+    var defs = r[0], hz = r[1];
+    var children = hz.llama_server || [], pods = hz.runpod || [];
+    var html = '';
+    (defs.backends || []).forEach(function (b) {
+      html += '<div class="svc-card"><div class="svc-head"><b>' + esc(b.name) + '</b>' +
+        '<span class="badge ' + esc(b.type) + '">' + esc(b.type) +
+        (b.mode ? ' · ' + esc(b.mode) : '') + '</span></div><div class="svc-params">';
+      var params = [];
+      if (b.type === 'embedded') {
+        params.push('models_dir: ' + esc(defs.models_dir));
+      } else if (b.type === 'llama-server') {
+        if (b.mode === 'remote') params.push('base_url: ' + esc(b.base_url),
+          'api_key_env: ' + esc(b.api_key_env || '(none)'));
+        else params.push('exe: ' + esc(b.server_exe), 'ports ' + esc(b.port_base) + '+',
+          'idle ' + esc(b.idle_timeout_s) + 's');
+      } else if (b.type === 'runpod') {
+        params.push('api_key_env: ' + esc(b.api_key_env));
+      } else {
+        params.push('base_url: ' + esc(b.base_url), 'api_key_env: ' + esc(b.api_key_env || '(none)'));
+      }
+      html += params.join(' · ') + '</div><div class="svc-models">';
+      var mm = b.models || {};
+      if (b.embedding_models && Object.keys(b.embedding_models).length)
+        mm = Object.assign({}, mm, b.embedding_models);
+      var names = Object.keys(mm);
+      if (!names.length) html += '<span class="muted">no models configured</span>';
+      names.forEach(function (n) {
+        var m = mm[n];
+        var bits = [];
+        if (m.endpoint_id) bits.push(esc(m.transport || 'openai'), 'ep ' + esc(m.endpoint_id));
+        else if (m.pod_id) bits.push('pod ' + esc(m.pod_id));
+        else { bits.push(esc(m.gguf || m)); if (m.ctx) bits.push('ctx ' + m.ctx);
+               if (m.workers > 1) bits.push('×' + m.workers + ' workers');
+               if (m.parallel > 1) bits.push('×' + m.parallel + ' slots'); }
+        html += '<div class="kv">· <b>' + esc(n) + '</b> <span class="muted">' +
+          (typeof m === 'string' ? '' : bits.join(' · ')) + '</span></div>';
+      });
+      html += '</div></div>';
+    });
+    // live children + pods
+    if (children.length) {
+      html += '<div class="widget"><h3>Live llama-server children</h3><table><tbody>';
+      children.forEach(function (c) {
+        html += '<tr><td><b>' + esc(c.backend) + ':' + esc(c.model) + '</b></td>' +
+          '<td>' + esc(c.state) + '</td><td>pid ' + (c.pid || '—') + '</td>' +
+          '<td>×' + c.parallel + ' slots</td><td class="muted">idle ' + (c.idle_s || 0) + 's</td>' +
+          '<td><button class="btn btn-sm btn-danger" onclick="stopChild(\'' + esc(c.backend) + '\',\'' + esc(c.model) + '\')">stop</button></td></tr>';
+      });
+      html += '</tbody></table><div class="muted">Children respawn lazily on the next request.</div></div>';
+    }
+    if (pods.length) {
+      html += '<div class="widget"><h3>Live runpod pods</h3><table><tbody>';
+      pods.forEach(function (p) {
+        html += '<tr><td><b>' + esc(p.backend) + ':' + esc(p.model) + '</b></td>' +
+          '<td>' + esc(p.state) + '</td><td class="muted">' + esc(p.pod_id || '') + '</td>' +
+          '<td class="muted">idle ' + (p.idle_s || 0) + 's</td>' +
+          '<td><button class="btn btn-sm" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',false)">stop</button> ' +
+          '<button class="btn btn-sm btn-danger" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',true)">terminate</button></td></tr>';
+      });
+      html += '</tbody></table><div class="muted">stop keeps storage (cheap resume); terminate frees everything (full redeploy next request).</div></div>';
+    }
+    ui.body.innerHTML = html;
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function stopChild(backend, model) {
+  api('/admin/llama-server/stop', {method: 'POST', body: {backend: backend, model: model}})
+    .then(function () { notify('✓ child stopped'); showPanel('services'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function stopPod(backend, model, terminate) {
+  api('/admin/runpod/stop', {method: 'POST', body: {backend: backend, model: model, terminate: terminate}})
+    .then(function () { notify('✓ pod ' + (terminate ? 'terminated' : 'stopped')); showPanel('services'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
-function esc(s) { return String(s ?? "").replace(/[&<>"']/g,
-  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : mb + " MB"; }
-
-async function refreshAll() {
-  await Promise.allSettled([refreshConfig(), refreshModels(), refreshPerf(), refreshLogs()]);
+// ---------- Performance ----------
+function showPerf(ui) {
+  ui.title.textContent = '📊 Performance';
+  var render = function () {
+    Promise.all([api('/healthz'), api('/admin/stats')]).then(function (r) {
+      var hz = r[0], st = r[1];
+      var html = '';
+      (hz.gpus || []).forEach(function (g) {
+        var used = g.total_mb - g.free_mb, pct = Math.round(used / g.total_mb * 100);
+        var cls = pct > 90 ? 'err' : pct > 70 ? 'warn' : '';
+        html += '<div class="widget"><h3>' + esc(g.name) + '</h3>' +
+          '<div class="bar"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
+          '<div class="kv" style="margin-top:4px;"><b>' + fmtMB(used) + '</b> used · <b>' +
+          fmtMB(g.free_mb) + '</b> free of ' + fmtMB(g.total_mb) + ' (' + pct + '%)</div></div>';
+      });
+      html += '<div class="widget"><h3>Per-model (' + esc(st.total) + ' logged requests)</h3>';
+      if (!(st.per_model || []).length) html += '<div class="muted">No requests logged yet.</div>';
+      else {
+        html += '<table><thead><tr><th>model</th><th>backend</th><th class="num">n</th>' +
+          '<th class="num">avg ms</th><th class="num">max ms</th><th class="num">tokens</th>' +
+          '<th class="num">errors</th></tr></thead><tbody>';
+        st.per_model.forEach(function (m) {
+          html += '<tr><td><b>' + esc(m.model) + '</b></td><td>' + esc(m.backend) + '</td>' +
+            '<td class="num">' + m.n + '</td><td class="num">' + m.avg_ms + '</td>' +
+            '<td class="num">' + m.max_ms + '</td><td class="num">' + m.total_tokens + '</td>' +
+            '<td class="num">' + (m.errors ? '<span style="color:var(--danger)">' + m.errors + '</span>' : '0') + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      }
+      html += '</div><div class="widget"><h3>Recent requests</h3><table><tbody>';
+      (st.recent || []).slice(-15).reverse().forEach(function (e) {
+        var col = e.status >= 400 ? 'var(--danger)' : 'var(--text-dim)';
+        html += '<tr><td class="muted">' + esc(e.ts) + '</td><td><b>' + esc(e.model) + '</b></td>' +
+          '<td>' + esc(e.backend || '—') + '</td><td>' + (e.stream ? 'stream' : 'chat') + '</td>' +
+          '<td class="num">' + e.ms + 'ms</td><td style="color:' + col + '">' + e.status + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+      ui.body.innerHTML = html;
+    }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+  };
+  render();
+  _perfTimer = setInterval(render, 5000);
 }
-refreshAll();
-setInterval(refreshAll, 4000);
+
+// ---------- Syslog ----------
+function showSyslog(ui) {
+  ui.title.textContent = '📋 Syslog';
+  var render = function () {
+    api('/admin/events').then(function (r) {
+      var html = '<div class="logs">';
+      (r.events || []).forEach(function (e) {
+        html += '<div class="log-entry"><span class="log-time">' + esc(e.ts) + '</span> ' +
+          '<span class="log-level ' + esc(e.level) + '">' + esc(e.level) + '</span> ' +
+          '<span class="log-msg">' + esc(e.message) + '</span></div>';
+      });
+      if (!(r.events || []).length) html += '<div class="muted">No events yet.</div>';
+      html += '</div><div class="muted" style="margin-top:6px">Live — refreshes every 4s. Ring keeps the last 300 events.</div>';
+      ui.body.innerHTML = html;
+      var logs = ui.body.querySelector('.logs');
+      if (logs) logs.scrollTop = logs.scrollHeight;
+    }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+  };
+  render();
+  _syslogTimer = setInterval(render, 4000);
+}
+
+// ---------- Parameters ----------
+function showParams(ui) {
+  ui.title.textContent = '⚙️ Setup Parameters';
+  api('/admin/backends').then(function (d) {
+    var html = '<div class="widget"><h3>Server</h3>' +
+      srow('Bind address', d.bind, 'bind') +
+      srow('Port', d.port, 'port', 'number') +
+      srow('Models directory', d.models_dir, 'models_dir') +
+      srow('Default alias', d.default_alias || '(none)', 'default_alias') +
+      srow('Queue: max waiting', d.queue.max_waiting, 'q_max_waiting', 'number') +
+      srow('Queue: timeout (s)', d.queue.timeout_s, 'q_timeout_s', 'number') +
+      '<div class="muted">All parameters hot-reload from the config file — or save below.</div></div>';
+    html += '<div class="widget"><h3>Raw config JSON</h3>' +
+      '<div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;">' +
+      '<button class="btn btn-primary" onclick="saveConfig()">Save &amp; apply</button>' +
+      '<button class="btn" onclick="reloadConfig()">↻ Reload from disk</button>' +
+      '<span class="muted" id="cfg-path"></span></div>' +
+      '<textarea id="cfg-raw" spellcheck="false"></textarea>' +
+      '<div class="muted" style="margin-top:4px">Editing is raw JSON — the structured backends/models editors arrive via the config schema. Broken JSON is rejected (last good config keeps serving).</div></div>';
+    ui.body.innerHTML = html;
+    api('/admin/config').then(function (c) {
+      document.getElementById('cfg-raw').value = c.text;
+      document.getElementById('cfg-path').textContent = c.path;
+    });
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function srow(label, val, id, type) {
+  return '<div class="srow"><label>' + esc(label) + '</label>' +
+    '<input id="pm-' + esc(id) + '" type="' + (type || 'text') + '" value="' + esc(val) + '"></div>';
+}
+function saveConfig() {
+  var text = document.getElementById('cfg-raw').value;
+  api('/admin/config', {method: 'PUT', body: {text: text}})
+    .then(function () { notify('✓ config saved + applied'); refreshHeader(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function reloadConfig() {
+  api('/admin/reload', {method: 'POST'})
+    .then(function () { notify('✓ reloaded'); showPanel('params'); refreshHeader(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
+// ---------- API Keys ----------
+function showKeys(ui) {
+  ui.title.textContent = '🔑 API Keys & Connections';
+  api('/admin/secrets').then(function (d) {
+    var html = '<div class="widget"><h3>Gateway access (bearer keys)</h3>';
+    html += d.gateway_keys_configured
+      ? '<div class="kv"><span class="badge ok">configured</span> Requests need <b>Authorization: Bearer &lt;key&gt;</b> — keys live in gateway_keys in the config (Parameters → raw JSON).</div>'
+      : '<div class="kv"><span class="badge warn">open</span> No gateway_keys configured — the gateway trusts localhost. Add keys via Parameters → raw JSON.</div>';
+    html += '</div><div class="widget"><h3>Backend service credentials</h3>';
+    if (!(d.api_keys || []).length)
+      html += '<div class="muted">No cloud/runpod backends configured — nothing needs keys.</div>';
+    else {
+      html += '<table><thead><tr><th>env var</th><th>used by</th><th>status</th></tr></thead><tbody>';
+      d.api_keys.forEach(function (k) {
+        var badge = k.source === 'env' ? '<span class="badge ok">env</span>'
+          : k.source === 'keyring' ? '<span class="badge ok">keyring</span>'
+          : '<span class="badge err">missing</span>';
+        html += '<tr><td><b>' + esc(k.name) + '</b></td><td>' +
+          k.backends.map(esc).join(', ') + '</td><td>' + badge + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '<div class="muted" style="margin-top:6px">' + esc(d.hint) + '</div></div>';
+    ui.body.innerHTML = html;
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+
+// ---------- Health & Recovery ----------
+function showHealth(ui) {
+  ui.title.textContent = '🩺 Health & Recovery';
+  api('/healthz').then(function (h) {
+    var html = '<div class="widget"><h3>Status</h3>' +
+      '<div class="kv">version <b>' + esc(h.version) + '</b> · bind <b>' + esc(h.bind) + ':' + h.port + '</b></div>' +
+      '<div class="kv"><b>' + h.loaded_count + '</b> loaded instances · <b>' + h.discovered_models + '</b> GGUFs on disk</div>';
+    Object.keys(h.backends || {}).forEach(function (n) {
+      var b = h.backends[n];
+      html += '<div class="kv">· <span class="badge ' + esc(b.type) + '">' + esc(n) + '</span> ' +
+        b.configured_models + ' model(s)</div>';
+    });
+    html += '</div>';
+    (h.gpus || []).forEach(function (g) {
+      var used = g.total_mb - g.free_mb, pct = Math.round(used / g.total_mb * 100);
+      var cls = pct > 90 ? 'err' : pct > 70 ? 'warn' : '';
+      html += '<div class="widget"><h3>' + esc(g.name) + '</h3>' +
+        '<div class="bar"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
+        '<div class="kv" style="margin-top:4px;"><b>' + fmtMB(used) + '</b> used · <b>' + fmtMB(g.free_mb) + '</b> free (' + pct + '%)</div></div>';
+    });
+    var children = h.llama_server || [], pods = h.runpod || [];
+    if (children.length) {
+      html += '<div class="widget"><h3>llama-server children (' + children.length + ')</h3><table><tbody>';
+      children.forEach(function (c) {
+        html += '<tr><td><b>' + esc(c.backend) + ':' + esc(c.model) + '</b></td><td>' + esc(c.state) +
+          '</td><td><button class="btn btn-sm btn-danger" onclick="stopChild(\'' + esc(c.backend) + '\',\'' + esc(c.model) + '\')">stop</button></td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+    if (pods.length) {
+      html += '<div class="widget"><h3>runpod pods (' + pods.length + ')</h3><table><tbody>';
+      pods.forEach(function (p) {
+        html += '<tr><td><b>' + esc(p.backend) + ':' + esc(p.model) + '</b></td><td>' + esc(p.state) +
+          '</td><td><button class="btn btn-sm" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',false)">stop</button> ' +
+          '<button class="btn btn-sm btn-danger" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',true)">terminate</button></td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+    html += '<div class="widget"><h3>Recovery actions</h3><div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+      '<button class="btn" onclick="unloadAll()">⏏ Unload all embedded models</button>' +
+      '<button class="btn" onclick="stopAllChildren()">■ Stop all llama-server children</button>' +
+      '<button class="btn" onclick="reloadConfig()">↻ Reload config</button></div>' +
+      '<div class="muted" style="margin-top:6px">Everything respawns lazily — unloading/stopping only frees resources until the next request.</div></div>';
+    ui.body.innerHTML = html;
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function unloadAll() {
+  api('/admin/unload', {method: 'POST', body: {all: true}})
+    .then(function (r) { notify('✓ unloaded ' + r.unloaded); showPanel('health'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function stopAllChildren() {
+  api('/admin/llama-server/stop', {method: 'POST', body: {all: true}})
+    .then(function () { notify('✓ all children stopped'); showPanel('health'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
+// ---------- Aliases ----------
+function showAliases(ui) {
+  ui.title.textContent = '🧭 Aliases';
+  api('/admin/aliases').then(function (d) {
+    var html = '<div class="widget"><h3>Define alias</h3>' +
+      '<div class="srow"><label>name</label><input id="al-name" placeholder="smart"></div>' +
+      '<div class="srow"><label>chain (backend:model, …)</label><input id="al-chain" placeholder="local:big, groq:cloud-fast" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>hedge_s (0 = sequential)</label><input id="al-hedge" type="number" min="0" step="0.5" value="0"></div>' +
+      '<div class="srow"><label>local_only</label><input id="al-local" type="checkbox"></div>' +
+      '<button class="btn btn-primary" onclick="upsertAlias()">Upsert</button></div>' +
+      '<div class="widget"><h3>Existing</h3><table><thead><tr><th>alias</th><th>chain</th><th class="num">hedge_s</th><th>local_only</th><th></th></tr></thead><tbody>';
+    Object.keys(d.aliases || {}).forEach(function (n) {
+      var a = d.aliases[n];
+      html += '<tr><td><b>' + esc(n) + '</b></td><td>' + esc((a.chain || []).join(' → ')) + '</td>' +
+        '<td class="num">' + (a.hedge_s || 0) + '</td><td>' + (a.local_only ? '✓' : '') + '</td>' +
+        '<td><button class="btn btn-sm btn-danger" onclick="delAlias(\'' + esc(n) + '\')">delete</button></td></tr>';
+    });
+    if (!Object.keys(d.aliases || {}).length)
+      html += '<tr><td colspan="5" class="muted">No aliases — requests use backend:model or bare model names.</td></tr>';
+    html += '</tbody></table><div class="muted" style="margin-top:6px">Hedge: the primary answers within hedge_s or the next entry races it — first completion wins.</div></div>';
+    ui.body.innerHTML = html;
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function upsertAlias() {
+  api('/admin/aliases', {method: 'POST', body: {
+    name: document.getElementById('al-name').value,
+    chain: document.getElementById('al-chain').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+    hedge_s: parseFloat(document.getElementById('al-hedge').value) || 0,
+    local_only: document.getElementById('al-local').checked}})
+    .then(function () { notify('✓ alias saved'); showPanel('aliases'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function delAlias(name) {
+  api('/admin/aliases', {method: 'POST', body: {name: name, delete: true}})
+    .then(function () { notify('✓ deleted'); showPanel('aliases'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
+function errBox(e) { return '<div style="color:var(--danger);padding:12px;">✗ ' + esc(e.message) + '</div>'; }
+
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+boot();
 </script>
 </body>
 </html>
