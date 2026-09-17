@@ -18,12 +18,11 @@ execute through the gateway's cloud-client path; the first request
 after scale-to-zero blocks during worker boot (cold start) — set the
 queue timeout accordingly.
 
-REST API (rest.runpod.io — the GraphQL API is deprecated):
-  POST   /v1/pods                    deploy (camelCase payload)
-  GET    /v1/pods                    list (find by name)
-  POST   /v1/pods/{podId}/start      resume a stopped pod
-  POST   /v1/pods/{podId}/stop       stop (keeps storage)
-  DELETE /v1/pods/{podId}            terminate
+REST API v2 (api.runpod.io/v2):
+  POST   /v2/pods                    deploy (snake_case payload)
+  GET    /v2/pods                    list (paginated: {"pods": [...], "pagination": {...}})
+  POST   /v2/pods/{id}/action        lifecycle: {"action": "start"|"stop"|"restart"|"terminate"}
+  GET    /v2/serverless              list endpoints (paginated)
 """
 from __future__ import annotations
 
@@ -42,7 +41,7 @@ from .config import GatewayConfig
 
 logger = logging.getLogger(__name__)
 
-REST_BASE = "https://rest.runpod.io/v1"
+REST_BASE = "https://api.runpod.io/v2"
 SERVERLESS_URL = "https://api.runpod.ai/v2/{endpoint_id}/openai/v1"
 SERVERLESS_API = "https://api.runpod.ai/v2/{endpoint_id}"
 
@@ -115,8 +114,8 @@ async def _rest(method: str, path: str, api_key_env: str,
 
 
 async def deploy_pod(payload: dict[str, Any], api_key_env: str) -> dict[str, Any]:
-    """POST /v1/pods → the created pod object (id expected)."""
-    out = await _rest("POST", "/pods", api_key_env, payload)
+    """POST /v2/pods → the created pod object (id expected)."""
+    out = await _rest("POST", "/v2/pods", api_key_env, payload)
     pod = out if isinstance(out, dict) else {}
     if not (pod.get("id") or (isinstance(pod.get("pod"), dict) and pod["pod"].get("id"))):
         raise RunPodError(f"runpod deploy returned no pod id: {str(out)[:300]}")
@@ -124,8 +123,8 @@ async def deploy_pod(payload: dict[str, Any], api_key_env: str) -> dict[str, Any
 
 
 async def list_pods(api_key_env: str) -> list[dict[str, Any]]:
-    """GET /v1/pods → pod list (normalized to a list of dicts)."""
-    out = await _rest("GET", "/pods", api_key_env)
+    """GET /v2/pods → pod list (handles paginated response: {"pods": [...], "pagination": {...}})."""
+    out = await _rest("GET", "/v2/pods", api_key_env)
     if isinstance(out, list):
         return [p for p in out if isinstance(p, dict)]
     if isinstance(out, dict):
@@ -136,27 +135,27 @@ async def list_pods(api_key_env: str) -> list[dict[str, Any]]:
 
 
 async def list_endpoints(api_key_env: str) -> list[dict[str, Any]]:
-    """GET /v1/endpoints → endpoint list (normalized to a list of dicts)."""
-    out = await _rest("GET", "/endpoints", api_key_env)
+    """GET /v2/serverless → endpoint list (handles paginated response)."""
+    out = await _rest("GET", "/v2/serverless", api_key_env)
     if isinstance(out, list):
         return [e for e in out if isinstance(e, dict)]
     if isinstance(out, dict):
-        for key in ("endpoints", "data", "items"):
+        for key in ("endpoints", "data", "items", "serverless"):
             if isinstance(out.get(key), list):
                 return [e for e in out[key] if isinstance(e, dict)]
     return []
 
 
 async def start_pod(pod_id: str, api_key_env: str) -> Any:
-    return await _rest("POST", f"/pods/{pod_id}/start", api_key_env)
+    return await _rest("POST", f"/v2/pods/{pod_id}/action", api_key_env, {"action": "start"})
 
 
 async def stop_pod(pod_id: str, api_key_env: str) -> Any:
-    return await _rest("POST", f"/pods/{pod_id}/stop", api_key_env)
+    return await _rest("POST", f"/v2/pods/{pod_id}/action", api_key_env, {"action": "stop"})
 
 
 async def terminate_pod(pod_id: str, api_key_env: str) -> Any:
-    return await _rest("DELETE", f"/pods/{pod_id}", api_key_env)
+    return await _rest("POST", f"/v2/pods/{pod_id}/action", api_key_env, {"action": "terminate"})
 
 
 def pod_state(pod: dict[str, Any]) -> str:
@@ -193,41 +192,75 @@ def _pod_name(backend_name: str, model_key: str) -> str:
 
 
 def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> dict[str, Any]:
-    """Config pod spec → POST /v1/pods payload (field names verified
-    against the live schema: interruptible, dockerStartCmd as an ARRAY,
-    ports as an ARRAY). The raw ``deploy`` dict always wins.
+    """Config pod spec → POST /v2/pods payload (snake_case, nested gpu).
 
-    dockerStartCmd: ``docker_cmd`` (FULL command incl. the binary, e.g.
-    "/llama-server -m ...") wins; else ``docker_args`` is prefixed with
-    /llama-server — RunPod's dockerStartCmd REPLACES the image CMD, so
-    bare args made the container exec "-hf ..." and die (live-verified
-    failure mode). ``docker_entrypoint`` (array) passes through for full
-    control."""
+    v2 schema changes from v1:
+    - imageName → image
+    - gpuCount + gpuTypeIds → gpu: {id, count}
+    - containerDiskInGb → disk
+    - dockerStartCmd (array) → cmd (array) or args (string)
+    - dockerEntrypoint → entrypoint
+    - volumeInGb + volumeMountPath → mounts: {persistent: {size, path}}
+    - env: array of {key, value} → object {key: value}
+    - interruptible → cloud: "COMMUNITY" (spot) vs "SECURE" (default)
+
+    docker_cmd (FULL command incl. the binary, e.g. "/llama-server -m ...")
+    wins; else docker_args is prefixed with /llama-server — RunPod's cmd
+    REPLACES the image CMD, so bare args made the container exec "-hf ..."
+    and die (live-verified failure mode). docker_entrypoint (array) passes
+    through for full control."""
     payload: dict[str, Any] = {
         "name": _pod_name(backend_name, model_key),
-        "imageName": spec.get("image"),
+        "image": spec.get("image"),
         "ports": spec.get("ports"),
-        "gpuCount": spec.get("gpu_count"),
-        "containerDiskInGb": spec.get("container_disk_gb"),
-        "env": spec.get("env") or None,
+        "disk": spec.get("container_disk_gb"),
+        "env": _normalize_env(spec.get("env")),
     }
+    # GPU spec: nested object {id, count}
+    gpu_type_ids = spec.get("gpu_type_ids")
+    if gpu_type_ids:
+        # v2 takes a single GPU id; use first from list (scheduler picks)
+        gpu_id = gpu_type_ids[0] if isinstance(gpu_type_ids, list) else gpu_type_ids
+        payload["gpu"] = {
+            "id": gpu_id,
+            "count": spec.get("gpu_count") or 1,
+        }
+    elif spec.get("gpu_count"):
+        payload["gpu"] = {"count": spec["gpu_count"]}
+    # Container command
     if spec.get("docker_cmd"):
-        payload["dockerStartCmd"] = shlex.split(spec["docker_cmd"])
+        payload["cmd"] = shlex.split(spec["docker_cmd"])
     elif spec.get("docker_args"):
-        payload["dockerStartCmd"] = ["/llama-server",
-                                     *shlex.split(spec["docker_args"])]
+        payload["cmd"] = ["/llama-server", *shlex.split(spec["docker_args"])]
     if spec.get("docker_entrypoint"):
-        payload["dockerEntrypoint"] = list(spec["docker_entrypoint"])
-    if spec.get("gpu_type_ids"):
-        payload["gpuTypeIds"] = spec["gpu_type_ids"]
+        payload["entrypoint"] = list(spec["docker_entrypoint"])
+    # Volume → persistent mount
     if spec.get("volume_gb"):
-        payload["volumeInGb"] = spec["volume_gb"]
-        payload["volumeMountPath"] = spec.get("volume_mount") or "/workspace"
+        payload["mounts"] = {
+            "persistent": {
+                "size": spec["volume_gb"],
+                "path": spec.get("volume_mount") or "/workspace",
+            }
+        }
+    # Spot → cloud: COMMUNITY
     if spec.get("spot"):
-        payload["interruptible"] = True  # NOT 'spot' — schema-verified
+        payload["cloud"] = "COMMUNITY"
+    # Clean up None/empty values
     payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
     payload.update(spec.get("deploy") or {})  # raw escape hatch wins
     return payload
+
+
+def _normalize_env(env) -> dict[str, str] | None:
+    """Normalize env from v1 array format [{key, value}] to v2 object {key: value}."""
+    if not env:
+        return None
+    if isinstance(env, dict):
+        return env
+    if isinstance(env, list):
+        return {item.get("key", item.get("name")): item.get("value", "")
+                for item in env if isinstance(item, dict)}
+    return None
 
 
 # ── Serverless URL builder ─────────────────────────────────────────────────

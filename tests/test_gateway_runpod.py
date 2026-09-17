@@ -3,7 +3,7 @@
 SERVERLESS models ({endpoint_id, remote_id}) route through the cloud
 client with base_url https://api.runpod.ai/v2/<ep>/openai/v1 (per-endpoint
 client cache, max_tokens NOT capped). POD models are lifecycle-managed:
-cold deploy on first request (camelCase payload, raw `deploy` override),
+cold deploy on first request (v2 payload, raw `deploy` override),
 find-by-name reuse while running, resume when stopped, health-poll via
 the proxy URL, 502 on deploy failure / exit-during-startup / startup
 timeout, idle reaper (stop tier then terminate tier), /healthz section,
@@ -296,14 +296,14 @@ def test_pod_cold_deploy_and_chat(wired, gguf, monkeypatch):
     assert "start" not in kinds
     payload = rest.calls[1][1]
     assert payload["name"] == "gw-rp-big"
-    assert payload["imageName"] == "ghcr.io/ggml-org/llama.cpp:server-cuda"
-    assert payload["gpuTypeIds"] == ["NVIDIA RTX A6000"]
-    assert payload["interruptible"] is True  # spot → interruptible (live schema)
+    assert payload["image"] == "ghcr.io/ggml-org/llama.cpp:server-cuda"
+    assert payload["gpu"]["id"] == "NVIDIA RTX A6000"
+    assert payload["cloud"] == "COMMUNITY"  # spot → COMMUNITY (v2 schema)
     assert payload["ports"] == ["8080/http"]  # array (live schema)
-    # dockerStartCmd is a FULL command: RunPod replaces the image CMD, so
+    # cmd is a FULL command: RunPod replaces the image CMD, so
     # bare args made the container exec "-m" and die (live-verified bug)
-    assert payload["dockerStartCmd"][0] == "/llama-server"
-    assert payload["dockerStartCmd"][1:3] == ["-m", "/workspace/m.gguf"]
+    assert payload["cmd"][0] == "/llama-server"
+    assert payload["cmd"][1:3] == ["-m", "/workspace/m.gguf"]
     # health-polled + proxied through the pod's proxy.runpod.net URL
     assert any(c["health"] == f"https://{POD_ID}-8080.proxy.runpod.net"
                for c in http)
@@ -317,7 +317,7 @@ def test_pod_cold_deploy_and_chat(wired, gguf, monkeypatch):
 def test_pod_deploy_payload_mapping(wired, gguf, monkeypatch):
     cfg = _rp_config(gguf, volume_gb=50, volume_mount="/data",
                      container_disk_gb=25, gpu_count=2, spot=False,
-                     deploy={"imageName": "custom/img:latest", "zzz": 1})
+                     deploy={"image": "custom/img:latest", "zzz": 1})
     wired(cfg)
     rest = _patch_rest(monkeypatch)
     _patch_pod_http(monkeypatch)
@@ -325,12 +325,13 @@ def test_pod_deploy_payload_mapping(wired, gguf, monkeypatch):
         client.post("/v1/chat/completions", json={
             "model": "big", "messages": [{"role": "user", "content": "hi"}]})
     payload = [c for c in rest.calls if c[0] == "deploy"][0][1]
-    assert payload["volumeInGb"] == 50
-    assert payload["volumeMountPath"] == "/data"
-    assert payload["containerDiskInGb"] == 25
-    assert payload["gpuCount"] == 2
-    assert "interruptible" not in payload  # spot false → omitted
-    assert payload["imageName"] == "custom/img:latest"  # raw deploy wins
+    # v2 payload: nested mounts, disk, gpu
+    assert payload["mounts"]["persistent"]["size"] == 50
+    assert payload["mounts"]["persistent"]["path"] == "/data"
+    assert payload["disk"] == 25
+    assert payload["gpu"]["count"] == 2
+    assert "cloud" not in payload  # spot false → omitted
+    assert payload["image"] == "custom/img:latest"  # raw deploy wins
     assert payload["zzz"] == 1  # unknown raw fields pass through
 
 
@@ -346,8 +347,8 @@ def test_pod_deploy_full_command_knobs(wired, gguf, monkeypatch):
         client.post("/v1/chat/completions", json={
             "model": "big", "messages": [{"role": "user", "content": "hi"}]})
     payload = [c for c in rest.calls if c[0] == "deploy"][0][1]
-    assert payload["dockerStartCmd"] == ["/custom/llama-server", "-m", "/m.gguf"]
-    assert payload["dockerEntrypoint"] == ["/bin/sh", "-c"]
+    assert payload["cmd"] == ["/custom/llama-server", "-m", "/m.gguf"]
+    assert payload["entrypoint"] == ["/bin/sh", "-c"]
 
 
 def test_pod_reuse_when_running(wired, gguf, monkeypatch):

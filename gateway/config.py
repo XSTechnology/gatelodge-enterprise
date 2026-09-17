@@ -84,7 +84,7 @@ Semantics:
   <pod-id>-<port>.proxy.runpod.net URL, proxied in OpenAI wire format,
   and idle-stopped (keeps storage) then idle-terminated per the two
   knobs (0 = never). ``deploy`` is a raw dict merged verbatim into the
-  POST /v1/pods payload (escape hatch for REST fields the gateway
+  POST /v2/pods payload (escape hatch for REST fields the gateway
   doesn't model). Pods are NOT touched on gateway shutdown.
 - Top-level keys present in the file replace the built-in defaults
   wholesale (defining "backends" overrides the default backends).
