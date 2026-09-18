@@ -67,7 +67,7 @@ td.num, th.num { text-align:right; }
 .badge { display:inline-block; font-size:.68rem; font-weight:600; padding:2px 8px; border-radius:6px;
   color:#fff; vertical-align:middle; }
 .badge.embedded { background:#2e7d32; } .badge.llama-server { background:#1565c0; }
-.badge.runpod { background:#7b1fa2; } .badge.openai { background:#e65100; }
+.badge.runpod { background:#7b1fa2; } .badge.runpod-public { background:#6a1b9a; } .badge.openai { background:#e65100; }
 .badge.ok { background:var(--success); } .badge.warn { background:var(--warning); }
 .badge.err { background:var(--danger); } .badge.dim { background:#9e9e9e; }
 .widget { padding:12px; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); margin-bottom:12px; }
@@ -343,6 +343,11 @@ function onBackendChange() {
       '<div class="muted" style="margin-left:148px;margin-bottom:6px">Use endpoint_id for serverless, pod_id for BYO pods. Not both.</div>';
   } else if (btype === 'openai') {
     html += '<div class="srow"><label>Remote model ID</label><input id="m-remote_id" placeholder="gpt-4o-mini" style="flex:1;min-width:260px"></div>';
+  } else if (btype === 'runpod-public') {
+    html += '<div class="srow"><label>Model slug</label><input id="m-model_slug" placeholder="black-forest-labs/FLUX.1-schnell" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>Remote model ID</label><input id="m-remote_id" placeholder="(defaults to slug)" style="flex:1;min-width:260px"></div>' +
+      '<div class="srow"><label>Timeout (s, 0 = default)</label><input id="m-timeout_s" type="number" min="0" step="1" placeholder="120"></div>' +
+      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Pre-deployed RunPod model slug. Found at runpod.io/console/serverless.</div>';
   }
   container.innerHTML = html;
 }
@@ -372,6 +377,7 @@ function buildConfiguredTable(configured, data) {
       if (cfg.parallel && cfg.parallel > 1) details.push('×' + cfg.parallel + ' slots');
       if (cfg.placement) details.push('GPU: ' + esc(cfg.placement));
       if (cfg.transport) details.push(cfg.transport);
+      if (cfg.model_slug) details.push('slug: ' + esc(cfg.model_slug));
       if (cfg.timeout_s) details.push('timeout: ' + cfg.timeout_s + 's');
       // Check if loaded
       var loaded = (data.loaded || []).find(function (m) { return m.alias === n; });
@@ -474,6 +480,13 @@ function saveModel() {
   } else if (btype === 'openai') {
     var remote_id = document.getElementById('m-remote_id');
     if (remote_id) payload.remote_id = remote_id.value.trim();
+  } else if (btype === 'runpod-public') {
+    var model_slug = document.getElementById('m-model_slug');
+    if (model_slug) payload.model_slug = model_slug.value.trim();
+    var remote_id = document.getElementById('m-remote_id');
+    if (remote_id && remote_id.value.trim()) payload.remote_id = remote_id.value.trim();
+    var timeout_s = document.getElementById('m-timeout_s');
+    if (timeout_s && timeout_s.value) payload.timeout_s = parseInt(timeout_s.value);
   }
   api('/admin/models', {method: 'POST', body: payload})
     .then(function () { notify('✓ ' + name + ' saved'); _editModelName = null; showPanel('models'); })
@@ -510,6 +523,8 @@ function editModel(name, backend, role) {
     if (transportEl && cfg.transport) transportEl.value = cfg.transport;
     var timeoutEl = document.getElementById('m-timeout_s');
     if (timeoutEl && cfg.timeout_s) timeoutEl.value = cfg.timeout_s;
+    var modelSlugEl = document.getElementById('m-model_slug');
+    if (modelSlugEl && cfg.model_slug) modelSlugEl.value = cfg.model_slug;
   }
   // Update title
   document.querySelector('#modal .modal-title').textContent = '🧠 Models — editing ' + name;
@@ -566,6 +581,7 @@ function buildBackendForm(defs) {
     '<option value="llama-server">Llama-server (subprocess)</option>' +
     '<option value="llama-server-remote">Llama-server (remote)</option>' +
     '<option value="runpod">RunPod</option>' +
+    '<option value="runpod-public">RunPod Public</option>' +
     '<option value="openai">OpenAI cloud</option></select></div>';
   html += '<div id="s-fields"></div>';
   html += '<div style="margin-top:10px;display:flex;gap:8px;">' +
@@ -596,6 +612,9 @@ function onSvcBackendChange() {
   } else if (stype === 'runpod') {
     html += '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="RUNPOD_API_KEY" value="RUNPOD_API_KEY"></div>' +
       '<div class="muted" style="margin-left:148px;margin-bottom:6px">Key stored in OS keyring or env var. Models use endpoint_id or pod_id.</div>';
+  } else if (stype === 'runpod-public') {
+    html += '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="RUNPOD_API_KEY" value="RUNPOD_API_KEY"></div>' +
+      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Pre-deployed RunPod models (Flux, Whisper, etc.). No endpoint or pod needed.</div>';
   } else if (stype === 'openai') {
     html += '<div class="srow"><label>Base URL</label><input id="s-base_url" placeholder="https://api.groq.com/openai/v1" style="flex:1;min-width:260px"></div>' +
       '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="GROQ_API_KEY"></div>';
@@ -616,6 +635,8 @@ function buildBackendTable(defs) {
         if (b.mode === 'remote') settings.push('url: ' + esc(b.base_url || ''));
         else settings.push('exe: ' + esc(b.server_exe || ''), 'ports ' + (b.port_base || 8120) + '+', 'idle ' + (b.idle_timeout_s || 0) + 's');
       } else if (b.type === 'runpod') {
+        settings.push('key: ' + esc(b.api_key_env || ''));
+      } else if (b.type === 'runpod-public') {
         settings.push('key: ' + esc(b.api_key_env || ''));
       } else if (b.type === 'openai') {
         settings.push('url: ' + esc(b.base_url || ''), 'key: ' + esc(b.api_key_env || ''));
@@ -694,6 +715,9 @@ function saveBackend() {
   } else if (stype === 'runpod') {
     var api_key_env = document.getElementById('s-api_key_env');
     if (api_key_env) payload.api_key_env = api_key_env.value.trim();
+  } else if (stype === 'runpod-public') {
+    var api_key_env = document.getElementById('s-api_key_env');
+    if (api_key_env) payload.api_key_env = api_key_env.value.trim();
   } else if (stype === 'openai') {
     var base_url = document.getElementById('s-base_url');
     if (base_url) payload.base_url = base_url.value.trim();
@@ -726,6 +750,8 @@ function editBackend(name) {
     var el = document.getElementById('s-base_url'); if (el && b.base_url) el.value = b.base_url;
     el = document.getElementById('s-api_key_env'); if (el && b.api_key_env) el.value = b.api_key_env;
   } else if (stype === 'runpod') {
+    var el = document.getElementById('s-api_key_env'); if (el && b.api_key_env) el.value = b.api_key_env;
+  } else if (stype === 'runpod-public') {
     var el = document.getElementById('s-api_key_env'); if (el && b.api_key_env) el.value = b.api_key_env;
   } else if (stype === 'openai') {
     var el = document.getElementById('s-base_url'); if (el && b.base_url) el.value = b.base_url;
