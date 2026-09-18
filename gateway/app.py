@@ -1621,6 +1621,155 @@ async def admin_unload(payload: LoadPayload) -> Response:
     return {"unloaded": n, "loaded": engine.loaded_models()}
 
 
+# ── Anthropic Messages API (/v1/messages) ──────────────────────────────────
+
+def _anthropic_error(status: int, message: str,
+                     err_type: str = "invalid_request_error") -> Response:
+    """OpenAI-shaped errors won't do here — Anthropic clients expect this."""
+    return JSONResponse(status_code=status, content={
+        "type": "error",
+        "error": {"type": err_type, "message": message},
+    })
+
+
+def _blocks_to_text(content: Any) -> str:
+    """Anthropic content (string or block list) → plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _sse_event(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request) -> Response:
+    """Anthropic Messages API shim over the gateway's OpenAI surface.
+
+    Lets Anthropic-style clients (Workshop, Claude Code, LangChain
+    anthropic provider) talk to the gateway. Translates request →
+    /v1/chat/completions (self-call) → Anthropic response shape.
+    Text content only in v1; system accepted as string or block list.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _anthropic_error(400, "Invalid JSON body")
+
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return _anthropic_error(400, "model is required")
+
+    raw_msgs = body.get("messages") or []
+    if not raw_msgs:
+        return _anthropic_error(400, "messages is required")
+
+    # Translate messages: Anthropic → OpenAI
+    oai_messages: list[dict[str, Any]] = []
+    system = body.get("system") or ""
+    sys_text = system if isinstance(system, str) else _blocks_to_text(system)
+    if sys_text:
+        oai_messages.append({"role": "system", "content": sys_text})
+    for m in raw_msgs:
+        oai_messages.append({
+            "role": m.get("role", "user"),
+            "content": _blocks_to_text(m.get("content", "")),
+        })
+
+    max_tokens = int(body.get("max_tokens") or 1024)
+    stream = bool(body.get("stream"))
+    temperature = body.get("temperature")
+
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    keys = getattr(cfg, "gateway_keys", None) or []
+    client = AsyncOpenAI(
+        base_url=f"http://{cfg.bind}:{cfg.port}/v1",
+        api_key=keys[0] if keys else "benchmark",
+    )
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    if stream:
+        async def gen() -> AsyncIterator[bytes]:
+            out_tok = 0
+            yield _sse_event("message_start", {
+                "type": "message_start",
+                "message": {"id": msg_id, "type": "message", "role": "assistant",
+                            "model": model, "content": [],
+                            "usage": {"input_tokens": 0, "output_tokens": 0}},
+            })
+            yield _sse_event("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}})
+            try:
+                kwargs: dict[str, Any] = dict(model=model, messages=oai_messages,
+                                              max_tokens=max_tokens, stream=True)
+                if temperature is not None:
+                    kwargs["temperature"] = temperature
+                s = await client.chat.completions.create(**kwargs)
+                async for chunk in s:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    text = getattr(delta, "content", None) if delta else None
+                    if text:
+                        out_tok += 1
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta", "index": 0,
+                            "delta": {"type": "text_delta", "text": text}})
+            except Exception as e:  # noqa: BLE001 — stream must not die silently
+                yield _sse_event("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)}})
+            yield _sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": 0})
+            yield _sse_event("message_delta", {
+                "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": out_tok}})
+            yield _sse_event("message_stop", {"type": "message_stop"})
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    # Non-streaming
+    try:
+        kwargs: dict[str, Any] = dict(model=model, messages=oai_messages,
+                                      max_tokens=max_tokens)
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        resp = await client.chat.completions.create(**kwargs)
+    except Exception as e:  # noqa: BLE001 — surface upstream failure
+        return _anthropic_error(502, f"Upstream error: {e}", "api_error")
+
+    text_out = ""
+    usage = getattr(resp, "usage", None)
+    in_tok = (getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    out_tok = (getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    choices = getattr(resp, "choices", None) or []
+    if choices:
+        msg = getattr(choices[0], "message", None)
+        if msg is not None:
+            text_out = getattr(msg, "content", None) or ""
+
+    return JSONResponse({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text_out}],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": in_tok, "output_tokens": out_tok},
+    })
+
+
 # ── Console (Stage 5): page + config editor + stats + events ───────────────
 
 @app.get("/", response_class=HTMLResponse)
