@@ -2383,6 +2383,8 @@ class BenchmarkPayload(BaseModel):
     n: int = 1  # number of iterations (warmup + measured)
     stream: bool = False  # use streaming to measure TTFT
     max_tokens: int = 256
+    base_url: str = ""  # external OpenAI-compatible endpoint (empty = self)
+    api_key: str = ""  # API key for external endpoint
 
 
 @app.post("/admin/benchmark")
@@ -2392,6 +2394,9 @@ async def admin_benchmark(payload: BenchmarkPayload) -> Response:
     Measures: first-load time (if cold), TTFT (time to first token),
     tokens per second, total latency, and output token count.
     Returns structured results suitable for the Perf panel.
+
+    If base_url is set, benchmarks an external OpenAI-compatible endpoint.
+    Otherwise benchmarks the gateway itself.
     """
     cfg = get_gateway_config()
     cfg.maybe_reload()
@@ -2400,18 +2405,27 @@ async def admin_benchmark(payload: BenchmarkPayload) -> Response:
     if not model:
         return _error(400, "model is required", param="model")
 
-    # Verify model exists (configured or discovered)
-    engine = get_engine()
-    loaded = engine.loaded_models()
-    discovered = installed_ggufs(cfg.models_dir)
-    all_names = [m["alias"] for m in loaded] + [d["name"] for d in discovered]
-    # Also check aliases
-    for alias_name in cfg.aliases:
-        all_names.append(alias_name)
+    # Determine target endpoint
+    base_url = payload.base_url.strip().rstrip("/")
+    api_key = payload.api_key.strip() or None
+    is_external = bool(base_url)
 
-    if model not in all_names:
-        return _error(400, f"Model {model!r} not found. Available: {all_names[:10]}",
-                      param="model", code="model_not_found")
+    # Verify model exists only for local benchmarks
+    if not is_external:
+        engine = get_engine()
+        loaded = engine.loaded_models()
+        discovered = installed_ggufs(cfg.models_dir)
+        all_names = [m["alias"] for m in loaded] + [d["name"] for d in discovered]
+        # Also check aliases
+        for alias_name in cfg.aliases:
+            all_names.append(alias_name)
+
+        if model not in all_names:
+            return _error(400, f"Model {model!r} not found. Available: {all_names[:10]}",
+                          param="model", code="model_not_found")
+
+        base_url = f"http://{cfg.bind}:{cfg.port}/v1"
+        api_key = api_key or None
 
     results = []
     for i in range(payload.n):
@@ -2420,12 +2434,13 @@ async def admin_benchmark(payload: BenchmarkPayload) -> Response:
         first_token_ts = None
         token_count = 0
 
+        client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key or "benchmark",
+        )
+
         if payload.stream:
             # Streaming benchmark — measures TTFT
-            client = AsyncOpenAI(
-                base_url=f"http://{cfg.bind}:{cfg.port}/v1",
-                api_key="benchmark",
-            )
             try:
                 stream = await client.chat.completions.create(
                     model=model,
@@ -2452,10 +2467,6 @@ async def admin_benchmark(payload: BenchmarkPayload) -> Response:
                 continue
         else:
             # Non-streaming benchmark
-            client = AsyncOpenAI(
-                base_url=f"http://{cfg.bind}:{cfg.port}/v1",
-                api_key="benchmark",
-            )
             try:
                 resp = await client.chat.completions.create(
                     model=model,

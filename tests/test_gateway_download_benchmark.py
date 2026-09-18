@@ -264,3 +264,25 @@ def test_benchmark_aggregate_stats(wired, tmp_path, monkeypatch):
     assert "avg_tok_per_s" in agg
     assert "min_total_ms" in agg
     assert "max_total_ms" in agg
+
+
+def test_benchmark_external_endpoint(wired, tmp_path, monkeypatch):
+    """Benchmark an external OpenAI-compatible endpoint."""
+    mock_resp = MagicMock()
+    mock_resp.usage.completion_tokens = 42
+    mock_client = AsyncMock()
+    mock_client.chat.completions.create = AsyncMock(return_value=mock_resp)
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: mock_client)
+
+    cfgfile, cfg, engine = wired(_base_config(Path(tmp_path) / "test_model.gguf"))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/admin/benchmark", json={
+            "model": "gpt-4o",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "sk-test-key",
+            "n": 1,
+        })
+    assert r.status_code == 200
+    d = r.json()
+    assert d["successful"] == 1
+    assert d["results"][0]["tokens"] == 42

@@ -990,6 +990,8 @@ function showPerf(ui) {
 function buildBenchmarkWidget() {
   var html = '<div class="widget"><h3>Benchmark</h3>';
   html += '<div class="srow"><label>Model</label><input id="bm-model" placeholder="model alias" style="flex:1;min-width:260px"></div>';
+  html += '<div class="srow"><label>Base URL</label><input id="bm-base_url" placeholder="(empty = gateway self)" style="flex:1;min-width:260px"></div>';
+  html += '<div class="srow"><label>API Key</label><input id="bm-api_key" type="password" placeholder="(optional)" style="flex:1;min-width:260px"></div>';
   html += '<div class="srow"><label>Prompt</label><input id="bm-prompt" placeholder="Explain quantum computing in simple terms." style="flex:1;min-width:260px"></div>';
   html += '<div class="srow"><label>Iterations</label><input id="bm-n" type="number" min="1" value="1" style="width:80px"></div>';
   html += '<div class="srow"><label>Max tokens</label><input id="bm-max_tokens" type="number" min="1" value="256" style="width:80px"></div>';
@@ -1005,6 +1007,8 @@ function runBenchmark() {
   if (!model) { notify('✗ Model is required', true); return; }
   var payload = {
     model: model,
+    base_url: document.getElementById('bm-base_url').value.trim(),
+    api_key: document.getElementById('bm-api_key').value,
     prompt: document.getElementById('bm-prompt').value.trim() || "Explain quantum computing in simple terms.",
     n: parseInt(document.getElementById('bm-n').value) || 1,
     max_tokens: parseInt(document.getElementById('bm-max_tokens').value) || 256,
