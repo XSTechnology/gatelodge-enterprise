@@ -351,3 +351,218 @@ def test_messages_nonstream_closes_client(wired, tmp_path, monkeypatch):
     assert r.status_code == 200
     assert r.json()["content"][0]["text"] == "ok"
     assert closed["client"] == 1
+
+
+# ── tool calling (regression: the shim used to DROP the tools field —
+#    the model never saw tool definitions and answered "I don't have
+#    access to external tools" in plain text) ─────────────────────────────
+
+def _fake_chat_tool(name="get_weather", args='{"city": "Paris"}', text=None):
+    resp = MagicMock()
+    tc = MagicMock()
+    tc.id = "call_1"
+    tc.function = MagicMock()
+    tc.function.name = name
+    tc.function.arguments = args
+    msg = MagicMock()
+    msg.content = text
+    msg.tool_calls = [tc]
+    resp.choices = [MagicMock(message=msg)]
+    resp.usage.prompt_tokens = 10
+    resp.usage.completion_tokens = 5
+    client = AsyncMock()
+    client.chat.completions.create = AsyncMock(return_value=resp)
+    return client
+
+
+def _tools_body(**extra):
+    body = {
+        "model": "m", "max_tokens": 64,
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }],
+        "messages": [{"role": "user",
+                      "content": "What's the weather in Paris?"}],
+    }
+    body.update(extra)
+    return body
+
+
+def test_messages_tools_forwarded_and_tool_use_returned(wired, tmp_path, monkeypatch):
+    """Anthropic tools → OpenAI tools in the self-call; OpenAI
+    tool_calls → Anthropic tool_use blocks + stop_reason tool_use."""
+    client = _fake_chat_tool()
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json=_tools_body())
+    assert r.status_code == 200
+    sent = client.chat.completions.create.call_args.kwargs
+    assert sent["tools"] == [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }]
+    d = r.json()
+    assert d["stop_reason"] == "tool_use"
+    assert d["content"][0]["type"] == "tool_use"
+    assert d["content"][0]["id"] == "call_1"
+    assert d["content"][0]["name"] == "get_weather"
+    assert d["content"][0]["input"] == {"city": "Paris"}
+
+
+def test_messages_no_tools_field_means_no_tools_kwarg(wired, tmp_path, monkeypatch):
+    """Plain requests (no tools) must not send tools=None — the engine's
+    Home-LLM template guard retries on that shape."""
+    client = _fake_chat("hi there")
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert r.status_code == 200
+    sent = client.chat.completions.create.call_args.kwargs
+    assert "tools" not in sent
+
+
+def test_messages_tool_history_translated(wired, tmp_path, monkeypatch):
+    """Assistant tool_use → OpenAI tool_calls; user tool_result →
+    role="tool" messages, so agentic follow-up turns keep working."""
+    client = _fake_chat("It's sunny and 18C in Paris.")
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "m",
+            "tools": [{"name": "get_weather", "description": "w",
+                       "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "let me check"},
+                    {"type": "tool_use", "id": "call_1",
+                     "name": "get_weather", "input": {"city": "Paris"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1",
+                     "content": "sunny 18C"},
+                    {"type": "text", "text": "thanks"},
+                ]},
+            ],
+        })
+    assert r.status_code == 200
+    msgs = client.chat.completions.create.call_args.kwargs["messages"]
+    assert msgs[0] == {"role": "user", "content": "weather in Paris?"}
+    a = msgs[1]
+    assert a["role"] == "assistant"
+    assert a["content"] == "let me check"
+    assert a["tool_calls"][0]["id"] == "call_1"
+    assert a["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert json.loads(a["tool_calls"][0]["function"]["arguments"]) == {"city": "Paris"}
+    assert msgs[2] == {"role": "tool", "tool_call_id": "call_1",
+                       "content": "sunny 18C"}
+    assert msgs[3] == {"role": "user", "content": "thanks"}
+
+
+def _tool_stream_client():
+    """Self-call stream shaped like the embedded backend with tools:
+    raw JSON-convention text first, then the parsed tool_calls chunk."""
+    tc = MagicMock()
+    tc.index = 0
+    tc.id = "call_9"
+    tc.function = MagicMock()
+    tc.function.name = "get_weather"
+    tc.function.arguments = '{"city": "Paris"}'
+
+    def _chunk(text=None, tool_calls=None):
+        ch = MagicMock()
+        d = MagicMock()
+        d.content = text
+        d.tool_calls = tool_calls
+        ch.choices = [MagicMock(delta=d)]
+        return ch
+
+    chunks = [
+        _chunk(text='{"tool": "get_weather", "arguments": {"city": "Paris"}}'),
+        _chunk(tool_calls=[tc]),
+    ]
+
+    class FakeStream:
+        def __init__(self):
+            self._it = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def close(self):
+            pass
+
+    client = AsyncMock()
+    recorded: dict = {}
+
+    async def _create(**kwargs):
+        recorded.update(kwargs)
+        return FakeStream()
+
+    client.chat.completions.create = _create
+    client.close = AsyncMock()
+    return client, recorded
+
+
+def test_messages_streaming_tool_use(wired, tmp_path, monkeypatch):
+    """Streaming: the JSON-convention text is suppressed and a proper
+    tool_use block (content_block_start/input_json_delta/stop) is
+    emitted with stop_reason tool_use."""
+    client, recorded = _tool_stream_client()
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json=_tools_body(stream=True))
+    assert r.status_code == 200
+    # tools reached the self-call
+    assert recorded["tools"][0]["function"]["name"] == "get_weather"
+    # the raw JSON-convention text was suppressed
+    assert '{"tool": "get_weather"' not in r.text
+    # tool_use block events present, in order
+    assert '"type": "tool_use"' in r.text
+    assert '"name": "get_weather"' in r.text
+    assert "input_json_delta" in r.text
+    assert '\\"city\\": \\"Paris\\"' in r.text
+    assert '"stop_reason": "tool_use"' in r.text
+    assert "message_stop" in r.text
+
+
+def test_messages_streaming_prose_not_suppressed(wired, tmp_path, monkeypatch):
+    """Prose answers must keep streaming live — the hold-back only
+    engages when the first content starts with '{'."""
+    client, _closed = _closeable_client(("The weather", " is sunny."))
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json=_tools_body(stream=True))
+    assert r.status_code == 200
+    assert "The weather" in r.text
+    assert "is sunny" in r.text
+    assert '"stop_reason": "end_turn"' in r.text
+    assert "tool_use" not in r.text

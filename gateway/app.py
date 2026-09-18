@@ -1691,6 +1691,88 @@ def _blocks_to_text(content: Any) -> str:
     return ""
 
 
+def _anthropic_tools_to_openai(tools: Any) -> list[dict[str, Any]]:
+    """Anthropic tool definitions → OpenAI function tools."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return out
+    for t in tools:
+        if not isinstance(t, dict) or not t.get("name"):
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": str(t["name"]),
+                "description": str(t.get("description") or ""),
+                "parameters": t.get("input_schema")
+                or {"type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
+def _anthropic_messages_to_openai(raw_msgs: list) -> list[dict[str, Any]]:
+    """Anthropic messages (tool_use / tool_result blocks) → OpenAI.
+
+    - assistant tool_use blocks → assistant tool_calls
+    - user tool_result blocks → role="tool" messages (emitted before the
+      turn's plain text — OpenAI convention: tool output follows the
+      assistant call, the next user text comes after)
+    - text blocks join into the message content
+    """
+    out: list[dict[str, Any]] = []
+    for m in raw_msgs:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if not isinstance(content, list):
+            out.append({"role": role, "content":
+                        content if isinstance(content, str)
+                        else _blocks_to_text(content)})
+            continue
+        texts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                if b.get("text"):
+                    texts.append(b["text"])
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": b.get("id") or f"call_{b.get('name', 'x')}",
+                    "type": "function",
+                    "function": {
+                        "name": str(b.get("name") or ""),
+                        "arguments": json.dumps(b.get("input") or {}),
+                    },
+                })
+            elif btype == "tool_result":
+                inner = b.get("content")
+                text = inner if isinstance(inner, str) else _blocks_to_text(inner)
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": str(b.get("tool_use_id") or ""),
+                    "content": text or "",
+                })
+        if role == "assistant":
+            msg: dict[str, Any] = {"role": "assistant"}
+            joined = "\n".join(texts)
+            if tool_calls:
+                if joined:
+                    msg["content"] = joined
+                msg["tool_calls"] = tool_calls
+            else:
+                msg["content"] = joined
+            out.append(msg)
+        else:
+            out.extend(tool_results)
+            if texts:
+                out.append({"role": role, "content": "\n".join(texts)})
+    return out
+
+
 def _sse_event(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
@@ -1715,7 +1797,8 @@ async def anthropic_messages(request: Request) -> Response:
     Lets Anthropic-style clients (Workshop, Claude Code, LangChain
     anthropic provider) talk to the gateway. Translates request →
     /v1/chat/completions (self-call) → Anthropic response shape.
-    Text content only in v1; system accepted as string or block list.
+    Text AND tool_use content: tools, tool_use blocks and tool_result
+    history are translated both ways; system as string or block list.
     """
     try:
         body = await request.json()
@@ -1730,17 +1813,14 @@ async def anthropic_messages(request: Request) -> Response:
     if not raw_msgs:
         return _anthropic_error(400, "messages is required")
 
-    # Translate messages: Anthropic → OpenAI
+    # Translate messages: Anthropic → OpenAI (tool_use / tool_result aware)
     oai_messages: list[dict[str, Any]] = []
     system = body.get("system") or ""
     sys_text = system if isinstance(system, str) else _blocks_to_text(system)
     if sys_text:
         oai_messages.append({"role": "system", "content": sys_text})
-    for m in raw_msgs:
-        oai_messages.append({
-            "role": m.get("role", "user"),
-            "content": _blocks_to_text(m.get("content", "")),
-        })
+    oai_messages.extend(_anthropic_messages_to_openai(raw_msgs))
+    tools = _anthropic_tools_to_openai(body.get("tools"))
 
     max_tokens = int(body.get("max_tokens") or 1024)
     stream = bool(body.get("stream"))
@@ -1815,23 +1895,102 @@ async def anthropic_messages(request: Request) -> Response:
                                               max_tokens=max_tokens, stream=True)
                 if temperature is not None:
                     kwargs["temperature"] = temperature
+                if tools:
+                    kwargs["tools"] = tools
                 s = await client.chat.completions.create(**kwargs)
+                # JSON-convention backends stream the raw tool JSON as
+                # text BEFORE the parsed tool_calls chunk arrives. Hold
+                # the very first text back until we know it isn't a
+                # `{...}` tool call — prose keeps streaming live, tool
+                # JSON gets suppressed and re-emitted as tool_use.
+                mode: str | None = None   # None=undecided, "text", "tool"
+                held = ""
+                tc_acc: dict[int, dict] = {}
                 async for chunk in s:
                     choices = getattr(chunk, "choices", None) or []
                     if not choices:
                         continue
                     delta = getattr(choices[0], "delta", None)
-                    text = getattr(delta, "content", None) if delta else None
-                    if text:
+                    if delta is None:
+                        continue
+                    tcs = getattr(delta, "tool_calls", None)
+                    if isinstance(tcs, list):
+                        for tc in tcs:
+                            idx = getattr(tc, "index", 0) or 0
+                            slot = tc_acc.setdefault(
+                                idx, {"id": "", "name": "", "args": ""})
+                            tc_id = getattr(tc, "id", None)
+                            if tc_id:
+                                slot["id"] = tc_id
+                            fn = getattr(tc, "function", None)
+                            if fn is not None:
+                                name = getattr(fn, "name", None)
+                                if name:
+                                    slot["name"] = name
+                                slot["args"] += (getattr(fn, "arguments", None)
+                                                 or "")
+                    text = getattr(delta, "content", None)
+                    if not text:
+                        continue
+                    if mode == "text":
                         out_tok += 1
                         yield _sse_event("content_block_delta", {
                             "type": "content_block_delta", "index": 0,
                             "delta": {"type": "text_delta", "text": text}})
+                    elif mode is None:
+                        held += text
+                        stripped = held.lstrip()
+                        if not stripped:
+                            continue
+                        if stripped[0] == "{":
+                            mode = "tool"   # suppress; tool_use follows
+                        else:
+                            mode = "text"
+                            out_tok += 1
+                            yield _sse_event("content_block_delta", {
+                                "type": "content_block_delta", "index": 0,
+                                "delta": {"type": "text_delta", "text": held}})
+                            held = ""
+                    # mode == "tool": swallow the JSON-convention text
+                # Flush anything still held: either undecided whitespace/
+                # short prose, or JSON-looking text the engine never
+                # parsed into a tool call — show it, don't eat it.
+                if held and (mode != "tool" or not tc_acc):
+                    out_tok += 1
+                    yield _sse_event("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": held}})
                 yield _sse_event("content_block_stop", {
                     "type": "content_block_stop", "index": 0})
-                yield _sse_event("message_delta", {
-                    "type": "message_delta", "delta": {"stop_reason": "end_turn"},
-                    "usage": {"output_tokens": out_tok}})
+                if tc_acc:
+                    block = 1
+                    for idx in sorted(tc_acc):
+                        slot = tc_acc[idx]
+                        try:
+                            json.loads(slot["args"] or "{}")
+                            partial = slot["args"] or "{}"
+                        except (json.JSONDecodeError, ValueError):
+                            partial = json.dumps({"_raw": slot["args"]})
+                        yield _sse_event("content_block_start", {
+                            "type": "content_block_start", "index": block,
+                            "content_block": {"type": "tool_use",
+                                              "id": slot["id"] or f"toolu_{idx}",
+                                              "name": slot["name"],
+                                              "input": {}}})
+                        yield _sse_event("content_block_delta", {
+                            "type": "content_block_delta", "index": block,
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": partial}})
+                        yield _sse_event("content_block_stop", {
+                            "type": "content_block_stop", "index": block})
+                        block += 1
+                    yield _sse_event("message_delta", {
+                        "type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                        "usage": {"output_tokens": out_tok}})
+                else:
+                    yield _sse_event("message_delta", {
+                        "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": out_tok}})
                 yield _sse_event("message_stop", {"type": "message_stop"})
             except Exception as e:  # noqa: BLE001 — stream must not die silently
                 yield _sse_event("error", {
@@ -1869,6 +2028,8 @@ async def anthropic_messages(request: Request) -> Response:
                                       max_tokens=max_tokens)
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if tools:
+            kwargs["tools"] = tools
         resp = await client.chat.completions.create(**kwargs)
     except Exception as e:  # noqa: BLE001 — surface upstream failure
         return _anthropic_error(502, f"Upstream error: {e}", "api_error")
@@ -1885,18 +2046,46 @@ async def anthropic_messages(request: Request) -> Response:
     in_tok = (getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
     out_tok = (getattr(usage, "completion_tokens", 0) or 0) if usage else 0
     choices = getattr(resp, "choices", None) or []
+    tool_blocks: list[dict[str, Any]] = []
     if choices:
         msg = getattr(choices[0], "message", None)
         if msg is not None:
             text_out = getattr(msg, "content", None) or ""
+            tcs = getattr(msg, "tool_calls", None)
+            if isinstance(tcs, list):
+                for tc in tcs:
+                    fn = getattr(tc, "function", None)
+                    if fn is None:
+                        continue
+                    raw_args = getattr(fn, "arguments", None) or "{}"
+                    try:
+                        args = json.loads(raw_args)
+                    except (json.JSONDecodeError, ValueError):
+                        args = None
+                    if not isinstance(args, dict):
+                        args = {"_raw": raw_args}
+                    tool_blocks.append({
+                        "type": "tool_use",
+                        "id": getattr(tc, "id", None)
+                        or f"toolu_{len(tool_blocks)}",
+                        "name": getattr(fn, "name", None) or "",
+                        "input": args,
+                    })
+
+    content: list[dict[str, Any]] = []
+    if text_out and text_out.strip():
+        content.append({"type": "text", "text": text_out})
+    content.extend(tool_blocks)
+    if not content:
+        content = [{"type": "text", "text": ""}]
 
     return JSONResponse({
         "id": msg_id,
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": text_out}],
+        "content": content,
         "model": model,
-        "stop_reason": "end_turn",
+        "stop_reason": "tool_use" if tool_blocks else "end_turn",
         "stop_sequence": None,
         "usage": {"input_tokens": in_tok, "output_tokens": out_tok},
     })
