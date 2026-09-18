@@ -64,7 +64,7 @@ def wired(tmp_path, monkeypatch):
         engine = gw_models.EmbeddedEngine(cfg)
         monkeypatch.setattr(gw_models, "_ENGINE", engine)
         monkeypatch.setattr(gw_app, "_LOG_PATH", tmp_path / "gateway_log.jsonl")
-        monkeypatch.setattr(gw_app, "_active_chats", 0)
+        gw_app._chat_slots.clear()
         return cfgfile, cfg, engine
     return _wire
 

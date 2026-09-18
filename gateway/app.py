@@ -81,6 +81,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import itertools
 import json
 import logging
 import struct
@@ -115,14 +116,56 @@ from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="0.6.0-v2")
+app = FastAPI(title="LLM Gateway", version="0.6.1")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
 
-# Concurrent chat completions in flight (queue admission control — the
-# event loop is single threaded, plain int arithmetic is safe)
-_active_chats = 0
+# Concurrent chat completions in flight (queue admission control).
+# Keyed registry (slot id → admission time) instead of a bare counter:
+# a stream whose client disconnects mid-flight can leave its response
+# generator suspended at a yield without ever running its finally —
+# with a plain int that slot leaked forever and the gateway wedged
+# into a permanent 429 wall (observed live). Every admission check
+# first evicts slots held longer than the stale threshold, so an
+# abandoned stream can block new requests for at most that long.
+_chat_slots: dict[int, float] = {}
+_chat_slot_seq = itertools.count(1)
+
+
+def _acquire_chat_slot() -> int:
+    sid = next(_chat_slot_seq)
+    _chat_slots[sid] = time.monotonic()
+    return sid
+
+
+def _release_chat_slot(sid: int) -> None:
+    _chat_slots.pop(sid, None)  # idempotent — double release is a no-op
+
+
+def _slot_stale_s(cfg: Any) -> float:
+    """How long a slot may legitimately be held. Real requests finish
+    within the queue timeout (streaming ones within a couple of them);
+    anything held longer is a zombie from an abandoned/cancelled
+    stream or a backend that hung."""
+    try:
+        q = float((cfg.queue or {}).get("timeout_s") or 120)
+    except Exception:  # noqa: BLE001 — config oddities must not wedge admission
+        q = 120.0
+    return max(600.0, q * 2.0)
+
+
+def _reap_stale_chat_slots(cfg: Any) -> int:
+    """Evict zombie slots; returns how many were dropped."""
+    now = time.monotonic()
+    stale_s = _slot_stale_s(cfg)
+    stale = [sid for sid, t0 in _chat_slots.items() if now - t0 > stale_s]
+    for sid in stale:
+        _chat_slots.pop(sid, None)
+    if stale:
+        logger.warning("admission: reaped %d stale chat slot(s) held >%.0fs "
+                       "(abandoned streams or hung backends)", len(stale), stale_s)
+    return len(stale)
 
 
 # ── In-memory event ring (console Logs pane) ───────────────────────────────
@@ -793,7 +836,6 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatRequest) -> Response:
-    global _active_chats
     cfg = get_gateway_config()
     cfg.maybe_reload()
     t0 = time.perf_counter()
@@ -801,11 +843,12 @@ async def chat_completions(body: ChatRequest) -> Response:
     # Queue admission: capacity = resident instances (min 1) + running
     # llama-server children (they batch concurrently) + max_waiting.
     # Over-limit requests get 429 + Retry-After instead of piling onto the
-    # serialized per-instance locks.
+    # serialized per-instance locks. Stale (zombie) slots are evicted first.
     engine = get_engine()
+    _reap_stale_chat_slots(cfg)
     capacity = (max(1, len(engine.loaded_models()))
                 + llamaserver.running_count() + cfg.queue["max_waiting"])
-    if _active_chats >= capacity:
+    if len(_chat_slots) >= capacity:
         _log_request(body.model, "", body.stream,
                      int((time.perf_counter() - t0) * 1000), {}, 429)
         return _error(429, "gateway busy — too many concurrent requests, "
@@ -831,10 +874,10 @@ async def chat_completions(body: ChatRequest) -> Response:
         # Streaming executes the PRIMARY entry only — hedge racing is a
         # non-streaming feature (first-completion-wins has no stream analog
         # short of first-token hedging, which is a follow-up).
-        _active_chats += 1
-        return _stream_chat(requested, entries[0], body)
+        slot = _acquire_chat_slot()
+        return _stream_chat(requested, entries[0], body, slot)
 
-    _active_chats += 1
+    slot = _acquire_chat_slot()
     try:
         try:
             resp, winner, model_key = await _exec_chain(
@@ -852,18 +895,13 @@ async def chat_completions(body: ChatRequest) -> Response:
                      resp.get("usage") or {}, 200)
         return JSONResponse(resp)
     finally:
-        _release_chat_slot()
-
-
-def _release_chat_slot() -> None:
-    global _active_chats
-    _active_chats = max(0, _active_chats - 1)
+        _release_chat_slot(slot)
 
 
 # ── POST /v1/chat/completions (stream) ─────────────────────────────────────
 
 def _stream_chat(requested: str, entry: tuple[str, str],
-                 body: ChatRequest) -> StreamingResponse:
+                 body: ChatRequest, slot: int) -> StreamingResponse:
     """SSE bridge — embedded engine (think-hold-back), llama-server
     subprocess (native SSE passthrough), or cloud passthrough.
 
@@ -932,7 +970,6 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         logger.info("gateway stream ok (%s / %s) in %dms [tool]",
                                     backend_name, model_key, ms)
                         _log_request(requested, backend_name, True, ms, {}, 200)
-                        _release_chat_slot()
                         return
                 yield _chunk({}, finish="stop")
             elif (backend.get("type") == "llama-server"
@@ -1105,7 +1142,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             yield "data: [DONE]\n\n"
             _log_request(requested, backend_name, True, ms, {}, 502)
         finally:
-            _release_chat_slot()
+            _release_chat_slot(slot)
 
     return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -1136,7 +1173,6 @@ def _b64_embeddings(data: list[dict[str, Any]]) -> None:
 async def embeddings(body: EmbeddingRequest) -> Response:
     """OpenAI embeddings — embedded GGUFs (config-defined, separate
     pooling instances) or cloud passthrough (remote decides the model)."""
-    global _active_chats
     cfg = get_gateway_config()
     cfg.maybe_reload()
     t0 = time.perf_counter()
@@ -1162,16 +1198,17 @@ async def embeddings(body: EmbeddingRequest) -> Response:
     # Same admission gate as chat — embedding requests serialize on their
     # instance lock, so an unbounded pile-up would starve everything else.
     engine = get_engine()
+    _reap_stale_chat_slots(cfg)
     capacity = (max(1, len(engine.loaded_models()))
                 + llamaserver.running_count() + cfg.queue["max_waiting"])
-    if _active_chats >= capacity:
+    if len(_chat_slots) >= capacity:
         _log_request(requested, "", False,
                      int((time.perf_counter() - t0) * 1000), {}, 429)
         return _error(429, "gateway busy — too many concurrent requests, "
                       "retry shortly", err_type="rate_limit_error",
                       code="rate_limited", headers={"Retry-After": "1"})
 
-    _active_chats += 1
+    slot = _acquire_chat_slot()
     try:
         backend = cfg.backends[backend_name]
         if backend.get("type") == "embedded":
@@ -1215,7 +1252,7 @@ async def embeddings(body: EmbeddingRequest) -> Response:
         return _error(502, str(e), err_type="server_error",
                       code="execution_error")
     finally:
-        _release_chat_slot()
+        _release_chat_slot(slot)
 
 
 # ── POST /v1/completions (legacy text completions) ─────────────────────────
@@ -1239,7 +1276,6 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     serverless runsync via the worker's generate mode ({"prompt": ...}),
     and cloud/remote via client.completions passthrough. Executes the
     PRIMARY chain entry only (no hedge)."""
-    global _active_chats
     cfg = get_gateway_config()
     cfg.maybe_reload()
     t0 = time.perf_counter()
@@ -1260,9 +1296,10 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     btype = backend.get("type")
 
     engine = get_engine()
+    _reap_stale_chat_slots(cfg)
     capacity = (max(1, len(engine.loaded_models()))
                 + llamaserver.running_count() + cfg.queue["max_waiting"])
-    if _active_chats >= capacity:
+    if len(_chat_slots) >= capacity:
         _log_request(requested, "", body.stream,
                      int((time.perf_counter() - t0) * 1000), {}, 429)
         return _error(429, "gateway busy — too many concurrent requests, "
@@ -1274,7 +1311,7 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     if not any(p.strip() for p in prompts):
         return _error(400, "prompt must not be empty", param="prompt")
 
-    _active_chats += 1
+    slot = _acquire_chat_slot()
     try:
         # embedded — llama_cpp raw completion (worker pool checkout)
         if btype == "embedded":
@@ -1308,7 +1345,7 @@ async def legacy_completions(body: CompletionRequest) -> Response:
                         _log_request(requested, backend_name, True,
                                      int((time.perf_counter() - t0) * 1000), {}, 502)
                     finally:
-                        _release_chat_slot()
+                        _release_chat_slot(slot)
                 return StreamingResponse(_gen(), media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache",
                                                   "X-Accel-Buffering": "no"})
@@ -1352,7 +1389,7 @@ async def legacy_completions(body: CompletionRequest) -> Response:
                         _log_request(requested, backend_name, True,
                                      int((time.perf_counter() - t0) * 1000), {}, 502)
                     finally:
-                        _release_chat_slot()
+                        _release_chat_slot(slot)
                 return StreamingResponse(_gen_ls(), media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache",
                                                   "X-Accel-Buffering": "no"})
@@ -1466,7 +1503,7 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         return _error(502, str(e), err_type="server_error",
                       code="execution_error")
     finally:
-        _release_chat_slot()
+        _release_chat_slot(slot)
 
 
 # ── GET /healthz ───────────────────────────────────────────────────────────

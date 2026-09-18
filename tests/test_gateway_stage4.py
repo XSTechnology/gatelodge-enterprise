@@ -83,7 +83,7 @@ def wired(tmp_path, monkeypatch):
         engine = gw_models.EmbeddedEngine(cfg)
         monkeypatch.setattr(gw_models, "_ENGINE", engine)
         monkeypatch.setattr(gw_app, "_LOG_PATH", tmp_path / "gateway_log.jsonl")
-        monkeypatch.setattr(gw_app, "_active_chats", 0)
+        gw_app._chat_slots.clear()
         return cfgfile, cfg, engine
     return _wire
 
@@ -262,7 +262,7 @@ async def test_queue_429_when_over_capacity(wired, gguf):
             assert second.json()["error"]["code"] == "rate_limited"
             r1 = await first
             assert r1.status_code == 200
-    assert gw_app._active_chats == 0  # slot released
+    assert not gw_app._chat_slots  # slot released
 
 
 async def test_queue_admits_within_capacity(wired, gguf):
@@ -284,4 +284,91 @@ async def test_queue_admits_within_capacity(wired, gguf):
             assert second.status_code == 200
             r1 = await first
             assert r1.status_code == 200
-    assert gw_app._active_chats == 0
+    assert not gw_app._chat_slots
+
+
+# ── zombie slot reaping (regression: abandoned streams used to wedge
+#    the admission counter into a permanent 429 wall) ──────────────────────
+
+async def test_stale_slot_reaped_by_next_request(wired, gguf):
+    """A slot held past the stale threshold (abandoned stream / hung
+    backend) is evicted by the next admission check — the gateway
+    recovers instead of 429ing forever."""
+    wired(_config(gguf, max_waiting=0))  # capacity 1
+    # Simulate an abandoned stream: acquired, never released, aged out.
+    sid = gw_app._acquire_chat_slot()
+    gw_app._chat_slots[sid] -= gw_app._slot_stale_s(None) + 60.0
+    assert len(gw_app._chat_slots) == 1
+
+    transport = httpx.ASGITransport(app=gw_app.app)
+    with _fake_llama():
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as client:
+            r = await client.post(
+                "/v1/chat/completions",
+                json={"model": "fast",
+                      "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200  # zombie evicted, not 429
+    assert not gw_app._chat_slots  # only the live request's slot, released
+
+
+async def test_fresh_slot_not_reaped(wired, gguf):
+    """A slot held for less than the stale threshold still counts —
+    the reaper must not over-release in-flight requests."""
+    wired(_config(gguf, max_waiting=0))  # capacity 1
+    sid = gw_app._acquire_chat_slot()  # fresh, still "in flight"
+    try:
+        transport = httpx.ASGITransport(app=gw_app.app)
+        with _fake_llama():
+            async with httpx.AsyncClient(transport=transport,
+                                         base_url="http://test") as client:
+                r = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "fast",
+                          "messages": [{"role": "user", "content": "hi"}]})
+                assert r.status_code == 429  # capacity genuinely taken
+    finally:
+        gw_app._release_chat_slot(sid)
+    assert not gw_app._chat_slots
+
+
+async def test_stream_slot_released_on_backend_error(wired, gguf):
+    """A streaming request whose backend raises mid-stream releases its
+    slot in the generator finally (the 502 path observed live)."""
+    wired(_config(gguf, max_waiting=0))
+
+    @contextmanager
+    def _boom_llama():
+        mod = types.ModuleType("llama_cpp")
+
+        class BoomLlama:
+            def __init__(self, **kwargs):
+                pass
+
+            def create_chat_completion(self, **kwargs):
+                raise RuntimeError("prompt tokens (999) exceed context "
+                                   "window of 4096")
+
+        mod.Llama = BoomLlama
+        real = sys.modules.get("llama_cpp")
+        sys.modules["llama_cpp"] = mod
+        try:
+            yield []
+        finally:
+            if real is not None:
+                sys.modules["llama_cpp"] = real
+            else:
+                sys.modules.pop("llama_cpp", None)
+
+    transport = httpx.ASGITransport(app=gw_app.app)
+    with _boom_llama():
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as client:
+            async with client.stream(
+                    "POST", "/v1/chat/completions",
+                    json={"model": "fast", "stream": True,
+                          "messages": [{"role": "user", "content": "hi"}]}) as r:
+                assert r.status_code == 200  # SSE headers already sent
+                body = (await r.aread()).decode()
+            assert "exceed context" in body  # error surfaced in-stream
+    assert not gw_app._chat_slots  # slot released despite mid-stream error
