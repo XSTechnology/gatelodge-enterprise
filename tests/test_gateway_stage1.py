@@ -329,7 +329,7 @@ def test_engine_unload_and_loaded_models(wired, gguf):
         engine._get_instance("smart")
         assert len(engine.loaded_models()) == 2
         assert {m["alias"] for m in engine.loaded_models()} == {"fast", "smart"}
-        assert engine.loaded_models()[0]["role"] == "gateway"
+        assert engine.loaded_models()[0]["role"] == "chat"
         assert engine.unload("fast") == 1
         assert {m["alias"] for m in engine.loaded_models()} == {"smart"}
         assert engine.is_loaded()

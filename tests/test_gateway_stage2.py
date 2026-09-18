@@ -320,7 +320,7 @@ def test_healthz(wired, gguf, monkeypatch):
         assert body["discovered_models"] == 0  # tmp models_dir is empty
         assert body["loaded_count"] == 1
         assert body["loaded"][0]["alias"] == "fast"
-        assert body["loaded"][0]["role"] == "gateway"
+        assert body["loaded"][0]["role"] == "chat"
         assert body["loaded"][0]["n_ctx"] == 1024
         gpu = body["gpus"][0]
         assert gpu["free_mb"] == 0  # max(24564 - 25000, 0)

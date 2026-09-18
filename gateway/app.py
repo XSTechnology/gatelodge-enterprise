@@ -1751,13 +1751,18 @@ async def anthropic_messages(request: Request) -> Response:
 
     # Anthropic-style clients send their own model names (claude-*, etc.)
     # which don't exist here. Resolve to a known gateway model; prefer
-    # loaded (resident) models, then configured backend models, then
-    # discovered GGUF stems, then aliases. Without this the self-call
-    # 400s (model_not_found) and the shim surfaces a confusing 502.
+    # loaded (resident) models — largest context first, so a long-prompt
+    # client (Workshop's session handoff is ~11.6k tokens) never lands on
+    # a small-ctx instance merely because it was loaded first — then
+    # configured backend models, then discovered GGUF stems, then aliases.
+    # Without this the self-call 400s (model_not_found) and the shim
+    # surfaces a confusing 502.
     candidates: list[str] = []
     engine = get_engine()
     try:
-        candidates += [m["alias"] for m in engine.loaded_models()]
+        loaded = sorted(engine.loaded_models(),
+                        key=lambda m: m.get("n_ctx") or 0, reverse=True)
+        candidates += [m["alias"] for m in loaded]
     except Exception:  # noqa: BLE001 — resolution must never block the call
         pass
     for b in (cfg.backends or {}).values():

@@ -226,6 +226,31 @@ def test_messages_unknown_model_falls_back(wired, tmp_path, monkeypatch):
     assert r.json()["model"] == "m"
 
 
+def test_messages_fallback_prefers_largest_ctx(wired, tmp_path, monkeypatch):
+    """Regression: the fallback used to take loaded models in insertion
+    order — a small-ctx instance loaded FIRST won for unknown model
+    names, and Workshop's ~11.6k-token session-handoff prompt overflowed
+    it. The largest-context loaded model must win instead."""
+    client = _fake_chat("ok")
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    _, cfg, engine = wired(_cfg(tmp_path))
+    # insertion order mimics the live bug: raw-name 27B@4096 loaded
+    # before pool@32768
+    monkeypatch.setattr(engine, "loaded_models", lambda: [
+        {"alias": "Qwen3.8-27B-Uncensored-Q4_K_M", "n_ctx": 4096},
+        {"alias": "pool", "n_ctx": 32768},
+    ])
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert r.status_code == 200
+    sent = client.chat.completions.create.call_args.kwargs
+    assert sent["model"] == "pool"
+    assert r.json()["model"] == "pool"
+
+
 # ── self-call hygiene (regression: unclosed streams leaked the inner
 #    request's worker checkout — a vanished client wedged the model) ──────
 

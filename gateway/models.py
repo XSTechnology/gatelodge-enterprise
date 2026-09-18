@@ -660,9 +660,11 @@ class EmbeddedEngine:
         """Currently loaded instances, Ollama-ps shaped (for /healthz in
         Stage 2 and the console in Stage 5). Pooled models with more than
         one worker carry a worker index; embedding instances carry
-        role 'embed'."""
+        role 'embed'. Chat pools report role 'chat' — matching what the
+        console's configured-models table and /v1/models show, so the
+        loaded-vs-configured tables agree."""
 
-        def _entry(inst: _Instance, role: str = "gateway",
+        def _entry(inst: _Instance, role: str = "chat",
                    worker: int | None = None) -> dict[str, Any]:
             try:
                 size = Path(inst.path).stat().st_size
