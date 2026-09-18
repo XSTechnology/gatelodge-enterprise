@@ -794,6 +794,102 @@ class EmbeddedEngine:
             out.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
         return out
 
+    # ── context-window fitting ──────────────────────────────────────────
+    # llama-cpp raises "Requested tokens (N) exceed context window" on
+    # overflow — it does NOT truncate. Agent clients that resend full
+    # history (Workshop sessions reach 150k+ tokens) die mid-stream
+    # without this; trim oldest non-system messages to fit instead.
+
+    _FIXED_OVERHEAD = 64    # chat-template fixed overhead, tokens
+    _PER_MSG_OVERHEAD = 16  # per-message template wrappers, tokens
+    _TRIM_NOTE = ("\n\n[context note: earlier conversation history was "
+                  "truncated to fit the context window]")
+
+    @staticmethod
+    def _count_tokens(inst: "_Instance", text: str) -> int:
+        """Exact count via the instance's tokenizer; ~chars/4 fallback.
+
+        The fallback keeps this testable with fake Llamas (and safe if
+        a llama-cpp build lacks tokenize) — it only needs to be close,
+        the budget carries the safety margin.
+        """
+        tok = getattr(getattr(inst, "llama", None), "tokenize", None)
+        if callable(tok):
+            data = text.encode("utf-8", "ignore")
+            try:
+                return len(tok(data, add_bos=False))
+            except TypeError:
+                try:
+                    return len(tok(data))
+                except Exception:  # noqa: BLE001 — fall back below
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+        return max(1, len(text) // 4)
+
+    @staticmethod
+    def _fit_messages(inst: "_Instance", messages: list[dict[str, Any]],
+                      max_tokens: int | None) -> list[dict[str, Any]]:
+        """Drop oldest non-system messages until the prompt fits n_ctx.
+
+        Keeps every system message (instructions + tool definitions) and
+        the newest turns. Returns the message list unchanged when it
+        already fits. Raises EmbeddedLLMError when even system + the
+        newest message exceed the window — nothing left to drop.
+        """
+        raw = getattr(getattr(inst, "llama", None), "n_ctx", 0)
+        n_ctx = int(raw() if callable(raw) else (raw or 0)) or 4096
+        reserve = min(int(max_tokens or 2048), max(256, n_ctx // 4))
+        budget = n_ctx - reserve - EmbeddedEngine._FIXED_OVERHEAD
+
+        def _msg_tokens(m: dict[str, Any]) -> int:
+            n = EmbeddedEngine._PER_MSG_OVERHEAD
+            c = m.get("content")
+            if isinstance(c, list):
+                c = json.dumps(c)
+            if isinstance(c, str) and c:
+                n += EmbeddedEngine._count_tokens(inst, c)
+            for tc in m.get("tool_calls") or []:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                n += EmbeddedEngine._count_tokens(
+                    inst, (fn.get("name") or "") + (fn.get("arguments") or ""))
+            return n
+
+        counts = [_msg_tokens(m) for m in messages]
+        total = sum(counts)
+        if total <= budget:
+            return messages
+
+        sys_idx = [i for i, m in enumerate(messages) if m.get("role") == "system"]
+        sys_cost = sum(counts[i] for i in sys_idx)
+        nonsys = [i for i in range(len(messages)) if i not in set(sys_idx)]
+
+        kept: list[int] = []
+        acc = sys_cost
+        for i in reversed(nonsys):
+            if acc + counts[i] > budget:
+                break
+            kept.append(i)
+            acc += counts[i]
+        if not kept:
+            need = (sys_cost + counts[nonsys[-1]]) if nonsys else sys_cost
+            raise EmbeddedLLMError(
+                f"prompt ({total} tokens) exceeds context window ({n_ctx}) "
+                f"even after trimming — system + newest message alone need "
+                f"{need} tokens (budget {budget})")
+        kept.reverse()
+        logger.warning("prompt trimmed %d→%d tokens for %s (n_ctx %d, "
+                       "reserve %d, dropped %d oldest messages)",
+                       total, acc, getattr(inst, "name", "?"), n_ctx,
+                       reserve, len(nonsys) - len(kept))
+
+        out = ([dict(messages[i]) for i in sys_idx]
+               + [dict(messages[i]) for i in kept])
+        if sys_idx:
+            first = out[0]
+            first["content"] = (first.get("content") or "") + EmbeddedEngine._TRIM_NOTE
+        return out
+
     def _completion_sync(self, inst: _Instance, messages: list[dict], kwargs: dict) -> tuple[_Message, dict[str, int]]:
         try:
             out = inst.llama.create_chat_completion(messages=messages, **kwargs)
@@ -833,6 +929,13 @@ class _CompletionsEndpoint:
         temperature = kwargs.get("temperature")
 
         inst = await self._engine._acquire(model_name)
+        # Fit to the context window BEFORE anything else: llama-cpp
+        # errors on overflow instead of truncating, so a full-history
+        # agent session would die mid-stream ("Requested tokens exceed
+        # context window"). Tokenizing a huge prompt is not free — keep
+        # it off the event loop.
+        messages = await asyncio.to_thread(
+            self._engine._fit_messages, inst, messages, max_tokens)
         llm_kwargs: dict[str, Any] = {"temperature": temperature if temperature is not None else 0.1}
         if max_tokens:
             llm_kwargs["max_tokens"] = max_tokens
