@@ -1689,6 +1689,32 @@ async def anthropic_messages(request: Request) -> Response:
 
     cfg = get_gateway_config()
     cfg.maybe_reload()
+
+    # Anthropic-style clients send their own model names (claude-*, etc.)
+    # which don't exist here. Resolve to a known gateway model; prefer
+    # loaded (resident) models, then configured backend models, then
+    # discovered GGUF stems, then aliases. Without this the self-call
+    # 400s (model_not_found) and the shim surfaces a confusing 502.
+    candidates: list[str] = []
+    engine = get_engine()
+    try:
+        candidates += [m["alias"] for m in engine.loaded_models()]
+    except Exception:  # noqa: BLE001 — resolution must never block the call
+        pass
+    for b in (cfg.backends or {}).values():
+        if isinstance(b, dict):
+            candidates += [str(k) for k in (b.get("models") or {}).keys()]
+    try:
+        candidates += [d["name"] for d in installed_ggufs(cfg.models_dir)]
+    except Exception:  # noqa: BLE001
+        pass
+    candidates += [str(a) for a in (getattr(cfg, "aliases", {}) or {})]
+    known = set(candidates)
+    if model not in known:
+        fallback = next((c for c in candidates if c), model)
+        logger.info("anthropic shim: model %r unknown, using %r", model, fallback)
+        model = fallback
+
     keys = getattr(cfg, "gateway_keys", None) or []
     client = AsyncOpenAI(
         base_url=f"http://{cfg.bind}:{cfg.port}/v1",

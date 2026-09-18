@@ -206,3 +206,21 @@ def test_messages_temperature_passthrough(wired, tmp_path, monkeypatch):
     assert r.status_code == 200
     sent = client.chat.completions.create.call_args.kwargs
     assert sent["temperature"] == 0.2
+
+
+def test_messages_unknown_model_falls_back(wired, tmp_path, monkeypatch):
+    """Workshop sends claude-* style names — shim must map to a known model."""
+    client = _fake_chat("ok")
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert r.status_code == 200
+    sent = client.chat.completions.create.call_args.kwargs
+    # the configured model "m" is the only known one in this fixture
+    assert sent["model"] == "m"
+    # response reports the model it actually used
+    assert r.json()["model"] == "m"
