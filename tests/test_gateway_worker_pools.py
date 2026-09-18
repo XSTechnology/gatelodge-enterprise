@@ -363,3 +363,85 @@ def test_pool_embed_models_still_single(wired, gguf):
             sys.modules["llama_cpp"] = real
         else:
             sys.modules.pop("llama_cpp", None)
+
+
+# ── checkout wedge hardening ───────────────────────────────────────────────
+# Regression: an abandoned SSE stream (client vanished mid-generation)
+# never ran its release; every later request to that model parked on
+# _free.get() FOREVER (observed wedging the 27B live). Three guards:
+# admin-load seeds the free list, acquire is bounded by queue.timeout_s,
+# and unload drains in-flight checkouts first.
+
+def test_admin_load_seeds_free_list(wired, gguf):
+    """/admin/load preloads the instance AND makes it servable — the
+    next request must not wait behind an unseeded free list."""
+    wired(_config(gguf))  # workers=1
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/admin/load", json={"model": "fast"})
+            assert r.status_code == 200
+            assert _one_chat(client).status_code == 200  # pre-fix: parked
+        loads = [r["load"] for r in records if "load" in r]
+        assert len(loads) == 1
+
+    _with_fake_llama(fn)
+
+
+def test_acquire_times_out_when_checkout_stuck(wired, gguf):
+    """A stuck checkout (abandoned stream) must not park later requests
+    forever — after queue.timeout_s, acquire raises a clear error; once
+    the checkout is released, the model serves again."""
+    cfg = _config(gguf)  # workers=1
+    cfg["queue"] = {"max_waiting": 4, "timeout_s": 0.3}
+    _, _, engine = wired(cfg)
+
+    async def scenario():
+        inst = await engine._acquire("fast")  # hold like an abandoned stream
+        try:
+            t0 = time.perf_counter()
+            with pytest.raises(gw_models.EmbeddedLLMError) as ei:
+                await asyncio.wait_for(engine._acquire("fast"), timeout=5)
+            dt = time.perf_counter() - t0
+            assert "busy" in str(ei.value)
+            assert dt < 2.0  # errored at ~0.3s — not parked, not 5s
+        finally:
+            engine._release("fast", inst)
+        inst2 = await engine._acquire("fast")  # recovered
+        engine._release("fast", inst2)
+
+    _with_fake_llama(lambda records: asyncio.run(scenario()))
+
+
+def test_unload_drain_reports_stuck_and_recovers(wired, gguf):
+    """drain(): bounded wait for in-flight checkouts — held ones are
+    reported as stuck; once returned, drain reports clean."""
+    _, _, engine = wired(_config(gguf))
+
+    async def scenario():
+        inst = await engine._acquire("fast")  # in-flight
+        stuck = await engine.drain("fast", wait_s=0.2)
+        assert stuck == {"fast": 1}  # still held → reported
+        engine._release("fast", inst)
+        stuck = await engine.drain("fast", wait_s=1.0)
+        assert stuck == {}  # returned → drained
+        assert engine.unload("fast") == 1
+
+    _with_fake_llama(lambda records: asyncio.run(scenario()))
+
+
+def test_admin_unload_response_reports_drain(wired, gguf):
+    """POST /admin/unload drains first and reports stuck checkouts in
+    the response (console reads .unloaded — extra keys are additive)."""
+    wired(_config(gguf))
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/admin/unload", json={"model": "fast"})
+            assert r.status_code == 200
+            body = r.json()
+            assert body["unloaded"] == 0  # nothing was loaded
+            assert body["drained"] is True
+            assert body["stuck"] == {}
+
+    _with_fake_llama(fn)

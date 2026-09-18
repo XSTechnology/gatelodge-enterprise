@@ -327,6 +327,7 @@ class _InstancePool:
         self._make = make
         self.instances: list[_Instance] = []
         self.sig: tuple | None = None  # set by the engine (config shape)
+        self.timeout_s = 120.0  # bounded worker wait (engine keeps it fresh)
         self._free: asyncio.Queue = asyncio.Queue()
         self._create_lock = asyncio.Lock()
 
@@ -350,16 +351,38 @@ class _InstancePool:
                     if len(self.instances) < self.max_workers:
                         return await asyncio.to_thread(self._new_instance)
             else:
-                return await self._free.get()
+                # All workers checked out — wait, but never forever. An
+                # abandoned stream can hold a checkout indefinitely
+                # (client vanished mid-generation); parking here wedged
+                # every later request to that model (observed live).
+                try:
+                    return await asyncio.wait_for(self._free.get(),
+                                                  timeout=self.timeout_s)
+                except asyncio.TimeoutError:
+                    raise EmbeddedLLMError(
+                        f"model {self.name!r} busy — no free worker for "
+                        f"{self.timeout_s:.0f}s (long generation or stuck "
+                        "stream; retry shortly or POST /admin/unload to "
+                        "reload the model)") from None
 
     def release(self, inst: _Instance) -> None:
         self._free.put_nowait(inst)
 
+    def checked_out(self) -> int:
+        """Instances currently held by in-flight requests (approximation:
+        a worker mid-CREATE counts as checked out)."""
+        return max(0, len(self.instances) - self._free.qsize())
+
     def first_or_create(self) -> _Instance:
         """Synchronous preload/registry access: the first instance,
-        created on the caller's thread when the pool is empty."""
+        created on the caller's thread when the pool is empty. The new
+        instance is ALSO seeded into the free list — /admin/load exists
+        to make the model immediately servable, and acquire() only hands
+        out what's in _free."""
         if not self.instances:
-            return self._new_instance()
+            inst = self._new_instance()
+            self._free.put_nowait(inst)
+            return inst
         return self.instances[0]
 
 
@@ -455,6 +478,11 @@ class EmbeddedEngine:
                                  make=lambda: _Instance(name, path, ctx, placement))
             pool.sig = want
             self._pools[name] = pool
+        try:
+            pool.timeout_s = float((self._config.queue or {})
+                                   .get("timeout_s") or 120)
+        except (TypeError, ValueError):
+            pool.timeout_s = 120.0
         return pool
 
     def _get_instance(self, model_name: str | None) -> _Instance:
@@ -585,14 +613,35 @@ class EmbeddedEngine:
         finally:
             self._release(model_name, inst)
 
+    def _unload_names(self, which: str) -> list[str]:
+        if which == "all":
+            return list(self._pools) + list(self._embed_instances)
+        return ([which] if which in self._pools
+                or which in self._embed_instances else [])
+
+    async def drain(self, which: str = "all", wait_s: float = 5.0) -> dict:
+        """Bounded wait for in-flight checkouts to return before an
+        unload. Returns per-model {name: stuck_count} — models whose
+        workers are still held when the deadline hits (abandoned
+        streams); their VRAM stays pinned until the holders are GC'd."""
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        stuck: dict[str, int] = {}
+        while True:
+            stuck = {}
+            for nm in self._unload_names(which):
+                pool = self._pools.get(nm)
+                if pool is not None and pool.checked_out() > 0:
+                    stuck[nm] = pool.checked_out()
+            if not stuck or time.monotonic() >= deadline:
+                return stuck
+            await asyncio.sleep(0.05)
+
     def unload(self, which: str = "all") -> int:
         """Drop pools/instances to free VRAM (chat AND embedding).
-        Returns number of instances unloaded."""
-        if which == "all":
-            names = list(self._pools) + list(self._embed_instances)
-        else:
-            names = ([which] if which in self._pools
-                     or which in self._embed_instances else [])
+        Returns number of instances unloaded. Callers wanting graceful
+        shutdown should await drain() first — checked-out instances
+        abandoned here keep their VRAM pinned until GC reaps them."""
+        names = self._unload_names(which)
         n = 0
         for nm in names:
             pool = self._pools.pop(nm, None)

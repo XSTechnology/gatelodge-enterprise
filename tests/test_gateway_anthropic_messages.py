@@ -224,3 +224,105 @@ def test_messages_unknown_model_falls_back(wired, tmp_path, monkeypatch):
     assert sent["model"] == "m"
     # response reports the model it actually used
     assert r.json()["model"] == "m"
+
+
+# ── self-call hygiene (regression: unclosed streams leaked the inner
+#    request's worker checkout — a vanished client wedged the model) ──────
+
+def _closeable_client(chunks=("a", "b"), text="ok"):
+    """Fake AsyncOpenAI whose stream AND client record their closes —
+    for both the streaming and non-streaming request shapes."""
+    closed = {"stream": 0, "client": 0}
+
+    class FakeStream:
+        def __init__(self):
+            self._it = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                t = next(self._it)
+            except StopIteration:
+                raise StopAsyncIteration from None
+            ch = MagicMock()
+            ch.choices = [MagicMock(delta=MagicMock(content=t))]
+            return ch
+
+        async def close(self):
+            closed["stream"] += 1
+
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=text))]
+    resp.usage.prompt_tokens = 3
+    resp.usage.completion_tokens = 2
+
+    async def _create(**kwargs):
+        if kwargs.get("stream"):
+            return FakeStream()
+        return resp
+
+    async def _close():
+        closed["client"] += 1
+
+    client = AsyncMock()
+    client.chat.completions.create = _create
+    client.close = _close
+    return client, closed
+
+
+def test_messages_stream_closes_selfcall(wired, tmp_path, monkeypatch):
+    """The shim's self-call stream + client are closed when the response
+    completes — an unclosed stream hides the client disconnect from the
+    gateway and leaks the inner worker checkout."""
+    client, closed = _closeable_client(("a", "b"))
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "m", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert r.status_code == 200
+    assert "message_stop" in r.text
+    assert closed["stream"] == 1  # self-call stream closed
+    assert closed["client"] == 1  # client closed
+
+
+def test_messages_stream_closes_selfcall_on_error(wired, tmp_path, monkeypatch):
+    """Upstream failure mid-stream still closes the self-call."""
+    async def _create(**kwargs):
+        raise RuntimeError("nope")
+
+    async def _close():
+        pass
+
+    client = AsyncMock()
+    client.chat.completions.create = _create
+    client.close = _close
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "m", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert r.status_code == 200  # SSE already started
+    assert "event: error" in r.text
+
+
+def test_messages_nonstream_closes_client(wired, tmp_path, monkeypatch):
+    """Non-streaming self-call closes its client too (connection reuse
+    hygiene — per-request clients otherwise leak sockets)."""
+    client, closed = _closeable_client(text="ok")
+    monkeypatch.setattr(gw_app, "AsyncOpenAI", lambda *a, **kw: client)
+    wired(_cfg(tmp_path))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/v1/messages", json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert r.status_code == 200
+    assert r.json()["content"][0]["text"] == "ok"
+    assert closed["client"] == 1

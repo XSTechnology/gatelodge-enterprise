@@ -1654,8 +1654,17 @@ async def admin_unload(payload: LoadPayload) -> Response:
     if not which:
         return _error(400, "model must not be empty (or send "
                       "{\"all\": true})", param="model")
+    # Drain first: bounded wait for in-flight requests to finish so the
+    # unload doesn't pull the model out from under them (their worker
+    # checkout would be orphaned and its VRAM pinned until GC).
+    stuck = await engine.drain(which, wait_s=cfg.queue["timeout_s"] * 0.1)
+    if stuck:
+        logger.warning("admin/unload: %s still has stuck checkout(s) after "
+                       "drain — unloading anyway (VRAM stays pinned until "
+                       "the holders are reaped)", stuck)
     n = engine.unload(which)
-    return {"unloaded": n, "loaded": engine.loaded_models()}
+    return {"unloaded": n, "drained": not stuck, "stuck": stuck,
+            "loaded": engine.loaded_models()}
 
 
 # ── Anthropic Messages API (/v1/messages) ──────────────────────────────────
@@ -1684,6 +1693,19 @@ def _blocks_to_text(content: Any) -> str:
 
 def _sse_event(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def _close_quietly(obj: Any) -> Any:
+    """Close an SDK client/stream whether close() is sync or async.
+    Returns an awaitable (or None). Never raises — cleanup only."""
+    fn = getattr(obj, "close", None)
+    if fn is None:
+        return None
+    try:
+        res = fn()
+    except Exception:  # noqa: BLE001 — cleanup must not raise
+        return None
+    return res if hasattr(res, "__await__") else None
 
 
 @app.post("/v1/messages")
@@ -1753,15 +1775,22 @@ async def anthropic_messages(request: Request) -> Response:
         model = fallback
 
     keys = getattr(cfg, "gateway_keys", None) or []
-    client = AsyncOpenAI(
-        base_url=f"http://{cfg.bind}:{cfg.port}/v1",
-        api_key=keys[0] if keys else "benchmark",
-    )
+    api_key = keys[0] if keys else "benchmark"
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     if stream:
         async def gen() -> AsyncIterator[bytes]:
             out_tok = 0
+            # Own client + stream, ALWAYS closed in finally. An unclosed
+            # AsyncStream leaks the self-call connection: the gateway then
+            # never sees the client disconnect, the inner SSE generator
+            # stays suspended at its yield, and the embedded worker
+            # checkout is held forever (observed wedging the 27B pool).
+            client = AsyncOpenAI(
+                base_url=f"http://{cfg.bind}:{cfg.port}/v1",
+                api_key=api_key,
+            )
+            s = None
             yield _sse_event("message_start", {
                 "type": "message_start",
                 "message": {"id": msg_id, "type": "message", "role": "assistant",
@@ -1771,6 +1800,11 @@ async def anthropic_messages(request: Request) -> Response:
             yield _sse_event("content_block_start", {
                 "type": "content_block_start", "index": 0,
                 "content_block": {"type": "text", "text": ""}})
+            # Tail events live INSIDE the try/except so a GeneratorExit
+            # (client vanished) skips them — yielding after GeneratorExit
+            # would raise. The finally is the only code that runs on every
+            # exit path; closing the stream there is what lets the inner
+            # request cancel and release its worker checkout.
             try:
                 kwargs: dict[str, Any] = dict(model=model, messages=oai_messages,
                                               max_tokens=max_tokens, stream=True)
@@ -1788,20 +1822,43 @@ async def anthropic_messages(request: Request) -> Response:
                         yield _sse_event("content_block_delta", {
                             "type": "content_block_delta", "index": 0,
                             "delta": {"type": "text_delta", "text": text}})
+                yield _sse_event("content_block_stop", {
+                    "type": "content_block_stop", "index": 0})
+                yield _sse_event("message_delta", {
+                    "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": out_tok}})
+                yield _sse_event("message_stop", {"type": "message_stop"})
             except Exception as e:  # noqa: BLE001 — stream must not die silently
                 yield _sse_event("error", {
                     "type": "error",
                     "error": {"type": "api_error", "message": str(e)}})
-            yield _sse_event("content_block_stop", {
-                "type": "content_block_stop", "index": 0})
-            yield _sse_event("message_delta", {
-                "type": "message_delta", "delta": {"stop_reason": "end_turn"},
-                "usage": {"output_tokens": out_tok}})
-            yield _sse_event("message_stop", {"type": "message_stop"})
+                yield _sse_event("content_block_stop", {
+                    "type": "content_block_stop", "index": 0})
+                yield _sse_event("message_delta", {
+                    "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": out_tok}})
+                yield _sse_event("message_stop", {"type": "message_stop"})
+            finally:
+                aw = _close_quietly(s)
+                if aw is not None:
+                    try:
+                        await aw
+                    except Exception:  # noqa: BLE001
+                        pass
+                aw = _close_quietly(client)
+                if aw is not None:
+                    try:
+                        await aw
+                    except Exception:  # noqa: BLE001
+                        pass
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     # Non-streaming
+    client = AsyncOpenAI(
+        base_url=f"http://{cfg.bind}:{cfg.port}/v1",
+        api_key=api_key,
+    )
     try:
         kwargs: dict[str, Any] = dict(model=model, messages=oai_messages,
                                       max_tokens=max_tokens)
@@ -1810,6 +1867,13 @@ async def anthropic_messages(request: Request) -> Response:
         resp = await client.chat.completions.create(**kwargs)
     except Exception as e:  # noqa: BLE001 — surface upstream failure
         return _anthropic_error(502, f"Upstream error: {e}", "api_error")
+    finally:
+        aw = _close_quietly(client)
+        if aw is not None:
+            try:
+                await aw
+            except Exception:  # noqa: BLE001
+                pass
 
     text_out = ""
     usage = getattr(resp, "usage", None)
