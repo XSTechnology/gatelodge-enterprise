@@ -87,6 +87,7 @@ import struct
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -94,6 +95,13 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+from openai import AsyncOpenAI
+
+try:
+    import huggingface_hub
+except ImportError:
+    huggingface_hub = None
 
 from . import cloud
 from . import llamaserver
@@ -136,6 +144,10 @@ class _RingHandler(logging.Handler):
             })
         except Exception:  # noqa: BLE001 — never let logging break a request
             pass
+
+    def push(self, event: dict) -> None:
+        """Push a manual event (non-logging) into the ring."""
+        self.events.append(event)
 
 
 _EVENTS: _RingHandler | None = None
@@ -2280,4 +2292,228 @@ async def admin_reload() -> Response:
             "backends": {n: len(b.get("models") or {})
                          for n, b in cfg.backends.items()},
             "aliases": sorted(cfg.aliases)}
+
+
+# ── Admin: model download from HuggingFace ─────────────────────────────────
+
+class DownloadPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    repo_id: str = ""  # e.g. "bartowski/Meta-Llama-3.1-8B-Instruct-Q4_K_M"
+    filename: str = ""  # specific file, or blank for auto-detect
+    hf_token: str = ""  # optional, for gated repos
+
+
+@app.post("/admin/models/download")
+async def admin_download_model(payload: DownloadPayload) -> Response:
+    """Download a GGUF file from HuggingFace to models_dir.
+
+    Returns progress events via the event ring. The file is downloaded
+    to models_dir and will be auto-discovered on next healthz/config reload.
+    """
+    if huggingface_hub is None:
+        return _error(500, "huggingface_hub not installed. Run: uv add huggingface_hub")
+
+    repo_id = payload.repo_id.strip()
+    if not repo_id:
+        return _error(400, "repo_id is required", param="repo_id")
+
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    models_dir = Path(cfg.models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = payload.filename.strip()
+    hf_token = payload.hf_token.strip() or None
+
+    try:
+        if filename:
+            # Download specific file
+            dest = huggingface_hub.hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(models_dir),
+                token=hf_token,
+            )
+        else:
+            # Auto-detect: find first .gguf file in repo
+            api = huggingface_hub.HfApi(token=hf_token)
+            try:
+                files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+            except Exception:
+                files = api.list_repo_files(repo_id=repo_id)
+            ggufs = [f for f in files if f.endswith(".gguf")]
+            if not ggufs:
+                return _error(404, f"No .gguf files found in {repo_id}",
+                              code="no_gguf_found")
+            # Pick the first one (usually the main quant)
+            filename = ggufs[0]
+            dest = huggingface_hub.hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(models_dir),
+                token=hf_token,
+            )
+
+        dest_path = Path(dest)
+        size_mb = round(dest_path.stat().st_size / (1024 * 1024), 1)
+        _event_ring().push({
+            "ts": datetime.now().isoformat(),
+            "event": "model_downloaded",
+            "repo_id": repo_id,
+            "filename": filename,
+            "dest": str(dest_path.name),
+            "size_mb": size_mb,
+        })
+        return {
+            "downloaded": dest_path.name,
+            "path": str(dest_path),
+            "size_mb": size_mb,
+            "repo_id": repo_id,
+        }
+    except Exception as e:
+        return _error(500, f"Download failed: {e}", code="download_error")
+
+
+# ── Admin: model benchmark ─────────────────────────────────────────────────
+
+class BenchmarkPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    model: str = ""  # model alias/name to benchmark
+    prompt: str = "Explain quantum computing in simple terms."
+    n: int = 1  # number of iterations (warmup + measured)
+    stream: bool = False  # use streaming to measure TTFT
+    max_tokens: int = 256
+
+
+@app.post("/admin/benchmark")
+async def admin_benchmark(payload: BenchmarkPayload) -> Response:
+    """Run a performance benchmark on a model.
+
+    Measures: first-load time (if cold), TTFT (time to first token),
+    tokens per second, total latency, and output token count.
+    Returns structured results suitable for the Perf panel.
+    """
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+
+    model = payload.model.strip()
+    if not model:
+        return _error(400, "model is required", param="model")
+
+    # Verify model exists (configured or discovered)
+    engine = get_engine()
+    loaded = engine.loaded_models()
+    discovered = installed_ggufs(cfg.models_dir)
+    all_names = [m["alias"] for m in loaded] + [d["name"] for d in discovered]
+    # Also check aliases
+    for alias_name in cfg.aliases:
+        all_names.append(alias_name)
+
+    if model not in all_names:
+        return _error(400, f"Model {model!r} not found. Available: {all_names[:10]}",
+                      param="model", code="model_not_found")
+
+    results = []
+    for i in range(payload.n):
+        t0 = time.perf_counter()
+        first_token_time = None
+        first_token_ts = None
+        token_count = 0
+
+        if payload.stream:
+            # Streaming benchmark — measures TTFT
+            client = AsyncOpenAI(
+                base_url=f"http://{cfg.bind}:{cfg.port}/v1",
+                api_key="benchmark",
+            )
+            try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": payload.prompt}],
+                    max_tokens=payload.max_tokens,
+                    stream=True,
+                )
+                async for chunk in stream:
+                    choices = getattr(chunk, "choices", [])
+                    if choices and getattr(choices[0], "delta", None):
+                        delta = choices[0].delta
+                        content = getattr(delta, "content", None)
+                        if content:
+                            token_count += 1
+                            if first_token_ts is None:
+                                first_token_ts = time.perf_counter()
+            except Exception as e:
+                total_ms = int((time.perf_counter() - t0) * 1000)
+                results.append({
+                    "iteration": i + 1,
+                    "error": str(e),
+                    "total_ms": total_ms,
+                })
+                continue
+        else:
+            # Non-streaming benchmark
+            client = AsyncOpenAI(
+                base_url=f"http://{cfg.bind}:{cfg.port}/v1",
+                api_key="benchmark",
+            )
+            try:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": payload.prompt}],
+                    max_tokens=payload.max_tokens,
+                )
+                usage = getattr(resp, "usage", None)
+                if usage:
+                    token_count = getattr(usage, "completion_tokens", 0) or 0
+                first_token_ts = time.perf_counter()  # approximation
+            except Exception as e:
+                total_ms = int((time.perf_counter() - t0) * 1000)
+                results.append({
+                    "iteration": i + 1,
+                    "error": str(e),
+                    "total_ms": total_ms,
+                })
+                continue
+
+        total_ms = int((time.perf_counter() - t0) * 1000)
+        ttft_ms = int((first_token_ts - t0) * 1000) if first_token_ts else total_ms
+        tok_per_s = round(token_count / (total_ms / 1000), 1) if total_ms > 0 else 0
+
+        results.append({
+            "iteration": i + 1,
+            "total_ms": total_ms,
+            "ttft_ms": ttft_ms,
+            "tokens": token_count,
+            "tok_per_s": tok_per_s,
+            "stream": payload.stream,
+        })
+
+    # Compute aggregates
+    successful = [r for r in results if "error" not in r]
+    agg = {}
+    if successful:
+        agg = {
+            "avg_total_ms": round(sum(r["total_ms"] for r in successful) / len(successful)),
+            "avg_ttft_ms": round(sum(r["ttft_ms"] for r in successful) / len(successful)),
+            "avg_tok_per_s": round(sum(r["tok_per_s"] for r in successful) / len(successful), 1),
+            "min_total_ms": min(r["total_ms"] for r in successful),
+            "max_total_ms": max(r["total_ms"] for r in successful),
+        }
+
+    _event_ring().push({
+        "ts": datetime.now().isoformat(),
+        "event": "benchmark",
+        "model": model,
+        "iterations": len(successful),
+        "avg_tok_per_s": agg.get("avg_tok_per_s"),
+    })
+
+    return {
+        "model": model,
+        "prompt": payload.prompt[:80] + ("..." if len(payload.prompt) > 80 else ""),
+        "iterations": len(results),
+        "successful": len(successful),
+        "results": results,
+        "aggregate": agg if agg else None,
+    }
 

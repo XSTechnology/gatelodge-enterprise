@@ -257,7 +257,8 @@ function showModels(ui) {
     var html = buildModelForm(defs, d.discovered || []) +
       buildConfiguredTable(configured, d) +
       buildLoadedTable(d.loaded || []) +
-      buildDiscoveredChips(d.discovered || [], configured);
+      buildDiscoveredChips(d.discovered || [], configured) +
+      buildDownloadWidget();
     ui.body.innerHTML = html;
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
@@ -425,6 +426,30 @@ function buildDiscoveredChips(discovered, configured) {
   if (!discovered.length) html += '<span class="muted">models_dir is empty.</span>';
   html += '</div><div class="muted">Config-defined models (custom ctx / workers / placement) shadow same-named stems. Worker pools grow lazily under concurrency.</div></div>';
   return html;
+}
+
+function buildDownloadWidget() {
+  var html = '<div class="widget"><h3>Download from HuggingFace</h3>';
+  html += '<div class="srow"><label>Repo ID</label><input id="dl-repo_id" placeholder="bartowski/Meta-Llama-3.1-8B-Instruct-Q4_K_M" style="flex:1;min-width:260px"></div>';
+  html += '<div class="srow"><label>Filename (optional)</label><input id="dl-filename" placeholder="auto-detect first .gguf" style="flex:1;min-width:260px"></div>';
+  html += '<div class="srow"><label>HF Token (gated repos)</label><input id="dl-hf_token" placeholder="(optional)" style="flex:1;min-width:260px"></div>';
+  html += '<div style="margin-top:10px;"><button class="btn btn-primary" onclick="downloadModel()">Download</button></div>';
+  html += '<div class="muted" style="margin-top:6px">Downloads to models_dir. Auto-discovered on next reload.</div>';
+  html += '</div>';
+  return html;
+}
+
+function downloadModel() {
+  var repo_id = document.getElementById('dl-repo_id').value.trim();
+  if (!repo_id) { notify('✗ Repo ID is required', true); return; }
+  var payload = {repo_id: repo_id};
+  var filename = document.getElementById('dl-filename').value.trim();
+  if (filename) payload.filename = filename;
+  var hf_token = document.getElementById('dl-hf_token').value.trim();
+  if (hf_token) payload.hf_token = hf_token;
+  api('/admin/models/download', {method: 'POST', body: payload})
+    .then(function (d) { notify('✓ ' + d.downloaded + ' (' + d.size_mb + ' MB)'); showPanel('models'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
 // Store backend info for form rendering
@@ -954,11 +979,62 @@ function showPerf(ui) {
           '<td class="num">' + e.ms + 'ms</td><td style="color:' + col + '">' + e.status + '</td></tr>';
       });
       html += '</tbody></table></div>';
+      html += buildBenchmarkWidget();
       ui.body.innerHTML = html;
     }).catch(function (e) { ui.body.innerHTML = errBox(e); });
   };
   render();
   _perfTimer = setInterval(render, 5000);
+}
+
+function buildBenchmarkWidget() {
+  var html = '<div class="widget"><h3>Benchmark</h3>';
+  html += '<div class="srow"><label>Model</label><input id="bm-model" placeholder="model alias" style="flex:1;min-width:260px"></div>';
+  html += '<div class="srow"><label>Prompt</label><input id="bm-prompt" placeholder="Explain quantum computing in simple terms." style="flex:1;min-width:260px"></div>';
+  html += '<div class="srow"><label>Iterations</label><input id="bm-n" type="number" min="1" value="1" style="width:80px"></div>';
+  html += '<div class="srow"><label>Max tokens</label><input id="bm-max_tokens" type="number" min="1" value="256" style="width:80px"></div>';
+  html += '<div class="srow"><label>Stream</label><select id="bm-stream"><option value="0">No</option><option value="1">Yes (measures TTFT)</option></select></div>';
+  html += '<div style="margin-top:10px;"><button class="btn btn-primary" onclick="runBenchmark()">Run</button></div>';
+  html += '<div id="bm-results" style="margin-top:10px;"></div>';
+  html += '</div>';
+  return html;
+}
+
+function runBenchmark() {
+  var model = document.getElementById('bm-model').value.trim();
+  if (!model) { notify('✗ Model is required', true); return; }
+  var payload = {
+    model: model,
+    prompt: document.getElementById('bm-prompt').value.trim() || "Explain quantum computing in simple terms.",
+    n: parseInt(document.getElementById('bm-n').value) || 1,
+    max_tokens: parseInt(document.getElementById('bm-max_tokens').value) || 256,
+    stream: document.getElementById('bm-stream').value === '1',
+  };
+  document.getElementById('bm-results').innerHTML = '<div class="loading">Running benchmark…</div>';
+  api('/admin/benchmark', {method: 'POST', body: payload})
+    .then(function (d) {
+      var html = '';
+      if (d.aggregate) {
+        html += '<div class="kv"><b>Avg latency:</b> ' + d.aggregate.avg_total_ms + 'ms · ' +
+          '<b>TTFT:</b> ' + d.aggregate.avg_ttft_ms + 'ms · ' +
+          '<b>Tok/s:</b> ' + d.aggregate.avg_tok_per_s + '</div>';
+        html += '<div class="kv muted">Range: ' + d.aggregate.min_total_ms + ' – ' + d.aggregate.max_total_ms + 'ms</div>';
+      }
+      if (d.results && d.results.length) {
+        html += '<table style="margin-top:8px;"><thead><tr><th>#</th><th>ms</th><th>TTFT</th><th>tok/s</th><th>tokens</th></tr></thead><tbody>';
+        d.results.forEach(function (r) {
+          html += '<tr><td>' + r.iteration + '</td><td class="num">' + r.total_ms + '</td>' +
+            '<td class="num">' + (r.ttft_ms != null ? r.ttft_ms : '—') + '</td>' +
+            '<td class="num">' + (r.tok_per_s != null ? r.tok_per_s : '—') + '</td>' +
+            '<td class="num">' + (r.tokens || 0) + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      }
+      document.getElementById('bm-results').innerHTML = html;
+    })
+    .catch(function (e) {
+      document.getElementById('bm-results').innerHTML = '<div style="color:var(--danger)">✗ ' + esc(e.message) + '</div>';
+    });
 }
 
 // ---------- Syslog ----------
