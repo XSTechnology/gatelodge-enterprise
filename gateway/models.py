@@ -835,6 +835,10 @@ class EmbeddedEngine:
 
     _FIXED_OVERHEAD = 64    # chat-template fixed overhead, tokens
     _PER_MSG_OVERHEAD = 16  # per-message template wrappers, tokens
+    _TRIM_LOW_WATERMARK = 0.7  # over-budget prompts trim to 70% of the
+                               # budget — the kept prefix then stays
+                               # stable for a 30% growth window, so
+                               # llama.cpp's KV prefix cache survives
     _TRIM_NOTE = ("\n\n[context note: earlier conversation history was "
                   "truncated to fit the context window]")
 
@@ -894,7 +898,11 @@ class EmbeddedEngine:
                       ) -> tuple[list[dict[str, Any]], list[dict] | None]:
         """Fit the prompt into the context window — never errors.
 
-        Drop oldest non-system messages until the prompt fits n_ctx.
+        Drop oldest non-system messages until the prompt fits n_ctx —
+        down to a LOW WATERMARK (70% of the budget), not to exactly the
+        budget: the kept prefix then stays identical while the session
+        grows the remaining 30%, so llama.cpp's automatic KV prefix
+        reuse covers it and only the new suffix is decoded.
         Keeps every system message (instructions) and the newest turns.
         When the newest message ALONE (plus system) exceeds the window —
         huge tool_result/summary blocks from agent clients — its content
@@ -972,11 +980,30 @@ class EmbeddedEngine:
 
         kept: list[int] = []
         acc = sys_cost
+        # Stable-prefix (KV-cache) trim: an over-budget prompt drops to a
+        # LOW WATERMARK, not to exactly-budget. Trimming to exactly the
+        # budget moves the kept-boundary by one message on every
+        # subsequent request, so llama.cpp's automatic KV prefix reuse
+        # (Llama.generate: longest-common-prefix match against the
+        # previously evaluated tokens) collapses to the system section
+        # and every request re-prefills from scratch. Trimming to 70% of
+        # the budget lets the session grow the remaining 30% before the
+        # next trim — every request in that window reuses the previous
+        # prompt as a cached prefix and decodes only the new suffix.
+        low = max(int(budget * EmbeddedEngine._TRIM_LOW_WATERMARK), 64)
+        kept: list[int] = []
+        acc = sys_cost
         for i in reversed(nonsys):
-            if acc + counts[i] > budget:
+            if acc + counts[i] > low:
                 break
             kept.append(i)
             acc += counts[i]
+        if not kept and nonsys and sys_cost + counts[nonsys[-1]] <= budget:
+            # The newest message alone busts the watermark but FITS the
+            # budget — keep it alone rather than truncating its content
+            # (identical outcome to a no-watermark trim).
+            kept.append(nonsys[-1])
+            acc = sys_cost + counts[nonsys[-1]]
         if not kept:
             # The newest message alone (plus system) busts the budget.
             # Truncate its CONTENT instead of erroring — agent clients

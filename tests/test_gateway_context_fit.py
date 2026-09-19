@@ -322,6 +322,63 @@ def test_fit_messages_prompt_cap_above_window_is_noop():
     assert out == msgs
 
 
+# ── unit: low-watermark (stable-prefix / KV-cache) trim ────────────────────
+
+def test_watermark_trims_deeper_than_budget():
+    """Over-budget prompts drop to 70% of the budget, not exactly-budget:
+    the kept prefix stays stable for a 30% growth window so llama.cpp's
+    automatic KV prefix reuse survives (an exactly-budget trim moves the
+    boundary one message per request and re-prefills from scratch)."""
+    inst = _FakeInst(n_ctx=4096)  # budget 3008, watermark 2105
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(27):  # 27 × 116 = 3133 + 17 → over budget
+        msgs.append({"role": "user", "content": f"m{i} " + "x" * 400})
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, None)
+    assert len(out) < len(msgs)
+    # watermark: 17 + 17×117 = 2006 ≤ 2105 (an exactly-budget trim kept 25)
+    assert len(out) == 18  # system + 17 newest (m10..m26)
+    kept_tokens = sum(len(m["content"]) // 4 + 16 for m in out)
+    assert kept_tokens <= 2105
+
+
+def test_watermark_growth_window_is_prefix_stable():
+    """The KV-reuse property: after a trim to the watermark, the session
+    can grow (up to the budget) with NO further trim — each request's
+    prompt extends the previous one, so the prefix cache holds."""
+    inst = _FakeInst(n_ctx=4096)  # budget 3008, watermark 2105
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(27):
+        msgs.append({"role": "user", "content": f"m{i} " + "x" * 400})
+    out1, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, None)
+    assert len(out1) < len(msgs)  # trimmed once
+    # session grows by a few turns — still under budget → NOT re-trimmed
+    grown = list(out1) + [{"role": "user", "content": "new turn " + "y" * 200}
+                          for _ in range(2)]
+    out2, _ = gw_models.EmbeddedEngine._fit_messages(inst, grown, None)
+    assert out2 == grown  # identical — prefix extends out1 unchanged
+    # …until the budget is exceeded again, then it re-trims to the watermark
+    grown_more = grown + [{"role": "user", "content": "z" * 400}
+                          for _ in range(9)]  # 2142 + 9×116 = 3186 > 3008
+    out3, _ = gw_models.EmbeddedEngine._fit_messages(inst, grown_more, None)
+    assert len(out3) < len(grown_more)
+
+
+def test_watermark_newest_between_watermark_and_budget_kept_alone():
+    """A newest message bigger than the watermark but within the budget
+    is kept whole (rescued) instead of falling into truncation."""
+    inst = _FakeInst(n_ctx=4096)  # budget 3008, watermark 2105
+    msgs = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "old " + "x" * 3600},  # ~916 tok
+            {"role": "user", "content": "new " + "y" * 9600}]  # ~2416 tok
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, None)
+    # newest (2433 with system) busts the 2105 watermark → rescue keeps
+    # it alone rather than truncating (matches pre-watermark behavior)
+    assert len(out) == 2
+    assert out[1]["content"].startswith("new ")
+    assert "truncated to fit" not in out[1]["content"]
+    assert "[context note:" in out[0]["content"]
+
+
 # ── unit: EmbeddedEngine._apply_no_think ───────────────────────────────────
 
 def test_apply_no_think_appends_to_system():
