@@ -890,6 +890,7 @@ class EmbeddedEngine:
                       max_tokens: int | None,
                       tools: list[dict] | None = None,
                       prompt_cap: int | None = None,
+                      tools_cost: int | None = None,
                       ) -> tuple[list[dict[str, Any]], list[dict] | None]:
         """Fit the prompt into the context window — never errors.
 
@@ -918,6 +919,11 @@ class EmbeddedEngine:
         bounded even when the window could hold more history. The cap
         must leave room above the tools floor or tools drop (same
         plain-chat degradation as an n_ctx-starved window).
+
+        tools_cost overrides the tools budget (llama-server backends
+        pass the exact cost of the NATIVE tools JSON their chat
+        template renders — the embedded _tools_instruction estimate
+        undercounts it and would overflow the child).
         """
         raw = getattr(getattr(inst, "llama", None), "n_ctx", 0)
         n_ctx = int(raw() if callable(raw) else (raw or 0)) or 4096
@@ -927,8 +933,9 @@ class EmbeddedEngine:
             budget = min(budget,
                          int(prompt_cap) - EmbeddedEngine._FIXED_OVERHEAD)
         if tools:
-            tools_cost = EmbeddedEngine._count_tokens(
-                inst, EmbeddedEngine._tools_instruction(tools))
+            if tools_cost is None:
+                tools_cost = EmbeddedEngine._count_tokens(
+                    inst, EmbeddedEngine._tools_instruction(tools))
             # floor: keep tools unless they'd starve messages to an
             # unusable sliver (proportional so small windows still work)
             floor = max(256, n_ctx // 16)

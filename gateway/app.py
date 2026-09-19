@@ -583,6 +583,35 @@ def _resolve_capabilities(chain: list[str], cfg, embed_names: set) -> list[str]:
 
 # ── chain execution ────────────────────────────────────────────────────────
 
+async def _ls_fit_prompt(cfg, backend_name: str, model_key: str, mgr,
+                         base: str, messages: list[dict[str, Any]],
+                         max_tokens: int | None,
+                         tools: list[dict[str, Any]] | None
+                         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Trim a chat payload to a llama-server child's per-slot context
+    (ctx // parallel) and apply the per-model knobs.
+
+    llama-server 400s on overflow instead of truncating, so trimming
+    happens here exactly like the embedded path — but with the child's
+    own /tokenize for exact counts and the NATIVE tools JSON cost. The
+    knobs (no_think, max_prompt_tokens) live in
+    backends.<name>.models.<model>, are read per request (hot-reload),
+    and are deliberately NOT part of the child signature — flipping
+    one never respawns the process."""
+    m = cfg.backends[backend_name]["models"][model_key]
+    try:
+        prompt_cap = int(m.get("max_prompt_tokens") or 0) or None
+    except (TypeError, ValueError):
+        prompt_cap = None
+    messages, tools = await asyncio.to_thread(
+        llamaserver.fit_chat, base, messages, max_tokens, tools,
+        mgr.ctx, mgr.parallel, prompt_cap,
+        f"{backend_name}/{model_key}")
+    if m.get("no_think"):
+        messages = EmbeddedEngine._apply_no_think(messages)
+    return messages, tools
+
+
 async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
                       requested: str) -> tuple[dict[str, Any], str, str]:
     """Execute ONE chain entry → (openai_response_dict, backend, model_key).
@@ -644,12 +673,17 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         llamaserver.ensure_reaper()
         mgr = llamaserver.get_manager(cfg, backend_name, model_key)
         base = await mgr.ensure_ready()
+        # Trim to the slot context + apply knobs (no_think / max_prompt
+        # _tokens) — llama-server 400s on overflow instead of trimming.
+        messages, tools = await _ls_fit_prompt(
+            cfg, backend_name, model_key, mgr, base,
+            body.messages, body.max_tokens, body.tools)
         payload: dict[str, Any] = {
             "model": mgr.alias,  # the child's --alias (its model id)
-            "messages": body.messages,
+            "messages": messages,
         }
-        if body.tools:
-            payload["tools"] = body.tools
+        if tools:
+            payload["tools"] = tools
         if body.temperature is not None:
             payload["temperature"] = body.temperature
         if body.max_tokens:
@@ -980,13 +1014,18 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 llamaserver.ensure_reaper()
                 mgr = llamaserver.get_manager(cfg, backend_name, model_key)
                 base = await mgr.ensure_ready()
+                # Same trim + knobs as the non-streaming path — mid-stream
+                # SSE errors from an overflowed child are the worst mode.
+                messages, tools = await _ls_fit_prompt(
+                    cfg, backend_name, model_key, mgr, base,
+                    body.messages, body.max_tokens, body.tools)
                 payload: dict[str, Any] = {
                     "model": mgr.alias,
-                    "messages": body.messages,
+                    "messages": messages,
                     "stream": True,
                 }
-                if body.tools:
-                    payload["tools"] = body.tools
+                if tools:
+                    payload["tools"] = tools
                 if body.temperature is not None:
                     payload["temperature"] = body.temperature
                 if body.max_tokens:
@@ -1364,7 +1403,12 @@ async def legacy_completions(body: CompletionRequest) -> Response:
             llamaserver.ensure_reaper()
             mgr = llamaserver.get_manager(cfg, backend_name, model_key)
             base = await mgr.ensure_ready()
-            payload = {"model": mgr.alias, "prompt": prompts[0]}
+            # Trim the raw prompt to the slot context (head+tail when
+            # oversized) — llama-server 400s on overflow.
+            prompt_text = await asyncio.to_thread(
+                llamaserver.fit_prompt, base, prompts[0], body.max_tokens,
+                mgr.ctx, mgr.parallel, f"{backend_name}/{model_key}")
+            payload = {"model": mgr.alias, "prompt": prompt_text}
             if body.temperature is not None:
                 payload["temperature"] = body.temperature
             if body.max_tokens:

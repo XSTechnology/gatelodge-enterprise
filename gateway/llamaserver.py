@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import subprocess
 import time
+import types
 from pathlib import Path
 from subprocess import Popen
 from typing import Any, AsyncIterator
@@ -111,6 +113,161 @@ async def stream_completions(base_url: str, payload: dict[str, Any],
         async for line in r.aiter_lines():
             if line.startswith("data: "):
                 yield line[6:]
+
+
+# ── Tokenizer bridge (/tokenize) ───────────────────────────────────────────
+
+_sync_client: httpx.Client | None = None
+
+
+def _sync_http() -> httpx.Client:
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = httpx.Client()
+    return _sync_client
+
+
+def post_tokenize_sync(base_url: str, content: str,
+                       timeout: float = 5.0) -> list[int] | None:
+    """Exact token count from the child's /tokenize endpoint.
+
+    SYNC on purpose: the shared trim helper (EmbeddedEngine._fit_
+    messages) is sync and runs inside asyncio.to_thread. Returns None
+    on any failure — callers fall back to the heuristic."""
+    try:
+        r = _sync_http().post(f"{base_url}/tokenize",
+                              json={"content": content,
+                                    "add_special": False},
+                              timeout=timeout)
+        if r.status_code == 400:  # older builds reject add_special — retry bare
+            r = _sync_http().post(f"{base_url}/tokenize",
+                                  json={"content": content},
+                                  timeout=timeout)
+        if r.status_code == 200:
+            toks = (r.json() or {}).get("tokens")
+            if isinstance(toks, list):
+                return toks
+    except Exception:  # noqa: BLE001 — heuristic fallback is the contract
+        pass
+    return None
+
+
+class _TokenizerBridge:
+    """Adapter giving EmbeddedEngine._fit_messages an exact tokenizer.
+
+    _fit_messages is a SYNC static helper that reads only
+    inst.llama.n_ctx and inst.llama.tokenize() — this bridge supplies
+    both from a live llama-server child: n_ctx is the per-SLOT context
+    (ctx // parallel), tokenize() hits the child's /tokenize endpoint
+    for exact model-matched counts. Counts are cached by text; any
+    /tokenize failure falls back to ~chars/4 — same contract as the
+    embedded engine's own fallback."""
+
+    def __init__(self, base_url: str, timeout: float = 5.0):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.n_ctx = 4096  # caller sets the real slot context
+        self._cache: dict[str, int] = {}
+
+    def tokenize(self, data, add_bos=False):  # noqa: ARG002 — llama-cpp signature
+        """Returns a list whose LENGTH is the count (callers only len())."""
+        text = (data.decode("utf-8", "ignore")
+                if isinstance(data, (bytes, bytearray)) else str(data))
+        return [0] * self.count(text)
+
+    def count(self, text: str) -> int:
+        if text in self._cache:
+            return self._cache[text]
+        toks = post_tokenize_sync(self.base_url, text, self.timeout)
+        n = len(toks) if toks is not None else max(1, len(text) // 4)
+        self._cache[text] = n
+        return n
+
+
+def _slot_budget(n_ctx: int, max_tokens: int | None,
+                 prompt_cap: int | None) -> int:
+    """Message budget inside one slot — mirrors _fit_messages' math."""
+    reserve = min(int(max_tokens or 2048), max(256, n_ctx // 4))
+    budget = n_ctx - reserve - EmbeddedEngine._FIXED_OVERHEAD
+    if prompt_cap:
+        budget = min(budget, int(prompt_cap) - EmbeddedEngine._FIXED_OVERHEAD)
+    return budget
+
+
+def _msg_texts(messages: list[dict[str, Any]]) -> list[str]:
+    """Texts whose token counts approximate the rendered prompt (same
+    fields _fit_messages' _msg_tokens weighs)."""
+    texts: list[str] = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            texts.append(json.dumps(c))
+        elif isinstance(c, str) and c:
+            texts.append(c)
+        for tc in m.get("tool_calls") or []:
+            if (isinstance(tc, dict)
+                    and isinstance(tc.get("function"), dict)):
+                fn = tc["function"]
+                texts.append((fn.get("name") or "")
+                             + (fn.get("arguments") or ""))
+    return texts
+
+
+def fit_chat(base_url: str, messages: list[dict[str, Any]],
+             max_tokens: int | None, tools: list[dict] | None,
+             ctx: int, parallel: int,
+             prompt_cap: int | None = None, name: str = "llama-server",
+             timeout: float = 5.0
+             ) -> tuple[list[dict[str, Any]], list[dict] | None]:
+    """Fit a chat payload into the child's per-SLOT context — never errors.
+
+    llama-server 400s on overflow instead of truncating (a full-history
+    agent session kills the request), so trim here: drop oldest
+    non-system messages, truncate an oversized newest message, and
+    budget the NATIVE tools JSON (the child's chat template renders it
+    server-side — its exact cost beats the embedded _tools_instruction
+    estimate by ~40%). EmbeddedEngine._fit_messages does the real work;
+    this wraps it with the slot context and the tokenizer bridge.
+
+    Fast path: ONE /tokenize round trip on the joined contents (plus
+    one for the tools JSON) — when the prompt clearly fits, per-message
+    counts are skipped. Joined separators make the fast-path total
+    slightly LARGER than the slow path's, so it never skips a needed
+    trim. Only near/over budget does the full trim run.
+
+    Knobs (no_think, max_prompt_tokens as prompt_cap) live in the
+    model's config entry, are read per request by the caller, and are
+    deliberately NOT part of the child signature."""
+    slot_ctx = max(512, int(ctx or 0) // max(1, int(parallel or 1)))
+    bridge = _TokenizerBridge(base_url, timeout)
+    bridge.n_ctx = slot_ctx
+    tools_cost = None
+    if tools:
+        tools_cost = int(bridge.count(
+            json.dumps(tools, separators=(",", ":"))) * 1.15) + 128
+    budget = _slot_budget(slot_ctx, max_tokens, prompt_cap)
+    joined = "\n".join(_msg_texts(messages))
+    joined_n = bridge.count(joined) if joined else 0
+    if (joined_n + (tools_cost or 0)
+            + EmbeddedEngine._PER_MSG_OVERHEAD * len(messages) <= budget):
+        return messages, tools
+    shim = types.SimpleNamespace(llama=bridge, name=name)
+    return EmbeddedEngine._fit_messages(shim, messages, max_tokens, tools,
+                                        prompt_cap, tools_cost=tools_cost)
+
+
+def fit_prompt(base_url: str, prompt: str, max_tokens: int | None,
+               ctx: int, parallel: int, name: str = "llama-server",
+               timeout: float = 5.0) -> str:
+    """Fit a raw /v1/completions prompt into the per-SLOT context."""
+    slot_ctx = max(512, int(ctx or 0) // max(1, int(parallel or 1)))
+    bridge = _TokenizerBridge(base_url, timeout)
+    bridge.n_ctx = slot_ctx
+    shim = types.SimpleNamespace(llama=bridge, name=name)
+    budget = _slot_budget(slot_ctx, max_tokens, None)
+    if EmbeddedEngine._count_tokens(shim, prompt) <= budget:
+        return prompt
+    return EmbeddedEngine._truncate_text(shim, prompt, budget)
 
 
 # ── GPU placement → llama-server CLI flags ─────────────────────────────────

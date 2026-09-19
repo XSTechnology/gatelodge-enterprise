@@ -282,6 +282,9 @@ def test_completions_llama_server_subprocess(wired, gguf, monkeypatch):
     monkeypatch.setattr(lsrv, "Popen", _FakePopen)
     monkeypatch.setattr(lsrv, "get_health", fake_health)
     monkeypatch.setattr(lsrv, "post_completions", fake_post_completions)
+    # hermetic /tokenize (fit_prompt) — never hit a real local port
+    monkeypatch.setattr(lsrv, "post_tokenize_sync",
+                        lambda b, c, timeout=5.0: [0] * max(1, len(c) // 5))
     with TestClient(gw_app.app) as client:
         r = client.post("/v1/completions", json={
             "model": "srv:raw", "prompt": "hi", "max_tokens": 12})
@@ -318,6 +321,9 @@ def test_completions_llama_server_subprocess_stream(wired, gguf, monkeypatch):
     monkeypatch.setattr(lsrv, "Popen", _FakePopen)
     monkeypatch.setattr(lsrv, "get_health", fake_health)
     monkeypatch.setattr(lsrv, "stream_completions", fake_stream_completions)
+    # hermetic /tokenize (fit_prompt) — never hit a real local port
+    monkeypatch.setattr(lsrv, "post_tokenize_sync",
+                        lambda b, c, timeout=5.0: [0] * max(1, len(c) // 5))
     with TestClient(gw_app.app) as client:
         with client.stream("POST", "/v1/completions", json={
                 "model": "srv:raw", "stream": True, "prompt": "hi"}) as r:
