@@ -1600,7 +1600,12 @@ async def healthz() -> dict[str, Any]:
     cfg.maybe_reload()
     engine = get_engine()
 
-    gpus = detect_gpus()
+    # Fresh-enough VRAM: the 30s placement cache would report the
+    # pre-load snapshot right after a model loads/unloads (observed:
+    # "used 0 MB" with the pool resident, until the cache aged out).
+    # 2s TTL = at most one nvidia-smi spawn (~100ms) per 2s under the
+    # console/poller load; placement callers keep the 30s default.
+    gpus = detect_gpus(ttl_s=2.0)
     for g in gpus:
         g["free_mb"] = max(g["total_mb"] - g["used_mb"], 0)
 

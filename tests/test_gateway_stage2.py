@@ -305,7 +305,7 @@ def test_stream_engine_error_yields_error_event(wired, gguf):
 
 def test_healthz(wired, gguf, monkeypatch):
     _, cfg, engine = wired(_local_config(gguf))
-    monkeypatch.setattr(gw_app, "detect_gpus", lambda: [
+    monkeypatch.setattr(gw_app, "detect_gpus", lambda **kw: [
         {"index": 0, "name": "Fake 3090", "total_mb": 24564, "used_mb": 25000}])
 
     def fn(records):
@@ -330,8 +330,26 @@ def test_healthz(wired, gguf, monkeypatch):
 
 def test_healthz_free_vram_computed(wired, gguf, monkeypatch):
     wired(_local_config(gguf))
-    monkeypatch.setattr(gw_app, "detect_gpus", lambda: [
+    monkeypatch.setattr(gw_app, "detect_gpus", lambda **kw: [
         {"index": 0, "name": "G1", "total_mb": 1000, "used_mb": 250}])
     with TestClient(gw_app.app) as client:
         r = client.get("/healthz")
     assert r.json()["gpus"][0]["free_mb"] == 750
+
+
+def test_healthz_uses_short_gpu_ttl(wired, gguf, monkeypatch):
+    """/healthz must NOT use the 30s placement cache — after a model
+    loads, the cached pre-load snapshot showed 'used 0 MB' until the
+    cache aged out (observed live)."""
+    wired(_local_config(gguf))
+    seen: list[float] = []
+
+    def fake_detect(ttl_s=30.0):
+        seen.append(ttl_s)
+        return [{"index": 0, "name": "G1", "total_mb": 1000,
+                 "used_mb": 100}]
+
+    monkeypatch.setattr(gw_app, "detect_gpus", fake_detect)
+    with TestClient(gw_app.app) as client:
+        assert client.get("/healthz").status_code == 200
+    assert seen and all(t < 30.0 for t in seen)
