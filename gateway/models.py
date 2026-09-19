@@ -490,6 +490,14 @@ class EmbeddedEngine:
         created on the caller's thread when empty (tests, /admin/load)."""
         return self._pool_for(model_name).first_or_create()
 
+    def _model_entry(self, model_name: str | None) -> dict[str, Any]:
+        """Config entry for a chat model — {} for auto-discovered GGUFs
+        (no knobs; the unknown-name error surfaces at _acquire). Per-
+        request knobs (no_think, max_prompt_tokens) live here, NOT in
+        the pool signature: flag flips hot-reload on the next request
+        without rebuilding the loaded instance."""
+        return self._config.local_models().get((model_name or "").strip()) or {}
+
     async def _acquire(self, model_name: str | None) -> _Instance:
         """Check out an exclusive instance for a request (worker pool)."""
         return await self._pool_for(model_name).acquire()
@@ -794,6 +802,31 @@ class EmbeddedEngine:
             out.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
         return out
 
+    @staticmethod
+    def _apply_no_think(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Append the Qwen3 /no_think soft switch to a normalized chat.
+
+        The GGUF chat template has no no_think logic of its own (only an
+        enable_thinking variable llama-cpp-python 0.3.35 cannot pass),
+        but the MODEL is trained on the marker and complies — verified
+        live on Qwen3-8B-Q4_K_M: 400-token reasoning run → 7 tokens
+        (empty <think></think>, then the answer), 3.2s → 0.07s. Marker
+        goes on the merged leading system message when present, else on
+        the newest user turn (the documented fallback position)."""
+        if messages and messages[0].get("role") == "system":
+            first = dict(messages[0])
+            first["content"] = ((first.get("content") or "").strip()
+                                + "\n/no_think")
+            return [first] + list(messages[1:])
+        for i in range(len(messages) - 1, -1, -1):
+            if (messages[i].get("role") == "user"
+                    and isinstance(messages[i].get("content"), str)
+                    and messages[i]["content"]):
+                m = dict(messages[i])
+                m["content"] = m["content"].rstrip() + "\n/no_think"
+                return list(messages[:i]) + [m] + list(messages[i + 1:])
+        return messages
+
     # ── context-window fitting ──────────────────────────────────────────
     # llama-cpp raises "Requested tokens (N) exceed context window" on
     # overflow — it does NOT truncate. Agent clients that resend full
@@ -856,6 +889,7 @@ class EmbeddedEngine:
     def _fit_messages(inst: "_Instance", messages: list[dict[str, Any]],
                       max_tokens: int | None,
                       tools: list[dict] | None = None,
+                      prompt_cap: int | None = None,
                       ) -> tuple[list[dict[str, Any]], list[dict] | None]:
         """Fit the prompt into the context window — never errors.
 
@@ -875,11 +909,23 @@ class EmbeddedEngine:
         33,288 rendered > 32,768). Returns (messages, tools); tools are
         returned unchanged unless they starve the window, in which case
         they are dropped (plain-chat degradation beats a hard failure).
+
+        prompt_cap (backends.local.models.<name>.max_prompt_tokens)
+        bounds the rendered prompt — messages + tools + overhead —
+        BELOW the context window. Prefill time grows ~linearly with
+        prompt size, and agent clients with hard client-side timeouts
+        (Workshop sessions fail past ~16-50s) need the worst case
+        bounded even when the window could hold more history. The cap
+        must leave room above the tools floor or tools drop (same
+        plain-chat degradation as an n_ctx-starved window).
         """
         raw = getattr(getattr(inst, "llama", None), "n_ctx", 0)
         n_ctx = int(raw() if callable(raw) else (raw or 0)) or 4096
         reserve = min(int(max_tokens or 2048), max(256, n_ctx // 4))
         budget = n_ctx - reserve - EmbeddedEngine._FIXED_OVERHEAD
+        if prompt_cap:
+            budget = min(budget,
+                         int(prompt_cap) - EmbeddedEngine._FIXED_OVERHEAD)
         if tools:
             tools_cost = EmbeddedEngine._count_tokens(
                 inst, EmbeddedEngine._tools_instruction(tools))
@@ -1031,6 +1077,18 @@ class _CompletionsEndpoint:
         temperature = kwargs.get("temperature")
 
         inst = await self._engine._acquire(model_name)
+        # Per-model config knobs (hot-reload; NOT in the pool signature):
+        # - max_prompt_tokens: cap the rendered prompt below n_ctx —
+        #   prefill ~linear in prompt size, agent clients with hard
+        #   client-side timeouts need the worst case bounded
+        # - no_think: Qwen3 soft switch — skips the reasoning phase
+        #   (held back from streams, so it is pure added latency)
+        entry = self._engine._model_entry(model_name)
+        try:
+            prompt_cap = int(entry.get("max_prompt_tokens") or 0) or None
+        except (TypeError, ValueError):
+            prompt_cap = None
+        no_think = bool(entry.get("no_think"))
         # Fit to the context window BEFORE anything else: llama-cpp
         # errors on overflow instead of truncating, so a full-history
         # agent session would die mid-stream ("Requested tokens exceed
@@ -1038,17 +1096,21 @@ class _CompletionsEndpoint:
         # it off the event loop. Pass tools: their serialized form joins
         # the system message after trimming and must be budgeted for.
         messages, tools = await asyncio.to_thread(
-            self._engine._fit_messages, inst, messages, max_tokens, tools)
+            self._engine._fit_messages, inst, messages, max_tokens, tools,
+            prompt_cap)
         llm_kwargs: dict[str, Any] = {"temperature": temperature if temperature is not None else 0.1}
         if max_tokens:
             llm_kwargs["max_tokens"] = max_tokens
         if stream:
+            norm = self._engine._normalize_messages(messages, tools)
+            if no_think:
+                norm = EmbeddedEngine._apply_no_think(norm)
             # the generator owns the checkout; it releases in its finally
-            return self._stream(model_name, inst,
-                                self._engine._normalize_messages(messages, tools),
-                                llm_kwargs)
+            return self._stream(model_name, inst, norm, llm_kwargs)
         try:
             norm = self._engine._normalize_messages(messages, tools)
+            if no_think:
+                norm = EmbeddedEngine._apply_no_think(norm)
             try:
                 msg, usage = await asyncio.to_thread(
                     self._engine._completion_sync, inst, norm, llm_kwargs
@@ -1078,6 +1140,8 @@ class _CompletionsEndpoint:
                     plain = [m for m in plain if m.get("role") != "system"]
                     if sys_txt:
                         plain.insert(0, {"role": "system", "content": sys_txt})
+                    if no_think:
+                        plain = EmbeddedEngine._apply_no_think(plain)
                     retry_kwargs = dict(llm_kwargs)
                     try:
                         msg, usage = await asyncio.to_thread(

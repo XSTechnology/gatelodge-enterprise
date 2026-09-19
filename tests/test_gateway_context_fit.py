@@ -259,6 +259,93 @@ def test_fit_messages_drops_tools_that_fill_the_window():
     assert out == msgs  # messages untouched — they fit fine
 
 
+def test_fit_messages_prompt_cap_trims_below_window():
+    """max_prompt_tokens bounds the rendered prompt BELOW n_ctx — the
+    latency knob for clients with hard timeouts (prefill is ~linear in
+    prompt size: pool trims to ~25k render+prefill ~12s; a cap trims
+    harder and prefills proportionally faster)."""
+    inst = _FakeInst(n_ctx=4096)
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(40):
+        msgs.append({"role": "user", "content": f"msg {i} " + "x" * 200})
+    # window budget 4096-256-64 = 3776; ~2660 tokens of messages fit
+    out_win, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
+    assert len(out_win) == len(msgs)  # no window trim
+    # cap 1600 → budget 1536 → harder trim
+    out_cap, _ = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256, None, 1600)
+    assert len(out_cap) < len(out_win)
+    assert out_cap[-1]["content"].startswith("msg 39")  # newest kept
+    cost = sum(gw_models.EmbeddedEngine._count_tokens(
+        inst, m.get("content") or "") + 16 for m in out_cap)
+    assert cost <= 1600 - 64
+
+
+def test_fit_messages_prompt_cap_counts_tools():
+    """The cap bounds messages + tools together — the rendered prompt,
+    not just the message history."""
+    inst = _FakeInst(n_ctx=4096)
+    tools = _big_tools(2, desc_len=1200)  # ~700 tokens of schemas
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(40):
+        msgs.append({"role": "user", "content": f"msg {i} " + "x" * 200})
+    out, kept_tools = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256, tools, 3000)
+    assert kept_tools == tools  # they fit under the cap
+    assert len(out) < len(msgs)
+    tools_cost = gw_models.EmbeddedEngine._count_tokens(
+        inst, gw_models.EmbeddedEngine._tools_instruction(tools))
+    msg_cost = sum(
+        gw_models.EmbeddedEngine._count_tokens(inst, m.get("content") or "")
+        + 16 for m in out)
+    assert msg_cost + tools_cost <= 3000 - 64
+
+
+def test_fit_messages_prompt_cap_starved_drops_tools():
+    """A cap tighter than the tools floor drops tools — the same
+    plain-chat degradation as an n_ctx-starved window."""
+    inst = _FakeInst(n_ctx=4096)
+    tools = _big_tools(3, desc_len=2500)  # ~1.9k tokens
+    msgs = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"}]
+    out, kept_tools = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256, tools, 1024)
+    assert kept_tools is None  # dropped: 960 budget - 1.9k tools < floor
+    assert out == msgs
+
+
+def test_fit_messages_prompt_cap_above_window_is_noop():
+    inst = _FakeInst(n_ctx=1024)
+    msgs = [{"role": "user", "content": "hi"}]
+    out, _ = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256, None, 999999)
+    assert out == msgs
+
+
+# ── unit: EmbeddedEngine._apply_no_think ───────────────────────────────────
+
+def test_apply_no_think_appends_to_system():
+    msgs = [{"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"}]
+    out = gw_models.EmbeddedEngine._apply_no_think(msgs)
+    assert out[0]["content"] == "be brief\n/no_think"
+    assert out[1] == msgs[1]
+    assert msgs[0]["content"] == "be brief"  # input not mutated
+
+
+def test_apply_no_think_tags_newest_user_without_system():
+    msgs = [{"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"}]
+    out = gw_models.EmbeddedEngine._apply_no_think(msgs)
+    assert out[-1]["content"] == "three\n/no_think"
+    assert out[0]["content"] == "one"  # earlier turns untouched
+
+
+def test_apply_no_think_empty_is_noop():
+    assert gw_models.EmbeddedEngine._apply_no_think([]) == []
+
+
 # ── integration: /v1/chat/completions end-to-end ───────────────────────────
 
 def test_chat_completions_trims_oversized_history(wired, gguf):
@@ -294,6 +381,89 @@ def test_chat_completions_trims_oversized_history(wired, gguf):
         assert len(sent) < 40
         assert sent[-1]["content"].startswith("turn 39")
         assert not any(m["content"].startswith("turn 0 ") for m in sent)
+    finally:
+        if real is not None:
+            sys.modules["llama_cpp"] = real
+        else:
+            sys.modules.pop("llama_cpp", None)
+
+
+def test_chat_completions_no_think_and_prompt_cap(wired, gguf):
+    """Config knobs reach the wire: no_think appends the Qwen3 soft
+    switch to the system message the engine actually sends, and
+    max_prompt_tokens trims below the context window's own budget."""
+    wired(_config(gguf, ctx=4096, no_think=True, max_prompt_tokens=1600))
+    records: list[dict] = []
+
+    class FakeLlama:
+        def __init__(self, **kw):
+            self.n_ctx = kw.get("n_ctx", 4096)  # int attr, no tokenize
+
+        def create_chat_completion(self, **kw):
+            records.append(kw)
+            return {"choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                              "total_tokens": 2}}
+
+    mod = types.ModuleType("llama_cpp")
+    mod.Llama = FakeLlama
+    real = sys.modules.get("llama_cpp")
+    sys.modules["llama_cpp"] = mod
+    try:
+        with TestClient(gw_app.app) as c:
+            r = c.post("/v1/chat/completions", json={
+                "model": "fast",
+                "messages": [{"role": "system", "content": "sys"}]
+                + [{"role": "user", "content": f"turn {i} " + "z" * 300}
+                   for i in range(40)],
+                "max_tokens": 50})
+        assert r.status_code == 200, r.text
+        assert len(records) == 1
+        sent = records[0]["messages"]
+        # soft switch landed on the (trim-noted) system message
+        assert sent[0]["role"] == "system"
+        assert sent[0]["content"].endswith("/no_think")
+        # window budget 3776 would keep all ~3737 tokens; the 1536 cap
+        # must be what trimmed
+        assert len(sent) < 41
+        assert sent[-1]["content"].startswith("turn 39")
+    finally:
+        if real is not None:
+            sys.modules["llama_cpp"] = real
+        else:
+            sys.modules.pop("llama_cpp", None)
+
+
+def test_chat_completions_no_think_defaults_off(wired, gguf):
+    """Without the flag nothing is appended — other models/consumers
+    keep Qwen3-style reasoning."""
+    wired(_config(gguf, ctx=4096))
+    records: list[dict] = []
+
+    class FakeLlama:
+        def __init__(self, **kw):
+            self.n_ctx = kw.get("n_ctx", 4096)
+
+        def create_chat_completion(self, **kw):
+            records.append(kw)
+            return {"choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                              "total_tokens": 2}}
+
+    mod = types.ModuleType("llama_cpp")
+    mod.Llama = FakeLlama
+    real = sys.modules.get("llama_cpp")
+    sys.modules["llama_cpp"] = mod
+    try:
+        with TestClient(gw_app.app) as c:
+            r = c.post("/v1/chat/completions", json={
+                "model": "fast",
+                "messages": [{"role": "system", "content": "sys"},
+                             {"role": "user", "content": "hi"}],
+                "max_tokens": 50})
+        assert r.status_code == 200, r.text
+        sent = records[0]["messages"]
+        assert sent[0]["content"] == "sys"  # no marker, no trim note
     finally:
         if real is not None:
             sys.modules["llama_cpp"] = real
