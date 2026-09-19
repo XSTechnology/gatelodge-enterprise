@@ -44,6 +44,11 @@ def _with_fake_llama(fn, script=None):
             records.append({"call": kwargs})
             if kwargs.get("stream"):
                 def _gen():
+                    # hold the checkout while streaming — without this the
+                    # stream finishes in ~0ms and a concurrent request can
+                    # reuse the same worker (test_pool_stream_holds_worker
+                    # raced on exactly that)
+                    time.sleep(GEN_DELAY)
                     yield {"choices": [{"delta": {"content": "hi"}}]}
                 return _gen()
             time.sleep(GEN_DELAY)  # simulate a real generation

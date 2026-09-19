@@ -88,7 +88,7 @@ def test_fit_messages_noop_when_fits():
     msgs = [{"role": "system", "content": "be brief"},
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"}]
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
     assert out == msgs  # unchanged — and no trim note injected
 
 
@@ -97,7 +97,7 @@ def test_fit_messages_trims_oldest_keeps_system_and_newest():
     msgs = [{"role": "system", "content": "sys"}]
     for i in range(20):
         msgs.append({"role": "user", "content": f"msg {i} " + "x" * 400})
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
     # budget = 2048 - 256 - 64 = 1728; system kept, oldest dropped
     assert out[0]["role"] == "system"
     assert "truncated" in out[0]["content"]  # trim note appended
@@ -117,7 +117,7 @@ def test_fit_messages_truncates_oversized_newest_message():
     msgs = [{"role": "system", "content": "sys"},
             {"role": "user", "content": "old turn"},
             {"role": "user", "content": big}]
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
     assert out[0]["role"] == "system"
     assert "truncated" in out[0]["content"]  # trim note
     assert len(out) == 2  # system + newest only; old turn dropped
@@ -136,7 +136,7 @@ def test_fit_messages_truncates_system_when_it_fills_window():
     truncate the system content rather than erroring."""
     inst = _FakeInst(n_ctx=512)
     msgs = [{"role": "system", "content": "HEAD " + "s" * 4000 + " TAIL"}]
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
     assert len(out) == 1
     assert out[0]["role"] == "system"
     assert out[0]["content"].startswith("HEAD")
@@ -154,7 +154,7 @@ def test_fit_messages_truncates_newest_tool_call_arguments():
                 "id": "c1", "type": "function",
                 "function": {"name": "write_file",
                              "arguments": '{"body": "' + "y" * 8000 + '"}'}}]}]
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
     args = out[-1]["tool_calls"][0]["function"]["arguments"]
     assert len(args) < 8000
     assert "truncated" in args
@@ -164,7 +164,7 @@ def test_fit_messages_without_system_keeps_newest():
     inst = _FakeInst(n_ctx=1024)
     msgs = [{"role": "user", "content": f"m{i} " + "y" * 100}
             for i in range(30)]
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
     assert len(out) < 30
     assert out[-1]["content"].startswith("m29")
     assert all(m["role"] == "user" for m in out)
@@ -183,7 +183,7 @@ def test_fit_messages_counts_tool_call_messages():
                                                   "pad": "p" * 150})}}]})
         msgs.append({"role": "tool", "tool_call_id": f"c{i}",
                      "content": "r" * 200})
-    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
     assert len(out) < len(msgs)
     assert out[-1]["content"] == "r" * 200  # newest tool result kept
 
@@ -200,9 +200,63 @@ def test_fit_messages_heuristic_when_no_tokenizer():
 
     msgs = [{"role": "user", "content": f"m{i} " + "x" * 400}
             for i in range(30)]
-    out = gw_models.EmbeddedEngine._fit_messages(_Inst(), msgs, 256)
+    out, _ = gw_models.EmbeddedEngine._fit_messages(_Inst(), msgs, 256)
     assert len(out) < 30
     assert out[-1]["content"].startswith("m29")
+
+
+def _big_tools(n: int, desc_len: int = 400) -> list[dict]:
+    """Tool schemas like an agent client sends: n tools, fat descriptions."""
+    return [{"type": "function", "function": {
+        "name": f"tool_{i}",
+        "description": "d" * desc_len,
+        "parameters": {"type": "object",
+                       "properties": {"a": {"type": "string"}}}}} for i in range(n)]
+
+
+def test_fit_messages_reserves_room_for_tools():
+    """Tools are serialized into the system message AFTER trimming —
+    their token cost must come out of the budget or the rendered prompt
+    busts the window even after a clean trim (the live srv8b/pool
+    failure: 24,490-token trim + ~8.8k of tool schemas = 33,288 > 32,768).
+    """
+    inst = _FakeInst(n_ctx=2048)
+    tools = _big_tools(2, desc_len=1200)  # ~700 tokens of schemas
+    # messages that fit WITHOUT tools (budget 1728) but not WITH them
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(10):
+        msgs.append({"role": "user", "content": f"msg {i} " + "x" * 400})
+
+    plain_out, plain_tools = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256)
+    assert plain_tools is None  # no tools passed
+    assert plain_out == msgs  # fits comfortably without tools
+
+    out, kept_tools = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256, tools)
+    assert kept_tools == tools  # tools survive (they fit)
+    assert len(out) < len(msgs)  # but the trim is now harder
+    # system + kept messages + tools instruction must fit the budget
+    tools_cost = gw_models.EmbeddedEngine._count_tokens(
+        inst, gw_models.EmbeddedEngine._tools_instruction(tools))
+    msg_cost = sum(
+        gw_models.EmbeddedEngine._count_tokens(inst, m.get("content") or "")
+        + 16 for m in out)
+    assert msg_cost + tools_cost <= 2048 - 256 - 64
+
+
+def test_fit_messages_drops_tools_that_fill_the_window():
+    """Pathological tool payload (schemas bigger than the window minus
+    reserve): tools are dropped rather than erroring — a plain-chat
+    answer beats a hard failure."""
+    inst = _FakeInst(n_ctx=1024)
+    tools = _big_tools(3, desc_len=2500)  # ~1.9k tokens — budget is 704
+    msgs = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"}]
+    out, kept_tools = gw_models.EmbeddedEngine._fit_messages(
+        inst, msgs, 256, tools)
+    assert kept_tools is None  # dropped
+    assert out == msgs  # messages untouched — they fit fine
 
 
 # ── integration: /v1/chat/completions end-to-end ───────────────────────────

@@ -854,22 +854,46 @@ class EmbeddedEngine:
 
     @staticmethod
     def _fit_messages(inst: "_Instance", messages: list[dict[str, Any]],
-                      max_tokens: int | None) -> list[dict[str, Any]]:
+                      max_tokens: int | None,
+                      tools: list[dict] | None = None,
+                      ) -> tuple[list[dict[str, Any]], list[dict] | None]:
         """Fit the prompt into the context window — never errors.
 
         Drop oldest non-system messages until the prompt fits n_ctx.
-        Keeps every system message (instructions + tool definitions) and
-        the newest turns. When the newest message ALONE (plus system)
-        exceeds the window — huge tool_result/summary blocks from agent
-        clients — its content is head+tail truncated instead of raising
-        (a degraded answer beats a hard failure); the system prompt is
-        only truncated as a last resort when it fills the window itself.
-        Returns the message list unchanged when it already fits.
+        Keeps every system message (instructions) and the newest turns.
+        When the newest message ALONE (plus system) exceeds the window —
+        huge tool_result/summary blocks from agent clients — its content
+        is head+tail truncated instead of raising (a degraded answer
+        beats a hard failure); the system prompt is only truncated as a
+        last resort when it fills the window itself.
+
+        The budget reserves room for the tool definitions: they are
+        serialized into the system message by _normalize_messages AFTER
+        trimming, so a message-only count never sees them — agent
+        clients (Workshop) send tool schemas rendering to thousands of
+        tokens (verified live: 24,490-token trim + ~8.8k of tools =
+        33,288 rendered > 32,768). Returns (messages, tools); tools are
+        returned unchanged unless they starve the window, in which case
+        they are dropped (plain-chat degradation beats a hard failure).
         """
         raw = getattr(getattr(inst, "llama", None), "n_ctx", 0)
         n_ctx = int(raw() if callable(raw) else (raw or 0)) or 4096
         reserve = min(int(max_tokens or 2048), max(256, n_ctx // 4))
         budget = n_ctx - reserve - EmbeddedEngine._FIXED_OVERHEAD
+        if tools:
+            tools_cost = EmbeddedEngine._count_tokens(
+                inst, EmbeddedEngine._tools_instruction(tools))
+            # floor: keep tools unless they'd starve messages to an
+            # unusable sliver (proportional so small windows still work)
+            floor = max(256, n_ctx // 16)
+            if budget - tools_cost < floor:
+                logger.warning("tool definitions (%d tokens) + reserve "
+                               "leave < %d tokens for messages on %s "
+                               "(n_ctx %d) — dropping tools", tools_cost,
+                               floor, getattr(inst, "name", "?"), n_ctx)
+                tools = None
+            else:
+                budget -= tools_cost
 
         def _msg_tokens(m: dict[str, Any]) -> int:
             n = EmbeddedEngine._PER_MSG_OVERHEAD
@@ -887,7 +911,7 @@ class EmbeddedEngine:
         counts = [_msg_tokens(m) for m in messages]
         total = sum(counts)
         if total <= budget:
-            return messages
+            return messages, tools
 
         sys_idx = [i for i, m in enumerate(messages) if m.get("role") == "system"]
         sys_cost = sum(counts[i] for i in sys_idx)
@@ -954,7 +978,7 @@ class EmbeddedEngine:
             if out:
                 out[0]["content"] = ((out[0].get("content") or "")
                                      + EmbeddedEngine._TRIM_NOTE)
-            return out
+            return out, tools
         kept.reverse()
         logger.warning("prompt trimmed %d→%d tokens for %s (n_ctx %d, "
                        "reserve %d, dropped %d oldest messages)",
@@ -966,7 +990,7 @@ class EmbeddedEngine:
         if sys_idx:
             first = out[0]
             first["content"] = (first.get("content") or "") + EmbeddedEngine._TRIM_NOTE
-        return out
+        return out, tools
 
     def _completion_sync(self, inst: _Instance, messages: list[dict], kwargs: dict) -> tuple[_Message, dict[str, int]]:
         try:
@@ -1011,9 +1035,10 @@ class _CompletionsEndpoint:
         # errors on overflow instead of truncating, so a full-history
         # agent session would die mid-stream ("Requested tokens exceed
         # context window"). Tokenizing a huge prompt is not free — keep
-        # it off the event loop.
-        messages = await asyncio.to_thread(
-            self._engine._fit_messages, inst, messages, max_tokens)
+        # it off the event loop. Pass tools: their serialized form joins
+        # the system message after trimming and must be budgeted for.
+        messages, tools = await asyncio.to_thread(
+            self._engine._fit_messages, inst, messages, max_tokens, tools)
         llm_kwargs: dict[str, Any] = {"temperature": temperature if temperature is not None else 0.1}
         if max_tokens:
             llm_kwargs["max_tokens"] = max_tokens
