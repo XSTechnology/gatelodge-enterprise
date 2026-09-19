@@ -209,6 +209,47 @@ def _event_ring() -> _RingHandler:
 _event_ring()  # attach at import — events before the first /admin/events call
 
 
+# ── benign client-disconnect noise ─────────────────────────────────────────
+
+class _BenignDisconnectFilter(logging.Filter):
+    """Drop post-stream client-disconnect log noise.
+
+    Clients that close immediately after [DONE] (Workshop's SDK) or
+    abort mid-stream leave the server writing into a dead socket. On
+    Windows that surfaces as an uvicorn 'Exception in ASGI application'
+    traceback ending in ConnectionResetError [WinError 10054] plus
+    asyncio-proactor 'socket.send() raised exception.' lines — AFTER a
+    request that already completed successfully on our side. The filter
+    is attached ONLY to the uvicorn.error / asyncio loggers: gateway.* /
+    httpx records keep their full tracebacks (a child-side reset still
+    logs normally through our own handlers)."""
+
+    _BENIGN_NAMES = ("ClientDisconnected", "BrokenResourceError",
+                     "EndOfStream")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if "socket.send() raised exception" in record.getMessage():
+                return False
+            exc = record.exc_info[1] if record.exc_info else None
+            depth = 0
+            while exc is not None and depth < 8:  # walk cause/context chain
+                if isinstance(exc, (ConnectionResetError,
+                                    ConnectionAbortedError)):
+                    return False
+                if type(exc).__name__ in self._BENIGN_NAMES:
+                    return False
+                exc = exc.__cause__ or exc.__context__
+                depth += 1
+        except Exception:  # noqa: BLE001 — never break logging
+            pass
+        return True
+
+
+for _lg_name in ("uvicorn.error", "asyncio"):
+    logging.getLogger(_lg_name).addFilter(_BenignDisconnectFilter())
+
+
 @app.on_event("shutdown")
 async def _kill_llama_servers() -> None:
     """Stop every managed llama-server child when the gateway exits."""
@@ -2841,8 +2882,11 @@ async def admin_download_model(payload: DownloadPayload) -> Response:
 
     try:
         if filename:
-            # Download specific file
-            dest = huggingface_hub.hf_hub_download(
+            # Download specific file — to_thread: a multi-GB GGUF on the
+            # event loop would freeze every concurrent request (healthz,
+            # chats) for the whole download.
+            dest = await asyncio.to_thread(
+                huggingface_hub.hf_hub_download,
                 repo_id=repo_id,
                 filename=filename,
                 local_dir=str(models_dir),
@@ -2851,17 +2895,22 @@ async def admin_download_model(payload: DownloadPayload) -> Response:
         else:
             # Auto-detect: find first .gguf file in repo
             api = huggingface_hub.HfApi(token=hf_token)
-            try:
-                files = api.list_repo_files(repo_id=repo_id, repo_type="model")
-            except Exception:
-                files = api.list_repo_files(repo_id=repo_id)
+
+            def _list_files() -> list[str]:
+                try:
+                    return api.list_repo_files(repo_id=repo_id, repo_type="model")
+                except Exception:
+                    return api.list_repo_files(repo_id=repo_id)
+
+            files = await asyncio.to_thread(_list_files)
             ggufs = [f for f in files if f.endswith(".gguf")]
             if not ggufs:
                 return _error(404, f"No .gguf files found in {repo_id}",
                               code="no_gguf_found")
             # Pick the first one (usually the main quant)
             filename = ggufs[0]
-            dest = huggingface_hub.hf_hub_download(
+            dest = await asyncio.to_thread(
+                huggingface_hub.hf_hub_download,
                 repo_id=repo_id,
                 filename=filename,
                 local_dir=str(models_dir),

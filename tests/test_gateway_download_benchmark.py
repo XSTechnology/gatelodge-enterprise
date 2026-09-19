@@ -136,6 +136,59 @@ def test_download_with_hf_token(wired, tmp_path, monkeypatch):
     assert call_kwargs.get("token") == "hf_test_token"
 
 
+def test_download_runs_off_event_loop(wired, tmp_path, monkeypatch):
+    """hf_hub_download must run in a worker thread — a multi-GB GGUF on
+    the event loop would freeze every concurrent request (healthz,
+    chats) for the whole download."""
+    import threading
+    import time
+
+    fake_dest = tmp_path / "model.gguf"
+    fake_dest.write_bytes(b"x" * 1024)
+    seen_threads = []
+
+    def slow_download(**kwargs):
+        seen_threads.append(threading.get_ident())
+        time.sleep(0.05)  # stand-in for a minutes-long network download
+        return str(fake_dest)
+
+    monkeypatch.setattr(gw_app.huggingface_hub, "hf_hub_download",
+                        slow_download)
+    cfgfile, cfg, engine = wired(_base_config(Path(tmp_path) / "fake.gguf"))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/admin/models/download", json={
+            "repo_id": "test/repo", "filename": "model.gguf"})
+    assert r.status_code == 200
+    assert seen_threads and seen_threads[0] != threading.get_ident()
+
+
+def test_download_auto_detect_lists_off_event_loop(wired, tmp_path, monkeypatch):
+    import threading
+
+    fake_dest = tmp_path / "auto.gguf"
+    fake_dest.write_bytes(b"x" * 1024)
+    list_threads = []
+
+    fake_api = MagicMock()
+
+    def _list_files(**kw):
+        list_threads.append(threading.get_ident())
+        return ["auto.gguf", "other.bin"]
+
+    fake_api.list_repo_files.side_effect = _list_files
+    monkeypatch.setattr(gw_app.huggingface_hub, "HfApi",
+                        MagicMock(return_value=fake_api))
+    monkeypatch.setattr(gw_app.huggingface_hub, "hf_hub_download",
+                        MagicMock(return_value=str(fake_dest)))
+
+    cfgfile, cfg, engine = wired(_base_config(Path(tmp_path) / "fake.gguf"))
+    with TestClient(gw_app.app) as c:
+        r = c.post("/admin/models/download", json={"repo_id": "test/repo"})
+    assert r.status_code == 200
+    assert r.json()["downloaded"] == "auto.gguf"
+    assert list_threads and list_threads[0] != threading.get_ident()
+
+
 # ── Benchmark tests ────────────────────────────────────────────────────────
 
 def test_benchmark_missing_model(wired, tmp_path):

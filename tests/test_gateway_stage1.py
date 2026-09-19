@@ -639,3 +639,58 @@ def test_chat_embedded_error_502(wired, gguf):
             "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 502
     assert r.json()["error"]["type"] == "server_error"
+
+
+# ── benign client-disconnect log filter ────────────────────────────────────
+
+def _record(msg, exc=None):
+    import logging as _logging
+    return _logging.LogRecord(
+        "uvicorn.error", _logging.ERROR, __file__, 1, msg, None, exc)
+
+
+def test_disconnect_filter_drops_winerror_10054_traceback():
+    """The classic post-stream noise: uvicorn's ASGI pump writing into a
+    socket the client already closed."""
+    f = gw_app._BenignDisconnectFilter()
+    try:
+        raise ConnectionResetError(10054, "An existing connection was "
+                                          "forcibly closed by the remote host")
+    except ConnectionResetError:
+        rec = _record("Exception in ASGI application", sys.exc_info())
+    assert f.filter(rec) is False
+
+
+def test_disconnect_filter_drops_reset_in_cause_chain():
+    f = gw_app._BenignDisconnectFilter()
+    try:
+        try:
+            raise ConnectionAbortedError(10053, "aborted")
+        except ConnectionAbortedError as root:
+            raise RuntimeError("send failed") from root
+    except RuntimeError:
+        rec = _record("Exception in ASGI application", sys.exc_info())
+    assert f.filter(rec) is False
+
+
+def test_disconnect_filter_drops_asyncio_send_noise():
+    f = gw_app._BenignDisconnectFilter()
+    assert f.filter(_record("socket.send() raised exception.")) is False
+
+
+def test_disconnect_filter_keeps_real_errors():
+    f = gw_app._BenignDisconnectFilter()
+    try:
+        raise RuntimeError("embedded generation failed")
+    except RuntimeError:
+        rec = _record("Exception in ASGI application", sys.exc_info())
+    assert f.filter(rec) is True
+    assert f.filter(_record("llama-server 500: boom")) is True
+
+
+def test_disconnect_filter_attached_to_expected_loggers():
+    import logging as _logging
+    for name in ("uvicorn.error", "asyncio"):
+        filters = [f for f in _logging.getLogger(name).filters
+                   if isinstance(f, gw_app._BenignDisconnectFilter)]
+        assert filters, f"filter missing on {name!r} logger"
