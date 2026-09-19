@@ -828,14 +828,43 @@ class EmbeddedEngine:
         return max(1, len(text) // 4)
 
     @staticmethod
+    def _truncate_text(inst: "_Instance", text: str, max_tokens: int) -> str:
+        """Shorten text to <= max_tokens, keeping head AND tail.
+
+        Agent prompts put the actual question at the END of a message
+        while file/log dumps matter from the start — a middle cut keeps
+        both. Verifies with the same counter _fit_messages uses; returns
+        text unchanged when it already fits."""
+        if not text:
+            return text
+        total = EmbeddedEngine._count_tokens(inst, text)
+        if total <= max_tokens:
+            return text
+        marker = ("\n[... middle of this message was truncated to fit "
+                  "the context window ...]\n")
+        for shrink in (0.92, 0.75, 0.6, 0.45, 0.3, 0.2, 0.12):
+            target = max(128, int(len(text) * (max_tokens / total) * shrink))
+            half = max(32, (target - len(marker)) // 2)
+            cand = text[:half] + marker + text[-half:]
+            if EmbeddedEngine._count_tokens(inst, cand) <= max_tokens:
+                return cand
+        # pathological tokenizer behavior — hard cut as the last resort
+        target = max(128, int(len(text) * (max_tokens / total) * 0.1))
+        return text[:target] + "\n[... truncated ...]"
+
+    @staticmethod
     def _fit_messages(inst: "_Instance", messages: list[dict[str, Any]],
                       max_tokens: int | None) -> list[dict[str, Any]]:
-        """Drop oldest non-system messages until the prompt fits n_ctx.
+        """Fit the prompt into the context window — never errors.
 
+        Drop oldest non-system messages until the prompt fits n_ctx.
         Keeps every system message (instructions + tool definitions) and
-        the newest turns. Returns the message list unchanged when it
-        already fits. Raises EmbeddedLLMError when even system + the
-        newest message exceed the window — nothing left to drop.
+        the newest turns. When the newest message ALONE (plus system)
+        exceeds the window — huge tool_result/summary blocks from agent
+        clients — its content is head+tail truncated instead of raising
+        (a degraded answer beats a hard failure); the system prompt is
+        only truncated as a last resort when it fills the window itself.
+        Returns the message list unchanged when it already fits.
         """
         raw = getattr(getattr(inst, "llama", None), "n_ctx", 0)
         n_ctx = int(raw() if callable(raw) else (raw or 0)) or 4096
@@ -872,11 +901,60 @@ class EmbeddedEngine:
             kept.append(i)
             acc += counts[i]
         if not kept:
-            need = (sys_cost + counts[nonsys[-1]]) if nonsys else sys_cost
-            raise EmbeddedLLMError(
-                f"prompt ({total} tokens) exceeds context window ({n_ctx}) "
-                f"even after trimming — system + newest message alone need "
-                f"{need} tokens (budget {budget})")
+            # The newest message alone (plus system) busts the budget.
+            # Truncate its CONTENT instead of erroring — agent clients
+            # (Workshop) resend full history and stuff huge tool results
+            # / summaries into the newest message; a degraded answer
+            # beats a hard 502. Head+tail cut via _truncate_text.
+            out = [dict(messages[i]) for i in sys_idx]
+            avail = budget - sys_cost - EmbeddedEngine._PER_MSG_OVERHEAD
+            if avail < 64:
+                # system alone eats the window — truncate it too
+                sys_limit = max(64, (budget - EmbeddedEngine._PER_MSG_OVERHEAD
+                                     - 64) // 2)
+                if out and isinstance(out[0].get("content"), str):
+                    out[0]["content"] = EmbeddedEngine._truncate_text(
+                        inst, out[0]["content"], sys_limit)
+                avail = (budget - sys_limit
+                         - EmbeddedEngine._PER_MSG_OVERHEAD - 64)
+            if nonsys:
+                m = dict(messages[nonsys[-1]])
+                c = m.get("content")
+                if isinstance(c, list):
+                    c = json.dumps(c)
+                if isinstance(c, str):
+                    m["content"] = EmbeddedEngine._truncate_text(
+                        inst, c, max(64, avail - 64))
+                tcs = m.get("tool_calls")
+                if isinstance(tcs, list) and tcs:
+                    new_tcs = []
+                    for tc in tcs:
+                        if (isinstance(tc, dict)
+                                and isinstance(tc.get("function"), dict)):
+                            tc = dict(tc)
+                            fn = dict(tc["function"])
+                            if fn.get("arguments"):
+                                fn["arguments"] = EmbeddedEngine._truncate_text(
+                                    inst, str(fn["arguments"]),
+                                    max(32, avail // 2))
+                            tc["function"] = fn
+                        new_tcs.append(tc)
+                    m["tool_calls"] = new_tcs
+                out.append(m)
+                logger.warning("prompt trimmed %d→<=%d tokens for %s (n_ctx "
+                               "%d, reserve %d): newest message content "
+                               "truncated, %d older messages dropped)",
+                               total, budget, getattr(inst, "name", "?"),
+                               n_ctx, reserve, len(nonsys) - 1)
+            else:
+                logger.warning("prompt trimmed %d→<=%d tokens for %s (n_ctx "
+                               "%d, reserve %d): system content truncated)",
+                               total, budget, getattr(inst, "name", "?"),
+                               n_ctx, reserve)
+            if out:
+                out[0]["content"] = ((out[0].get("content") or "")
+                                     + EmbeddedEngine._TRIM_NOTE)
+            return out
         kept.reverse()
         logger.warning("prompt trimmed %d→%d tokens for %s (n_ctx %d, "
                        "reserve %d, dropped %d oldest messages)",

@@ -108,20 +108,56 @@ def test_fit_messages_trims_oldest_keeps_system_and_newest():
     assert not any(m.get("content", "").startswith("msg 1 ") for m in out)
 
 
-def test_fit_messages_raises_when_system_alone_too_big():
-    inst = _FakeInst(n_ctx=512)
-    msgs = [{"role": "system", "content": "x" * 4000}]
-    with pytest.raises(gw_models.EmbeddedLLMError) as e:
-        gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
-    assert "exceeds context window" in str(e.value)
+def test_fit_messages_truncates_oversized_newest_message():
+    """When system + newest alone bust the budget the newest message's
+    CONTENT is head+tail truncated (agent clients stuff huge tool
+    results into the last message) — not a hard error."""
+    inst = _FakeInst(n_ctx=2048)
+    big = "START-MARKER " + "x" * 40000 + " END-MARKER"
+    msgs = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "old turn"},
+            {"role": "user", "content": big}]
+    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 256)
+    assert out[0]["role"] == "system"
+    assert "truncated" in out[0]["content"]  # trim note
+    assert len(out) == 2  # system + newest only; old turn dropped
+    content = out[1]["content"]
+    assert content.startswith("START-MARKER")  # head kept
+    assert content.rstrip().endswith("END-MARKER")  # tail kept
+    assert "truncated to fit" in content  # middle marker
+    # and it actually fits now
+    counts = [gw_models.EmbeddedEngine._count_tokens(inst, m["content"])
+              for m in out]
+    assert sum(counts) < 2048 - 256
 
 
-def test_fit_messages_raises_when_newest_plus_system_too_big():
+def test_fit_messages_truncates_system_when_it_fills_window():
+    """System-only conversations (or a system bigger than the window)
+    truncate the system content rather than erroring."""
     inst = _FakeInst(n_ctx=512)
-    msgs = [{"role": "system", "content": "s" * 400},
-            {"role": "user", "content": "u" * 3000}]
-    with pytest.raises(gw_models.EmbeddedLLMError):
-        gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    msgs = [{"role": "system", "content": "HEAD " + "s" * 4000 + " TAIL"}]
+    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    assert len(out) == 1
+    assert out[0]["role"] == "system"
+    assert out[0]["content"].startswith("HEAD")
+    assert "truncated" in out[0]["content"]
+    n = gw_models.EmbeddedEngine._count_tokens(inst, out[0]["content"])
+    assert n < 512 - 64
+
+
+def test_fit_messages_truncates_newest_tool_call_arguments():
+    """A newest message whose bulk is tool_call arguments gets those
+    truncated too (arguments JSON is content for the model)."""
+    inst = _FakeInst(n_ctx=1024)
+    msgs = [{"role": "system", "content": "s"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "write_file",
+                             "arguments": '{"body": "' + "y" * 8000 + '"}'}}]}]
+    out = gw_models.EmbeddedEngine._fit_messages(inst, msgs, 64)
+    args = out[-1]["tool_calls"][0]["function"]["arguments"]
+    assert len(args) < 8000
+    assert "truncated" in args
 
 
 def test_fit_messages_without_system_keeps_newest():
