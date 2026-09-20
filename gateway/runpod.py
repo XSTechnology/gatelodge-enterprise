@@ -390,8 +390,15 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any],
         payload["cmd"] = shlex.split(spec["docker_args"])
     if spec.get("docker_entrypoint"):
         payload["entrypoint"] = list(spec["docker_entrypoint"])
-    # Volume → persistent mount
-    if spec.get("volume_gb"):
+    # Volume mounts: network volume by id (preferred — survives pod
+    # termination) or a create-time persistent volume by size. Mutually
+    # exclusive in the v2 API; volume_id wins.
+    if spec.get("volume_id"):
+        payload["mounts"] = {
+            "network": [{"volumeId": spec["volume_id"],
+                         "path": spec.get("volume_mount") or "/workspace"}]
+        }
+    elif spec.get("volume_gb"):
         payload["mounts"] = {
             "persistent": {
                 "size": spec["volume_gb"],
@@ -401,6 +408,10 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any],
     # Spot → cloud: COMMUNITY
     if spec.get("spot"):
         payload["cloud"] = "COMMUNITY"
+    # Preferred data centers — network volumes are DC-pinned, so the pod
+    # must land in the volume's DC (scheduler otherwise picks freely).
+    if spec.get("data_center_ids"):
+        payload["dataCenterIds"] = list(spec["data_center_ids"])
     # Clean up None/empty values
     payload = {k: v for k, v in payload.items() if v not in (None, "", [], {})}
     payload.update(spec.get("deploy") or {})  # raw escape hatch wins

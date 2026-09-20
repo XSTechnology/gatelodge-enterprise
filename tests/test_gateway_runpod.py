@@ -336,6 +336,25 @@ def test_pod_deploy_payload_mapping(wired, gguf, monkeypatch):
     assert payload["zzz"] == 1  # unknown raw fields pass through
 
 
+def test_pod_deploy_network_volume_mount(wired, gguf, monkeypatch):
+    """volume_id attaches an existing network volume (survives pod
+    termination, unlike persistent-by-size) and data_center_ids pins the
+    pod to the volume's DC — network volumes are DC-bound."""
+    cfg = _rp_config(gguf, volume_id="lf66zxdknx", volume_mount="/workspace",
+                     data_center_ids=["CA-MTL-4"], volume_gb=50)
+    wired(cfg)
+    rest = _patch_rest(monkeypatch)
+    _patch_pod_http(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    payload = [c for c in rest.calls if c[0] == "deploy"][0][1]
+    # network mount by id wins over persistent-by-size
+    assert payload["mounts"] == {"network": [{"volumeId": "lf66zxdknx",
+                                              "path": "/workspace"}]}
+    assert payload["dataCenterIds"] == ["CA-MTL-4"]
+
+
 def test_pod_deploy_full_command_knobs(wired, gguf, monkeypatch):
     """docker_cmd (full command incl. binary) wins over bare docker_args;
     docker_entrypoint passes through."""

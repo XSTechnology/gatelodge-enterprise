@@ -322,6 +322,13 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         "container_disk_gb": int(_num("container_disk_gb", 20)),
                         "volume_gb": int(_num("volume_gb", 0)),
                         "volume_mount": str(m.get("volume_mount") or "").strip(),
+                        # network volume by id (survives pod termination;
+                        # wins over volume_gb) + DC pinning (network
+                        # volumes are data-center-bound)
+                        "volume_id": str(m.get("volume_id") or "").strip(),
+                        "data_center_ids": [str(d).strip() for d in
+                                            (m.get("data_center_ids") or [])
+                                            if str(d).strip()],
                         "spot": bool(m.get("spot")),
                         "env": {str(k): str(v) for k, v in (m.get("env") or {}).items()}
                                if isinstance(m.get("env") or {}, dict) else {},
