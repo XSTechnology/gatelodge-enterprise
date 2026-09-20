@@ -1029,6 +1029,76 @@ def status() -> list[dict[str, Any]]:
     return out
 
 
+# ── Config-driven live status (boot-watch modal polls /healthz) ────────────
+
+_STATUS_STATE: dict[str, Any] = {"pods_at": 0.0, "pods": []}
+_STATUS_TTL_S = 10.0
+
+
+async def refresh_status(cfg) -> list[dict[str, Any]]:
+    """Live status for EVERY configured runpod pod model — not just the
+    ones a request has already touched. Materializes managers from
+    config, seeds pod_id from the spec, refreshes pod state from ONE
+    cached pods-list call (10s TTL), and health-probes running-but-not-
+    -ready pods so the boot-watch modal sees the full lifecycle
+    (not-deployed → starting/warming → running) without a chat request
+    first. Deploy-side gap this closes: a freshly deployed model had no
+    healthz entry until something called get_manager, so the modal's
+    state chip never advanced to the chat-test phase."""
+    backends = {n: b for n, b in cfg.backends.items()
+                if b.get("type") == "runpod"}
+    if not backends:
+        return status()
+    for name, b in backends.items():
+        for mkey, m in (b.get("models") or {}).items():
+            if isinstance(m, dict) and not m.get("endpoint_id"):
+                get_manager(cfg, name, mkey)
+    now = time.monotonic()
+    if now - _STATUS_STATE["pods_at"] > _STATUS_TTL_S:
+        for name, b in backends.items():
+            try:
+                _STATUS_STATE["pods"] = await list_pods(
+                    b.get("api_key_env") or "RUNPOD_API_KEY")
+            except Exception:  # noqa: BLE001 — status must never 500
+                logger.warning("runpod refresh_status list failed",
+                               exc_info=True)
+            _STATUS_STATE["pods_at"] = now
+            break
+    pods = _STATUS_STATE["pods"]
+    for m in list(_MANAGERS.values()):
+        if not m.pod_id and m.spec.get("pod_id"):
+            m.pod_id = str(m.spec["pod_id"])
+        pod = next((p for p in pods
+                    if (m.pod_id and p.get("id") == m.pod_id)
+                    or p.get("name") == _pod_name(m.backend_name,
+                                                  m.model_key)), None)
+        if pod is None:
+            if m.pod_id:
+                m.pod_status = "TERMINATED"
+                m.ready = False
+            continue
+        if not m.pod_id:
+            m.pod_id = str(pod.get("id"))
+        st = pod_state(pod)
+        m.pod_status = st
+        if st in ("RUNNING", "READY", "UNKNOWN"):
+            if not m.ready:
+                try:
+                    if await pod_healthy(m.base_url()):
+                        m.ready = True
+                except Exception:  # noqa: BLE001 — probe is best-effort
+                    pass
+        else:
+            m.ready = False
+    return status()
+
+
+def reset_status_cache() -> None:
+    """Test helper — drop the cached pods list."""
+    _STATUS_STATE["pods"] = []
+    _STATUS_STATE["pods_at"] = 0.0
+
+
 def reset_managers() -> None:
     """Test helper — drop the registry without lifecycle calls."""
     _MANAGERS.clear()

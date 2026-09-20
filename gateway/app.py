@@ -1660,7 +1660,7 @@ async def healthz() -> dict[str, Any]:
         "loaded_count": len(loaded),
         "loaded": loaded,  # Ollama-ps shaped: alias/path/size_vram/n_ctx/load_s
         "llama_server": llamaserver.status(),  # managed children (subprocess)
-        "runpod": runpod.status(),  # lifecycle-managed pods (serverless is stateless)
+        "runpod": await runpod.refresh_status(cfg),  # lifecycle-managed pods (serverless is stateless)
         "gpus": gpus,
     }
 

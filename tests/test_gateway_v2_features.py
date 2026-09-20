@@ -45,6 +45,7 @@ def wired(tmp_path, monkeypatch):
 
     yield _wire
     rp.reset_managers()
+    rp.reset_status_cache()
 
 
 CONFIG = {
@@ -352,3 +353,74 @@ def test_runpod_logs_endpoint(wired, monkeypatch):
         # nothing to resolve → 400
         r = client.post("/admin/runpod/logs", json={"model": "nope"})
         assert r.status_code == 400
+
+
+# ── Config-driven live status (boot-watch modal feeds on /healthz) ─────────
+
+def test_refresh_status_materializes_config_models(wired, monkeypatch):
+    """A freshly deployed model has NO manager until a request touches
+    it — refresh_status must materialize it from config so the boot
+    modal's state chip advances (the deploy-side gap: chip stuck on
+    'starting', chat test never fired)."""
+    cfg = json.loads(json.dumps(CONFIG))
+    # strip the spec pod_id — resolution must go through find-by-NAME
+    cfg["backends"]["rp"]["models"]["big"].pop("pod_id", None)
+    wired(cfg)
+
+    async def fake_pods(api_key_env):
+        return [{"id": "pod-new77", "name": "gw-rp-big",
+                 "status": "RUNNING"}]
+
+    async def fake_healthy(base_url):
+        return True
+
+    monkeypatch.setattr(rp, "list_pods", fake_pods)
+    monkeypatch.setattr(rp, "pod_healthy", fake_healthy)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/healthz")
+    assert r.status_code == 200
+    row = next(x for x in r.json()["runpod"] if x["model"] == "big")
+    assert row["pod_id"] == "pod-new77"   # adopted via pod NAME
+    assert row["state"] == "running"      # RUNNING + healthy → ready
+    assert row["base_url"]
+
+
+def test_refresh_status_terminated_pod(wired, monkeypatch):
+    cfg = json.loads(json.dumps(CONFIG))
+    cfg["backends"]["rp"]["models"]["big"]["pod_id"] = "pod-gone9"
+    wired(cfg)
+
+    async def fake_pods(api_key_env):
+        return []  # pod terminated — not in the list
+
+    async def fake_healthy(base_url):
+        raise AssertionError("must not probe a pod that is not RUNNING")
+
+    monkeypatch.setattr(rp, "list_pods", fake_pods)
+    monkeypatch.setattr(rp, "pod_healthy", fake_healthy)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/healthz")
+    row = next(x for x in r.json()["runpod"] if x["model"] == "big")
+    assert row["state"] == "TERMINATED"
+    assert row["base_url"] is None
+
+
+def test_refresh_status_stopped_pod_not_probed(wired, monkeypatch):
+    cfg = json.loads(json.dumps(CONFIG))
+    cfg["backends"]["rp"]["models"]["big"]["pod_id"] = "pod-live1"
+    wired(cfg)
+
+    async def fake_pods(api_key_env):
+        return [{"id": "pod-live1", "name": "gw-rp-big",
+                 "status": "EXITED"}]
+
+    async def fake_healthy(base_url):
+        raise AssertionError("must not probe an EXITED pod")
+
+    monkeypatch.setattr(rp, "list_pods", fake_pods)
+    monkeypatch.setattr(rp, "pod_healthy", fake_healthy)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/healthz")
+    row = next(x for x in r.json()["runpod"] if x["model"] == "big")
+    assert row["state"] == "EXITED"
+    assert row["base_url"] is None
