@@ -132,6 +132,9 @@ def test_sse_keepalive_during_cold_start(wired, monkeypatch):
         pod_status = "STARTING"
         pod_id = "pod-live1"
 
+        def is_ready(self):
+            return False
+
         async def ensure_ready(self, timeout_s=None):
             await asyncio.sleep(0.25)
             return "https://pod-live1-8080.proxy.runpod.net"
@@ -141,7 +144,6 @@ def test_sse_keepalive_during_cold_start(wired, monkeypatch):
             yield self
 
     monkeypatch.setattr(rp, "get_manager", lambda *a, **k: FakeMgr())
-    monkeypatch.setattr(rp, "ensure_reaper", lambda: None)
 
     async def fake_stream_chat(base, payload, timeout_s):
         yield json.dumps({"id": "x", "object": "chat.completion.chunk",

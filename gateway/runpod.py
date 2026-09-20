@@ -968,10 +968,9 @@ class _PodManager:
             logger.warning("runpod stop/terminate %s failed", pod_id, exc_info=True)
 
 
-# ── Registry + reaper ──────────────────────────────────────────────────────
+# ── Registry ────────────────────────────────────────────────────────────────
 
 _MANAGERS: dict[tuple[str, str], _PodManager] = {}
-_REAPER_TASK: asyncio.Task | None = None
 
 
 def get_manager(cfg: GatewayConfig, backend_name: str,
@@ -992,39 +991,11 @@ def get_manager(cfg: GatewayConfig, backend_name: str,
     return mgr
 
 
-async def _reaper_once() -> int:
-    """Idle-stop then idle-terminate pods. Returns count acted on."""
-    now = time.monotonic()
-    n = 0
-    for m in list(_MANAGERS.values()):
-        if not m.is_ready():
-            continue
-        idle = now - m.last_used
-        if (m.spec.get("idle_terminate_s", 0) > 0
-                and idle > m.spec["idle_terminate_s"]):
-            await m.stop(terminate=True)
-            n += 1
-        elif (m.spec.get("idle_stop_s", 0) > 0
-                and idle > m.spec["idle_stop_s"]):
-            await m.stop(terminate=False)
-            n += 1
-    return n
-
-
-async def _reaper_loop() -> None:
-    while True:
-        await asyncio.sleep(30)
-        try:
-            await _reaper_once()
-        except Exception:  # noqa: BLE001 — the reaper must never die
-            logger.warning("runpod reaper error", exc_info=True)
-
-
-def ensure_reaper() -> None:
-    global _REAPER_TASK
-    loop = asyncio.get_running_loop()
-    if _REAPER_TASK is None or _REAPER_TASK.get_loop() is not loop:
-        _REAPER_TASK = loop.create_task(_reaper_loop())
+def managers() -> list[tuple[tuple[str, str], _PodManager]]:
+    """All materialized managers with their (backend, model) keys —
+    the lifecycle watchdog iterates these. Idle/budget/death rules
+    moved to gateway.lifecycle (v3)."""
+    return list(_MANAGERS.items())
 
 
 def status() -> list[dict[str, Any]]:

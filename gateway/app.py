@@ -106,6 +106,7 @@ except ImportError:
 
 from . import cloud
 from . import catalog
+from . import lifecycle
 from . import llamaserver
 from . import providers
 from . import runpod
@@ -256,6 +257,32 @@ for _lg_name in ("uvicorn.error", "asyncio"):
 async def _kill_llama_servers() -> None:
     """Stop every managed llama-server child when the gateway exits."""
     llamaserver.kill_all()
+
+
+@app.on_event("startup")
+async def _start_lifecycle_watchdog() -> None:
+    """v3: the pod lifecycle watchdog runs from BOOT, not lazily from
+    request paths — no traffic must never mean no protection (a
+    forgotten pod bills forever)."""
+    lifecycle.ensure_watchdog()
+
+
+async def _budget_gate(cfg, backend_name: str, model_key: str) -> None:
+    """v3 D4: refuse to START a runpod pod when a monthly budget cap
+    is hit — a RUNNING pod keeps serving (its cost is committed).
+    Raises lifecycle.LifecycleBudgetExceeded; chokepoints map it to
+    503 budget_exceeded."""
+    backend = cfg.backends.get(backend_name) or {}
+    if backend.get("type") != "runpod":
+        return
+    if ((backend.get("models") or {}).get(model_key) or {}).get("endpoint_id"):
+        return  # serverless endpoint — not a lifecycle pod
+    mgr = runpod.get_manager(cfg, backend_name, model_key)
+    if mgr.is_ready():
+        return
+    ok, why = await lifecycle.budget_allows(cfg, backend_name, model_key)
+    if not ok:
+        raise lifecycle.LifecycleBudgetExceeded(why)
 
 
 # ── OpenAI-shaped errors ───────────────────────────────────────────────────
@@ -739,8 +766,8 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     if btype == "runpod" and not backend["models"][model_key].get("endpoint_id"):
         # Managed GPU POD: find-or-deploy + health-wait, then proxy in
         # native OpenAI wire format through the pod's runpod.net URL.
-        runpod.ensure_reaper()
         mgr = runpod.get_manager(cfg, backend_name, model_key)
+        await _budget_gate(cfg, backend_name, model_key)  # v3: 503 over cap
         # Cold start: hold the request while the pod boots, but cap the
         # non-streaming hold well under the spec's full start_timeout_s
         # (glm recipes: 3600s) — past the cap, a structured 503 tells
@@ -974,6 +1001,12 @@ async def chat_completions(body: ChatRequest) -> Response:
             _log_request(requested, "", body.stream, ms, {}, 503)
             return _error(503, str(e), err_type="overloaded_error",
                           code="warming_up", headers={"Retry-After": "30"})
+        except lifecycle.LifecycleBudgetExceeded as e:
+            # v3: monthly cap hit — refuse to START the pod
+            ms = int((time.perf_counter() - t0) * 1000)
+            _log_request(requested, "", body.stream, ms, {}, 503)
+            return _error(503, str(e), err_type="overloaded_error",
+                          code="budget_exceeded")
         except Exception as e:
             ms = int((time.perf_counter() - t0) * 1000)
             logger.warning("gateway chat failed (%s): %s", requested, e)
@@ -1107,8 +1140,15 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 # window (glm recipes take 6+ min) while emitting SSE
                 # comment keep-alives — clients stay connected and can
                 # see "warming up" instead of timing out on silence.
-                runpod.ensure_reaper()
                 mgr = runpod.get_manager(cfg, backend_name, model_key)
+                try:
+                    await _budget_gate(cfg, backend_name, model_key)
+                except lifecycle.LifecycleBudgetExceeded as e:
+                    yield "data: " + json.dumps({"error": {
+                        "message": str(e), "type": "overloaded_error",
+                        "code": "budget_exceeded"}}) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 async with mgr.request():  # v3: inflight guard — the
                     # generator's finally runs on completion OR client
                     # disconnect, so the watchdog can't stop the pod
@@ -1528,8 +1568,12 @@ async def legacy_completions(body: CompletionRequest) -> Response:
             return JSONResponse(resp)
 
         if btype == "runpod" and not backend["models"][model_key].get("endpoint_id"):
-            runpod.ensure_reaper()
             mgr = runpod.get_manager(cfg, backend_name, model_key)
+            try:
+                await _budget_gate(cfg, backend_name, model_key)
+            except lifecycle.LifecycleBudgetExceeded as e:
+                return _error(503, str(e), err_type="overloaded_error",
+                              code="budget_exceeded")
             async with mgr.request():  # v3: inflight guard
                 base = await mgr.ensure_ready()
                 payload = {"model": mgr.spec.get("alias", model_key),
@@ -2707,8 +2751,13 @@ async def admin_runpod_test(payload: RunPodTestPayload) -> Response:
                            "— no pod to test (send a chat request instead)")
 
     api_key_env = backend.get("api_key_env", "RUNPOD_API_KEY")
-    runpod.ensure_reaper()
     mgr = runpod.get_manager(cfg, payload.backend, payload.model)
+    if payload.deploy and not mgr.is_ready():
+        try:
+            await _budget_gate(cfg, payload.backend, payload.model)
+        except lifecycle.LifecycleBudgetExceeded as e:
+            return _error(503, str(e), err_type="overloaded_error",
+                          code="budget_exceeded")
     t_total = time.monotonic()
     res: dict[str, Any] = {"backend": payload.backend, "model": payload.model,
                            "ok": False, "phases": {}, "error": None}

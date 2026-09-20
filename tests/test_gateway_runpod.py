@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gateway.app as gw_app  # noqa: E402
 import gateway.cloud as gw_cloud  # noqa: E402
 import gateway.config as gw_config  # noqa: E402
+import gateway.lifecycle as lc  # noqa: E402
 import gateway.llamaserver as lsrv  # noqa: E402
 import gateway.models as gw_models  # noqa: E402
 import gateway.runpod as rp  # noqa: E402
@@ -925,10 +926,20 @@ async def test_run_job_policy_and_backoff(fake_httpx):
 
 
 async def test_pod_idle_reaper_stop_then_terminate(wired, gguf, monkeypatch):
-    cfg = _rp_config(gguf, idle_stop_s=60, idle_terminate_s=600)
-    wired(cfg)
+    raw = _rp_config(gguf, idle_stop_s=60, idle_terminate_s=600)
+    _, cfg, _ = wired(raw)
     rest = _patch_rest(monkeypatch)
     _patch_pod_http(monkeypatch)
+    lc.reset()
+
+    async def _no_refresh(c):
+        return None
+
+    async def _no_budget(c):
+        return None
+
+    monkeypatch.setattr(rp, "refresh_status", _no_refresh)
+    monkeypatch.setattr(lc, "month_to_date", _no_budget)
     with TestClient(gw_app.app) as client:
         client.post("/v1/chat/completions", json={
             "model": "big", "messages": [{"role": "user", "content": "hi"}]})
@@ -936,17 +947,22 @@ async def test_pod_idle_reaper_stop_then_terminate(wired, gguf, monkeypatch):
         assert mgr.is_ready()
         # idle past the STOP tier (not yet terminate) → stop, pod retained
         mgr.last_used -= 100
-        assert await rp._reaper_once() == 1
+        acted = await lc.tick(cfg)
+        assert acted["idle_stopped"] == 1
         assert ("stop", POD_ID) in rest.calls
         assert any(p["id"] == POD_ID for p in rest.pods)
-        # still "ready" bookkeeping cleared — re-deploy path next request
+        # stop cleared the ready bookkeeping — re-deploy path next request
         assert not mgr.is_ready()
         # idle past the TERMINATE tier → gone
         mgr.ready = True  # simulate still-running bookkeeping
         mgr.last_used -= 700
-        assert await rp._reaper_once() == 1
+        acted = await lc.tick(cfg)
+        assert acted["idle_terminated"] == 1
         assert ("terminate", POD_ID) in rest.calls
         assert rest.pods == []
+        # both actions left lifecycle alerts
+        kinds = [a["kind"] for a in lc.alerts()]
+        assert "idle_stopped" in kinds and "idle_terminated" in kinds
 
 
 def test_local_only_drops_runpod(wired, gguf, monkeypatch):
