@@ -154,6 +154,18 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
 .bw-banner.warn { background:rgba(217,119,6,.08); border:1px solid var(--warning); }
 .bw-banner .bw-sub { margin-top:6px; font-size:.76rem; color:var(--text-dim); word-break:break-all; }
 .bw-banner code { font-family:Consolas,monospace; font-size:.76rem; }
+/* v3 pod lifecycle: alerts + rules */
+.btn-danger-solid { background:var(--danger); color:#fff; border-color:var(--danger); }
+.btn-danger-solid:hover { filter:brightness(1.12); color:#fff; }
+.lc-alert { border-radius:var(--radius-sm); padding:8px 12px; margin-bottom:6px; font-size:.82rem; overflow-wrap:anywhere; }
+.lc-alert.critical { background:rgba(220,38,38,.08); border:1px solid var(--danger); }
+.lc-alert.warn { background:rgba(217,119,6,.08); border:1px solid var(--warning); }
+.lc-alert.info { background:var(--card); border:1px solid var(--border); }
+.lc-in { width:90px; padding:4px 8px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  background:var(--card); color:var(--text); font-size:.82rem; font-family:inherit; }
+.lc-in:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-soft); }
+select.lc-in { width:auto; padding-right:4px; }
+.lc-budgetbar { margin:6px 0 2px; max-width:340px; }
 @media (max-width:600px){ body{padding:12px} .settings-grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
   .cat-btn{padding:12px 6px;font-size:.75rem} .modal{padding:16px}
   .bw-panel{padding:14px} .bw-logs{height:240px} }
@@ -224,7 +236,7 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
 <script>
 'use strict';
 var KEY = localStorage.getItem('gw_key') || '';
-var _syslogTimer = null, _perfTimer = null, _bwTimer = null;
+var _syslogTimer = null, _perfTimer = null, _bwTimer = null, _lcTimer = null;
 
 // ---------- api ----------
 function api(path, opts) {
@@ -298,6 +310,7 @@ function stopTimers() {
   if (_syslogTimer) { clearInterval(_syslogTimer); _syslogTimer = null; }
   if (_perfTimer) { clearInterval(_perfTimer); _perfTimer = null; }
   if (_bwTimer) { clearInterval(_bwTimer); _bwTimer = null; }
+  if (_lcTimer) { clearInterval(_lcTimer); _lcTimer = null; }
 }
 
 // ---------- Models ----------
@@ -818,6 +831,16 @@ function _fmtDur(s) {
   if (s < 5400) return Math.round(s / 60) + 'm';
   return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
 }
+// v3 idle countdown for lifecycle-managed pods (healthz runpod entries):
+// running + idle_stop_s armed → "auto-stop in Xm", otherwise plain idle age
+function _rpIdleHtml(m) {
+  if (!m || m.idle_s == null) return '';
+  if (m.state === 'running' && m.idle_stop_s > 0) {
+    var left = Math.max(0, Math.ceil((m.idle_stop_s - m.idle_s) / 60));
+    return ' · auto-stop in ' + left + 'm';
+  }
+  return ' · idle ' + _fmtDur(m.idle_s);
+}
 function _rpStatusBadge(p, m) {
   var warm = (p.status || '') === 'warming-up' ||
     (m && (m.state === 'warming-up' || m.warming));
@@ -846,8 +869,7 @@ function renderRunpodPods(inv, mgrs, specs) {
     var wantStop = acts.length ? acts.indexOf('stop') >= 0 : running;
     var label = m ? '<b>' + esc(m.backend) + ':' + esc(m.model) + '</b>' : '<b>' + esc(p.name || 'pod') + '</b>';
     if (m) { label += ' <span class="badge runpod">managed</span>'; matched[m.backend + ':' + m.model] = true; }
-    label += '<div class="muted"><code>' + esc(p.id) + '</code>' +
-      (m && m.idle_s != null ? ' · idle ' + _fmtDur(m.idle_s) : '') + '</div>';
+    label += '<div class="muted"><code>' + esc(p.id) + '</code>' + _rpIdleHtml(m) + '</div>';
     var gpu = p.gpuTypeId ? (p.gpuCount > 1 ? p.gpuCount + '× ' : '') + esc(p.gpuTypeId) : '—';
     if (p.gpuUtil != null) gpu += ' <span class="muted">' + p.gpuUtil + '%</span>';
     var cost = [];
@@ -1192,7 +1214,7 @@ function addServerless() {
 var _dwCatalog = null;
 var _dwState = { recipeId: null, cloud: 'secure', gpuId: null, gpuCount: 1,
   volumeMode: null, volumeId: null, dcId: '', volumeType: 'STANDARD',
-  volumeSizeGb: null, ctxKey: null, diskGb: null, idleS: 0 };
+  volumeSizeGb: null, ctxKey: null, diskGb: null, idleS: 1800 };
 var _dwMsg = null; // {type:'ok'|'err', html} — deploy result banner
 
 function buildDeployWizard() {
@@ -1304,7 +1326,7 @@ function dwApplyRecipeDefaults() {
   var co = r.ctx_options || [];
   st.ctxKey = r.ctx_default || (co[0] && co[0].key) || null;
   st.diskGb = r.disk_gb_min;
-  st.idleS = 0;
+  st.idleS = 1800; // v3 default: 30 min idle auto-stop
 }
 function dwValidateState() { // keep _dwState consistent with the (possibly refreshed) catalog
   var st = _dwState;
@@ -1481,10 +1503,12 @@ function dwPanel() {
     (st.diskGb || r.disk_gb_min) + '" oninput="dwOnDiskInput()"></div>';
   // Idle auto-stop
   html += '<div class="srow"><label for="dw-idle">Idle auto-stop</label><select id="dw-idle" onchange="dwOnIdleChange()">' +
-    '<option value="0"' + (!st.idleS ? ' selected' : '') + '>Keep running until I stop it</option>' +
+    '<option value="0"' + (!st.idleS ? ' selected' : '') + '>Off — keep running until I stop it</option>' +
     '<option value="900"' + (st.idleS === 900 ? ' selected' : '') + '>after 15 min idle</option>' +
+    '<option value="1800"' + (st.idleS === 1800 ? ' selected' : '') + '>after 30 min idle</option>' +
     '<option value="3600"' + (st.idleS === 3600 ? ' selected' : '') + '>after 1 h idle</option>' +
-    '</select></div>';
+    '<option value="7200"' + (st.idleS === 7200 ? ' selected' : '') + '>after 2 h idle</option>' +
+    '</select><span class="muted">watchdog stops the pod when idle — resumable, storage keeps billing</span></div>';
   // Cost + VRAM + deploy
   html += '<div class="dw-cost" id="dw-cost">' + dwCostHtml() + '</div>';
   html += '<div class="muted" id="dw-vram">' + dwVramHtml() + '</div>';
@@ -1575,7 +1599,7 @@ function dwBuildPayload() {
     volume_mode: r.volume ? st.volumeMode : 'none',
     ctx_key: st.ctxKey,
     container_disk_gb: st.diskGb || r.disk_gb_min,
-    idle_terminate_s: st.idleS,
+    idle_stop_s: st.idleS, // 0 disables — watchdog stops (never terminates) the idle pod
     alias: ''
   };
   if (r.volume) {
@@ -1691,6 +1715,7 @@ var _clAccount = null;   // /admin/providers/runpod/account response
 var _clCatalog = null;   // /admin/catalog response (datacenter list for the volume form)
 var _clVolMsg = null;    // {type:'ok'|'err', text} — volume manager result banner
 var _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
+var _clLifecycle = null; // /admin/lifecycle response — watchdog, budgets, rules, alerts
 
 function showCloud(ui) {
   ui.title.textContent = '☁ Cloud';
@@ -1699,9 +1724,11 @@ function showCloud(ui) {
   _clCatalog = null;
   _clVolMsg = null;
   _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
+  _clLifecycle = null;
   api('/admin/providers').then(function (d) {
     var ps = d.providers || [];
-    var html = '<div class="widget"><h3>Provider</h3>' +
+    var html = '<div id="cl-alerts"></div>' +
+      '<div class="widget"><h3>Provider</h3>' +
       '<div class="srow"><label for="cl-provider">Cloud provider</label>' +
       '<select id="cl-provider" onchange="clOnProviderChange()">';
     for (var i = 0; i < ps.length; i++)
@@ -1710,6 +1737,9 @@ function showCloud(ui) {
       '<div id="cl-provider-panel"><div class="muted">loading…</div></div></div>';
     ui.body.innerHTML = html;
     clShowProviderPanel(ps.length ? ps[0].id : null);
+    clPollLifecycle(); // alerts banner + lifecycle panel
+    if (_lcTimer) clearInterval(_lcTimer);
+    _lcTimer = setInterval(clPollLifecycle, 30000); // cleared by stopTimers on tab switch/close
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
 function clOnProviderChange() {
@@ -1730,6 +1760,11 @@ function clShowProviderPanel(providerId) {
       'into the same DC to attach it. A volume referenced by a configured model cannot be deleted.</div></div>' +
       '<div class="widget"><h3>Spend</h3><div id="cl-spend-body"><div class="muted">loading…</div></div>' +
       '<div class="muted" style="margin-top:6px">Per-pod GPU + disk charges for the last 7 days, straight from the provider API.</div></div>' +
+      '<div class="widget"><h3>Pod lifecycle ' +
+      '<button class="btn btn-sm" onclick="clPollLifecycle()">⟳ refresh</button></h3>' +
+      '<div id="cl-lifecycle-body"><div class="muted">loading…</div></div>' +
+      '<div class="muted" style="margin-top:6px">The watchdog enforces idle auto-stop, monthly spend caps and auto-recover. ' +
+      'Caps of 0 are off. Alerts land in the banner above.</div></div>' +
       buildRunpodServers();
     dwInit();
     clLoadAccount();
@@ -1927,6 +1962,178 @@ function clRenderSpend() {
   if (meta.uniquePodCount != null) parts.push(meta.uniquePodCount + ' pod(s)');
   if (parts.length) html += '<div class="muted" style="margin-top:6px">' + esc(parts.join(' · ')) + '</div>';
   box.innerHTML = html;
+}
+
+// ----- v3 pod lifecycle: watchdog chip, budgets, per-model rules, alerts, panic -----
+function clPollLifecycle() {
+  api('/admin/lifecycle').then(function (d) {
+    _clLifecycle = d;
+    clRenderAlerts();
+    clRenderLifecycle();
+  }).catch(function () { /* transient poll error — keep last render */ });
+}
+// POST /admin/lifecycle/settings — the endpoint returns the full panel state,
+// so one round trip both persists and re-renders.
+function clSaveSettings(body, okMsg) {
+  api('/admin/lifecycle/settings', {method: 'POST', body: body})
+    .then(function (d) {
+      _clLifecycle = d;
+      clRenderAlerts();
+      clRenderLifecycle();
+      if (okMsg) notify(okMsg);
+    })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function clSaveBudget() {
+  var el = document.getElementById('lc-budget');
+  if (!el) return;
+  var v = parseFloat(el.value);
+  if (isNaN(v) || v < 0) v = 0;
+  clSaveSettings({budget_usd_month: v}, '✓ monthly budget cap saved');
+}
+function clSaveModelRules(backend, model) {
+  var key = backend + '|' + model;
+  var body = {};
+  var capEl = document.getElementById('lc-cap-' + key);
+  var recEl = document.getElementById('lc-rec-' + key);
+  if (capEl) {
+    var v = parseFloat(capEl.value);
+    body.model_budgets = {};
+    body.model_budgets[key] = isNaN(v) ? 0 : Math.max(0, v);
+  }
+  if (recEl) {
+    body.model_auto_recover = {};
+    body.model_auto_recover[key] = recEl.value === 'redeploy' ? 'redeploy' : 'alert';
+  }
+  clSaveSettings(body, '✓ saved ' + key);
+}
+function clClearAlerts() { clSaveSettings({clear_alerts: true}); }
+
+function clRenderAlerts() {
+  var box = document.getElementById('cl-alerts');
+  if (!box) return;
+  var alerts = (_clLifecycle && _clLifecycle.alerts) || [];
+  if (!alerts.length) { box.innerHTML = ''; return; }
+  var html = '<div class="widget"><h3>⚠ Alerts (' + alerts.length + ') ' +
+    '<button class="btn btn-sm" onclick="clClearAlerts()">clear</button></h3>';
+  for (var i = 0; i < alerts.length; i++) {
+    var a = alerts[i] || {};
+    var sev = a.severity === 'critical' ? 'critical' : a.severity === 'warn' ? 'warn' : 'info';
+    html += '<div class="lc-alert ' + sev + '">' +
+      '<span class="muted">' + esc(String(a.ts || '').slice(11, 19) || '—') + '</span> ' +
+      '<b>[' + esc(a.kind || '?') + ']</b> ' + esc(a.model || a.backend || '—') + ' — ' +
+      esc(a.message || '') + '</div>';
+  }
+  box.innerHTML = html + '</div>';
+}
+
+function clRenderLifecycle() {
+  var box = document.getElementById('cl-lifecycle-body');
+  if (!box) return;
+  if (!_clLifecycle) { box.innerHTML = '<div class="muted">loading…</div>'; return; }
+  // don't clobber in-progress edits with a poll refresh
+  var ae = document.activeElement;
+  if (ae && box.contains(ae) &&
+      (ae.tagName === 'INPUT' || ae.tagName === 'SELECT')) return;
+  var d = _clLifecycle, html = '';
+  // watchdog chip
+  var wd = d.watchdog || {};
+  html += '<div class="kv">' + (wd.running
+    ? '<span class="badge ok">watchdog ● running (' + Math.round(wd.interval_s || 0) + 's)</span>'
+    : '<span class="badge warn">watchdog ● paused</span>') + '</div>';
+  // account budget: month-to-date vs cap, progress bar when a cap is set
+  var mtd = d.month_to_date, cap = Number(d.budget_usd_month) || 0;
+  var spent = (mtd && mtd.total_usd != null) ? Number(mtd.total_usd) : null;
+  html += '<div class="kv" style="margin-top:8px"><b>Month spend</b> ' +
+    (spent != null ? '$' + spent.toFixed(2) : '—');
+  if (cap > 0) {
+    html += ' / cap $' + cap.toFixed(2) + '</div>';
+    if (spent != null) {
+      var pct = Math.round(spent / cap * 100);
+      var cls = pct > 100 ? 'err' : pct >= 80 ? 'warn' : '';
+      html += '<div class="bar lc-budgetbar"><div class="bar-fill ' + cls +
+        '" style="width:' + Math.min(pct, 100) + '%"></div></div>' +
+        '<div class="muted">' + pct + '% of cap</div>';
+    }
+  } else {
+    html += ' <span class="muted">(no cap)</span></div>';
+  }
+  if (mtd) {
+    if (mtd.accrual_usd) html += '<div class="muted">+$' + Number(mtd.accrual_usd).toFixed(2) +
+      ' accruing (in-flight / unbilled)</div>';
+    if (mtd.as_of) html += '<div class="muted">as of ' + esc(String(mtd.as_of).replace('T', ' ')) + '</div>';
+  }
+  html += '<div class="lc-budgetrow" style="margin-top:6px">' +
+    '<label class="muted" for="lc-budget">Monthly cap $</label>' +
+    '<input id="lc-budget" class="lc-in" type="number" min="0" step="1" value="' + cap + '">' +
+    '<button class="btn btn-sm" onclick="clSaveBudget()">save</button>' +
+    '<span class="muted">0 = off</span></div>';
+  // per-model rules
+  var rules = d.rules || [];
+  html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bg-deep)">' +
+    '<div class="kv" style="margin-bottom:6px"><b>Per-model rules</b></div>';
+  if (rules.length) {
+    html += '<table><thead><tr><th>model</th><th>est $/hr</th><th>idle</th>' +
+      '<th>monthly cap $</th><th>auto-recover</th><th></th></tr></thead><tbody>';
+    for (var i = 0; i < rules.length; i++) {
+      var r = rules[i] || {};
+      var key = (r.backend || '') + '|' + (r.model || '');
+      var idle = [];
+      if (r.idle_stop_s > 0) idle.push('auto-stop ' + _fmtDur(r.idle_stop_s));
+      if (r.idle_terminate_s > 0) idle.push('terminate ' + _fmtDur(r.idle_terminate_s));
+      html += '<tr><td><b>' + esc(r.alias || r.model || '?') + '</b>' +
+        '<div class="muted"><code>' + esc(key) + '</code></div></td>' +
+        '<td class="muted">' + (r.est_cost_per_hr ? '$' + Number(r.est_cost_per_hr).toFixed(2) : '—') + '</td>' +
+        '<td class="muted">' + (idle.length ? esc(idle.join(' · ')) : 'off') + '</td>' +
+        '<td><input id="lc-cap-' + esc(key) + '" class="lc-in" type="number" min="0" step="1" value="' +
+        (Number(r.monthly_budget_usd) || 0) + '"></td>' +
+        '<td><select id="lc-rec-' + esc(key) + '" class="lc-in">' +
+        '<option value="alert"' + (r.auto_recover !== 'redeploy' ? ' selected' : '') + '>Alert only</option>' +
+        '<option value="redeploy"' + (r.auto_recover === 'redeploy' ? ' selected' : '') + '>Redeploy</option>' +
+        '</select></td>' +
+        '<td><button class="btn btn-sm" onclick="clSaveModelRules(\'' +
+        esc(r.backend || '') + '\',\'' + esc(r.model || '') + '\')">save</button></td></tr>';
+    }
+    html += '</tbody></table>';
+  } else {
+    html += '<div class="muted">No lifecycle-managed models configured.</div>';
+  }
+  html += '</div>';
+  // panic button
+  html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bg-deep);' +
+    'display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+    '<button class="btn btn-danger-solid" onclick="clStopAllPods()">⛔ stop all pods</button>' +
+    '<span class="muted">Stops every RUNNING pod on the account — pods stay resumable (not terminated). In-flight requests break.</span></div>';
+  box.innerHTML = html;
+}
+
+// PANIC — raw fetch so 4xx/5xx error bodies survive; never terminate, only stop
+function clStopAllPods() {
+  if (!confirm('Stop every RUNNING pod? In-flight requests will break. Pods stay resumable (not terminated).')) return;
+  var headers = {'Content-Type': 'application/json'};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  fetch('/admin/runpod/stop-all', {method: 'POST', headers: headers})
+    .then(function (r) {
+      return r.json().then(
+        function (d) { return {status: r.status, data: d}; },
+        function () { return {status: r.status, data: null}; });
+    })
+    .then(function (res) {
+      if (res.status === 200 && res.data) {
+        notify('Stopped ' + ((res.data.stopped || []).length) + ' pod(s)');
+        var errs = res.data.errors || [];
+        for (var i = 0; i < errs.length; i++) {
+          var e = errs[i] || {};
+          notify('✗ ' + (e.pod_id || e.backend || 'pod') + ': ' + (e.error || 'stop failed'), true);
+        }
+      } else {
+        var m = (res.data && res.data.error && res.data.error.message) || ('HTTP ' + res.status);
+        notify('✗ stop-all failed — ' + m, true);
+      }
+      refreshRunpodPods();
+      clPollLifecycle(); // the panic_stop alert lands in the banner
+    })
+    .catch(function (e) { notify('✗ stop-all failed — ' + e.message, true); });
 }
 
 // ----- boot watch modal (deploy / manual pod start) -----
