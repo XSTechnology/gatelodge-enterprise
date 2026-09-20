@@ -304,6 +304,11 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         # FULL command incl. binary (overrides docker_args
                         # prefixing) + optional entrypoint passthrough
                         "docker_cmd": str(m.get("docker_cmd") or "").strip(),
+                        # shell SCRIPT, verbatim (one argv element) — for
+                        # docker_entrypoint like ["sh","-c"]; shlex-split
+                        # docker_cmd would shred it (live-verified dash
+                        # syntax error in the container)
+                        "docker_script": str(m.get("docker_script") or "").strip(),
                         "docker_entrypoint": [str(a) for a in
                                               (m.get("docker_entrypoint") or [])
                                               if str(a).strip()],

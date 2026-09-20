@@ -245,6 +245,13 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any],
     # Container command
     if spec.get("docker_cmd"):
         payload["cmd"] = shlex.split(spec["docker_cmd"])
+    elif spec.get("docker_script"):
+        # ONE argv element, VERBATIM — for shell entrypoints. shlex
+        # splitting shreds a script: with entrypoint ["sh","-c"] the
+        # container ran `sh -c "(curl" -fsSL ...` and dash died with
+        # '-fsSL: 1: Syntax error: end of file unexpected' (live-
+        # verified). The whole script must reach -c as one argument.
+        payload["cmd"] = [spec["docker_script"]]
     elif spec.get("docker_args"):
         payload["cmd"] = shlex.split(spec["docker_args"])
     if spec.get("docker_entrypoint"):

@@ -380,6 +380,28 @@ def test_pod_deploy_gpu_type_fallback(wired, gguf, monkeypatch):
     assert deploys[1]["gpu"]["id"] == "NVIDIA GeForce RTX 3090"
 
 
+def test_pod_deploy_docker_script_single_arg(wired, gguf, monkeypatch):
+    """docker_script passes VERBATIM as ONE cmd element — for shell
+    entrypoints. shlex splitting shredded the script: the container ran
+    `sh -c "(curl" -fsSL ...` and dash died with "Syntax error: end of
+    file unexpected" (live-verified)."""
+    script = ("(curl -fsSL -o /m.gguf https://x/y.gguf || "
+              "wget -q -O /m.gguf https://x/y.gguf) && "
+              "exec /llama-server -m /m.gguf --port 8080")
+    wired(_rp_config(gguf, docker_entrypoint=["sh", "-c"],
+                     docker_cmd="", docker_args="",
+                     docker_script=script))
+    rest = _patch_rest(monkeypatch)
+    _patch_pod_http(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    payload = [c for c in rest.calls if c[0] == "deploy"][0][1]
+    assert payload["cmd"] == [script]  # ONE element, verbatim
+    assert payload["entrypoint"] == ["sh", "-c"]
+
+
 def test_pod_reuse_when_running(wired, gguf, monkeypatch):
     wired(_rp_config(gguf))
     rest = _patch_rest(monkeypatch)
