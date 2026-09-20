@@ -206,10 +206,13 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> d
     - interruptible → cloud: "COMMUNITY" (spot) vs "SECURE" (default)
 
     docker_cmd (FULL command incl. the binary, e.g. "/llama-server -m ...")
-    wins; else docker_args is prefixed with /llama-server — RunPod's cmd
-    REPLACES the image CMD, so bare args made the container exec "-hf ..."
-    and die (live-verified failure mode). docker_entrypoint (array) passes
-    through for full control."""
+    wins; docker_args passes through BARE (no binary). The official
+    ghcr.io/ggml-org/llama.cpp:server-cuda image declares its server
+    via ENTRYPOINT, so the pod's CMD is APPENDED — prefixing the
+    binary produced "/llama-server /llama-server -hf ..." and a
+    ~17s crash loop with "error: invalid argument: /llama-server"
+    (live-verified from the container logs). docker_entrypoint (array)
+    passes through for full control."""
     payload: dict[str, Any] = {
         "name": _pod_name(backend_name, model_key),
         "image": spec.get("image"),
@@ -232,7 +235,7 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> d
     if spec.get("docker_cmd"):
         payload["cmd"] = shlex.split(spec["docker_cmd"])
     elif spec.get("docker_args"):
-        payload["cmd"] = ["/llama-server", *shlex.split(spec["docker_args"])]
+        payload["cmd"] = shlex.split(spec["docker_args"])
     if spec.get("docker_entrypoint"):
         payload["entrypoint"] = list(spec["docker_entrypoint"])
     # Volume → persistent mount

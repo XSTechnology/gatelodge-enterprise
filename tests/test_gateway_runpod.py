@@ -300,10 +300,11 @@ def test_pod_cold_deploy_and_chat(wired, gguf, monkeypatch):
     assert payload["gpu"]["id"] == "NVIDIA RTX A6000"
     assert payload["cloud"] == "COMMUNITY"  # spot → COMMUNITY (v2 schema)
     assert payload["ports"] == ["8080/http"]  # array (live schema)
-    # cmd is a FULL command: RunPod replaces the image CMD, so
-    # bare args made the container exec "-m" and die (live-verified bug)
-    assert payload["cmd"][0] == "/llama-server"
-    assert payload["cmd"][1:3] == ["-m", "/workspace/m.gguf"]
+    # cmd is BARE ARGS: the official llama.cpp image declares the server
+    # via ENTRYPOINT, so the pod CMD appends — a prefixed binary doubled
+    # it into "invalid argument: /llama-server" (live-verified crash loop)
+    assert payload["cmd"] == ["-m", "/workspace/m.gguf",
+                              "--host", "0.0.0.0", "--port", "8080"]
     # health-polled + proxied through the pod's proxy.runpod.net URL
     assert any(c["health"] == f"https://{POD_ID}-8080.proxy.runpod.net"
                for c in http)
@@ -336,7 +337,7 @@ def test_pod_deploy_payload_mapping(wired, gguf, monkeypatch):
 
 
 def test_pod_deploy_full_command_knobs(wired, gguf, monkeypatch):
-    """docker_cmd (full command) wins over the docker_args prefix;
+    """docker_cmd (full command incl. binary) wins over bare docker_args;
     docker_entrypoint passes through."""
     cfg = _rp_config(gguf, docker_cmd="/custom/llama-server -m /m.gguf",
                      docker_entrypoint=["/bin/sh", "-c"])
