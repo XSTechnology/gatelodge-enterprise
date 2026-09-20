@@ -3144,6 +3144,49 @@ async def admin_runpod_volumes(payload: VolumeManagePayload) -> Response:
     return _error(400, "action must be 'create' or 'delete'")
 
 
+class PodLogsPayload(BaseModel):
+    """Recent container log lines for one pod (boot-watch modal)."""
+    model_config = ConfigDict(extra="ignore")
+    backend: str = ""
+    model: str = ""
+    pod_id: str = ""
+    tail: int = 120
+
+
+@app.post("/admin/runpod/logs")
+async def admin_runpod_logs(payload: PodLogsPayload) -> Response:
+    """Tail of a pod's container logs — the deploy modal streams these
+    while the pod boots (downloading weights / building / loading)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if backend not in rp_backends:
+        return _error(400, f"backend {backend!r} is not a runpod backend")
+    api_key_env = rp_backends[backend].get("api_key_env", "RUNPOD_API_KEY")
+    pod_id = payload.pod_id
+    if not pod_id and payload.model:
+        spec = (rp_backends[backend].get("models") or {}).get(payload.model)
+        pod_id = (spec or {}).get("pod_id") or ""
+        if not pod_id:
+            try:
+                pod = await runpod.get_manager(
+                    cfg, backend, payload.model).find_pod()
+                pod_id = (pod or {}).get("id") or ""
+            except Exception:  # noqa: BLE001 — find is best-effort
+                pod_id = ""
+    if not pod_id:
+        return _error(400, "pod_id or model required (model must be "
+                          "deployed or have a pod_id in config)")
+    try:
+        lines = await runpod.fetch_pod_logs(
+            pod_id, api_key_env, max(10, min(int(payload.tail or 120), 400)))
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    return {"pod_id": pod_id, "lines": lines}
+
+
 class RunPodServerlessPayload(BaseModel):
     """Payload for managing runpod serverless endpoints."""
     model_config = ConfigDict(extra="ignore")

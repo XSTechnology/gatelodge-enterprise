@@ -322,3 +322,33 @@ def test_volume_delete_in_use_guard(wired, monkeypatch):
             "action": "delete", "volume_id": "vol1"})
     assert r.status_code == 409
     assert "rp:big" in r.json()["error"]["message"]
+
+
+def test_runpod_logs_endpoint(wired, monkeypatch):
+    cfg = json.loads(json.dumps(CONFIG))
+    cfg["backends"]["rp"]["models"]["big"]["pod_id"] = "pod-live1"
+    wired(cfg)
+    seen = []
+
+    async def fake_logs(pod_id, api_key_env, tail=100):
+        seen.append((pod_id, tail))
+        return [{"ts": "t1", "source": "container",
+                 "line": "[boot] downloading model"}]
+
+    monkeypatch.setattr(rp, "fetch_pod_logs", fake_logs)
+    with TestClient(gw_app.app) as client:
+        # by model (pod_id resolved from config spec)
+        r = client.post("/admin/runpod/logs", json={"model": "big"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["pod_id"] == "pod-live1"
+        assert body["lines"][0]["line"] == "[boot] downloading model"
+        assert seen == [("pod-live1", 120)]
+        # explicit pod_id + tail clamped
+        r = client.post("/admin/runpod/logs", json={
+            "pod_id": "pod-x", "tail": 9999})
+        assert r.status_code == 200
+        assert seen[-1] == ("pod-x", 400)
+        # nothing to resolve → 400
+        r = client.post("/admin/runpod/logs", json={"model": "nope"})
+        assert r.status_code == 400

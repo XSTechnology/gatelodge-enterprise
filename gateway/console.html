@@ -121,8 +121,42 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
 .dw-msg ul { margin:6px 0 0 18px; }
 .dw-msg code { font-family:Consolas,monospace; font-size:.8rem; background:var(--bg-deep); padding:1px 5px; border-radius:4px; }
 .dw-hint { font-size:.75rem; color:var(--text-faint); margin-top:6px; }
+/* boot watch modal */
+.bw-overlay { position:fixed; inset:0; background:rgba(15,15,18,.55); backdrop-filter:blur(3px);
+  display:none; align-items:center; justify-content:center; z-index:2500; padding:20px; }
+.bw-overlay.show { display:flex; animation:fadeIn .2s ease; }
+.bw-panel { background:var(--card); border-radius:var(--radius); border:1px solid var(--border);
+  box-shadow:var(--shadow); width:100%; max-width:700px; max-height:92vh; overflow-y:auto;
+  padding:18px 20px; scrollbar-width:thin; }
+.bw-head { display:flex; align-items:flex-start; gap:10px; }
+.bw-head h2 { font-size:1.05rem; font-weight:600; color:var(--primary); flex:1; min-width:0; margin:0; }
+.bw-podline { font-size:.74rem; color:var(--text-faint); margin:2px 0 0; }
+.bw-podline code { font-family:Consolas,monospace; }
+.bw-close { border:none; background:none; font-size:1.15rem; cursor:pointer; color:var(--text-faint);
+  line-height:1; padding:2px 8px; border-radius:var(--radius-sm); font-family:inherit; flex:0 0 auto; }
+.bw-close:hover { color:var(--danger); background:var(--bg); }
+.bw-statusrow { display:flex; align-items:center; gap:10px; margin:12px 0; flex-wrap:wrap; }
+.bw-state { display:inline-block; font-size:.75rem; font-weight:600; padding:4px 12px; border-radius:999px;
+  background:var(--primary-soft); color:var(--primary); }
+.bw-state.warm { background:rgba(217,119,6,.12); color:var(--warning); }
+.bw-state.err { background:rgba(220,38,38,.10); color:var(--danger); }
+.bw-state.ok { background:rgba(22,163,74,.12); color:var(--success); }
+.bw-elapsed { font-size:.78rem; color:var(--text-dim); font-variant-numeric:tabular-nums; }
+.bw-logs { background:#111; border:1px solid var(--border); border-radius:var(--radius-sm); height:300px;
+  overflow-y:auto; padding:10px 12px; font-family:'Cascadia Code',Consolas,monospace; font-size:.73rem;
+  line-height:1.55; scrollbar-width:thin; }
+.bw-log { color:#c9d1d9; white-space:pre-wrap; word-break:break-word; }
+.bw-log .bw-ts { color:#6e7681; margin-right:8px; }
+.bw-log.bw-mark { color:#79c0ff; font-weight:600; }
+.bw-waiting { color:#6e7681; font-style:italic; }
+.bw-banner { margin-top:12px; border-radius:var(--radius-sm); padding:12px 14px; font-size:.88rem; }
+.bw-banner.ok { background:rgba(22,163,74,.08); border:1px solid var(--success); }
+.bw-banner.warn { background:rgba(217,119,6,.08); border:1px solid var(--warning); }
+.bw-banner .bw-sub { margin-top:6px; font-size:.76rem; color:var(--text-dim); word-break:break-all; }
+.bw-banner code { font-family:Consolas,monospace; font-size:.76rem; }
 @media (max-width:600px){ body{padding:12px} .settings-grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
-  .cat-btn{padding:12px 6px;font-size:.75rem} .modal{padding:16px} }
+  .cat-btn{padding:12px 6px;font-size:.75rem} .modal{padding:16px}
+  .bw-panel{padding:14px} .bw-logs{height:240px} }
 </style>
 </head>
 <body>
@@ -169,10 +203,28 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
   </div>
 </div>
 
+<div class="bw-overlay" id="bw-overlay">
+  <div class="bw-panel" role="dialog" aria-modal="true" aria-labelledby="bw-title">
+    <div class="bw-head">
+      <h2 id="bw-title">🚀 Spinning up…</h2>
+      <button class="bw-close" onclick="bwClose()" title="Close (polling stops — the pod keeps booting)" aria-label="Close boot watch">✕</button>
+    </div>
+    <div class="bw-podline" id="bw-podline"></div>
+    <div class="bw-statusrow">
+      <span class="bw-state" id="bw-state">⏳ starting pod…</span>
+      <span class="bw-elapsed" id="bw-elapsed">⏱ 0s</span>
+    </div>
+    <div class="bw-logs" id="bw-logs" aria-label="Container log tail">
+      <div class="bw-waiting">waiting for pod logs…</div>
+    </div>
+    <div id="bw-banner"></div>
+  </div>
+</div>
+
 <script>
 'use strict';
 var KEY = localStorage.getItem('gw_key') || '';
-var _syslogTimer = null, _perfTimer = null, _clBootTimer = null;
+var _syslogTimer = null, _perfTimer = null, _bwTimer = null;
 
 // ---------- api ----------
 function api(path, opts) {
@@ -245,7 +297,7 @@ function closeModal() {
 function stopTimers() {
   if (_syslogTimer) { clearInterval(_syslogTimer); _syslogTimer = null; }
   if (_perfTimer) { clearInterval(_perfTimer); _perfTimer = null; }
-  if (_clBootTimer) { clearInterval(_clBootTimer); _clBootTimer = null; }
+  if (_bwTimer) { clearInterval(_bwTimer); _bwTimer = null; }
 }
 
 // ---------- Models ----------
@@ -805,6 +857,10 @@ function renderRunpodPods(inv, mgrs, specs) {
     var btns = '';
     if (wantStop) btns += '<button class="btn btn-sm" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'stop\')">stop</button> ';
     if (wantStart) btns += '<button class="btn btn-sm" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'start\')">start</button> ';
+    if (!running) btns += '<button class="btn btn-sm" onclick="bwOpenFromPod(\'' +
+      esc(m ? m.backend : 'rp') + '\',\'' + esc(m ? m.model : (p.name || p.id)) + '\',\'' +
+      esc(p.id) + '\',\'' + esc(p.name || '') + '\')" ' +
+      'title="Live boot watch: server status + container logs">📡 watch</button> ';
     if (m) btns += '<button class="btn btn-sm" onclick="testRunpodModel(\'' + esc(m.backend) + '\',\'' + esc(m.model) + '\')">⚗ test</button> ';
     btns += '<button class="btn btn-sm btn-danger" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'terminate\')">terminate</button>';
     html += '<tr><td>' + label + '</td><td>' + _rpStatusBadge(p, m) + '</td>' +
@@ -1143,7 +1199,6 @@ function buildDeployWizard() {
   return '<div class="widget"><h3>Deploy model ' +
     '<button class="btn btn-sm" onclick="dwRefreshOptions()" title="Re-fetch GPU prices, data centers and volumes">⟳ refresh options</button></h3>' +
     '<div id="dw-body"><div class="muted">loading options…</div></div>' +
-    '<div id="dw-boot"></div>' +
     '<div class="muted" style="margin-top:6px">Deploys a ready-to-use llama-server pod on RunPod from a tested recipe. ' +
     'Billing is per hour while the pod runs — stop it from the RunPod servers widget when you are done.</div></div>';
 }
@@ -1560,7 +1615,7 @@ function dwSuccessHtml(d) {
   html += clTriedHtml(d.tried);
   html += '<div style="margin-top:6px">Use model "' + esc(d.model) +
     '" in any OpenAI- or Anthropic-compatible tool → <code>' + esc(url) + '</code></div>' +
-    '<div class="dw-hint">Boot takes a few minutes (model copy + load). Watch it appear in the RunPod servers widget below.</div>';
+    '<div class="dw-hint">Boot takes a few minutes (model copy + load) — a boot-watch popup is tracking it, and it appears in the RunPod servers widget below.</div>';
   return html;
 }
 // list of GPU combos that were tried but had no capacity (deploy fallback info)
@@ -1604,7 +1659,7 @@ function dwDeploy() {
       if (res.status === 200 && res.data && res.data.ok) {
         _dwMsg = {type: 'ok', html: dwSuccessHtml(res.data)};
         notify('✓ deploying ' + res.data.model);
-        clStartBootPoll(res.data.model);
+        bwOpenDeploy(res.data);
         refreshRunpodPods();
       } else {
         var errs = res.data && res.data.detail && res.data.detail.errors;
@@ -1874,49 +1929,257 @@ function clRenderSpend() {
   box.innerHTML = html;
 }
 
-// ----- post-deploy boot watch (poll state every 15 s, up to 15 min) -----
-function clModelStatus(h, model) {
+// ----- boot watch modal (deploy / manual pod start) -----
+// Opens over the page, polls /healthz + /admin/runpod/logs every 5 s while
+// the pod boots, runs a chat test once the model reports running, then
+// declares the server operational. Closing only stops polling — never the pod.
+var _bw = null; // {backend, model, pod_id, pod_name, alias, t0, lastPoll,
+                //  kind, warm_s, rawState, logs, logsPending, testing, tested,
+                //  done, missing}
+
+function bwOpenDeploy(d) {
+  bwOpen({backend: (d && d.backend) || 'rp', model: (d && d.model) || '',
+          pod_id: (d && d.pod_id) || '', pod_name: (d && d.name) || '',
+          alias: (d && d.model) || ''});
+}
+
+// servers-widget "📡 watch" — called from an inline onclick string
+function bwOpenFromPod(backend, model, podId, podName) {
+  bwOpen({backend: backend || 'rp', model: model || podId || 'pod',
+          pod_id: podId || '', pod_name: podName || '',
+          alias: model || podId || 'pod'});
+}
+
+function bwOpen(o) {
+  _bw = {backend: o.backend, model: o.model, pod_id: o.pod_id, pod_name: o.pod_name,
+         alias: o.alias, t0: Date.now(), lastPoll: 0, kind: 'starting', warm_s: null,
+         rawState: '', logs: [], logsPending: true, testing: false, tested: false,
+         done: false, missing: 0};
+  document.getElementById('bw-title').textContent =
+    '🚀 Spinning up: ' + (_bw.alias || _bw.model || 'model');
+  var sub = [];
+  if (_bw.pod_name) sub.push('<code>' + esc(_bw.pod_name) + '</code>');
+  if (_bw.pod_id) sub.push('<code>' + esc(_bw.pod_id) + '</code>');
+  document.getElementById('bw-podline').innerHTML = sub.join(' · ') || '&nbsp;';
+  document.getElementById('bw-banner').innerHTML = '';
+  document.getElementById('bw-logs').innerHTML = '<div class="bw-waiting">waiting for pod logs…</div>';
+  bwRenderState(0);
+  document.getElementById('bw-overlay').classList.add('show');
+  bwStartTimer();
+}
+
+function bwStartTimer() {
+  bwStopTimer();
+  if (_bw) _bw.lastPoll = 0;
+  _bwTimer = setInterval(bwTick, 1000);
+  bwTick();
+}
+
+function bwStopTimer() {
+  if (_bwTimer) { clearInterval(_bwTimer); _bwTimer = null; }
+}
+
+// ✕ / Done — stops polling only; never touches the pod
+function bwClose() {
+  bwStopTimer();
+  _bw = null;
+  var ov = document.getElementById('bw-overlay');
+  if (ov) ov.classList.remove('show');
+}
+
+function bwTick() {
+  if (!_bw) { bwStopTimer(); return; }
+  var el = Math.round((Date.now() - _bw.t0) / 1000);
+  if (_bw.done) return; // final banner shown — timer is stopped anyway
+  if (el >= 1200) { bwTimeout(); return; } // 20-minute polling budget
+  bwRenderState(el);
+  if (Date.now() - _bw.lastPoll < 4900) return;
+  _bw.lastPoll = Date.now();
+  bwPollHealth();
+  bwPollLogs();
+}
+
+function bwTimeout() {
+  _bw.done = true;
+  bwStopTimer();
+  bwSetChip('⏱ still warming', 'warm');
+  document.getElementById('bw-elapsed').textContent =
+    '⏱ ' + Math.round((Date.now() - _bw.t0) / 1000) + 's';
+  document.getElementById('bw-banner').innerHTML =
+    '<div class="muted" style="margin-top:12px">⏱ still warming — close and check the RunPod servers widget later (the pod keeps booting regardless of this window).</div>';
+}
+
+function bwSetChip(text, cls) {
+  var chip = document.getElementById('bw-state');
+  chip.className = 'bw-state' + (cls ? ' ' + cls : '');
+  chip.textContent = text;
+}
+
+function bwRenderState(el) {
+  if (!_bw) return;
+  var kind = _bw.kind;
+  if (kind === 'warming') {
+    var s = _bw.warm_s != null ? Math.round(_bw.warm_s) : el;
+    bwSetChip('🔥 warming up — building / downloading weights / loading model (' +
+      (s != null ? s : 0) + 's elapsed)', 'warm');
+  } else if (kind === 'testing') bwSetChip('🧪 testing…', '');
+  else if (kind === 'testfail') bwSetChip('⚠ chat test failed', 'err');
+  else if (kind === 'gone') bwSetChip('pod not found — deploy may have failed', 'err');
+  else if (kind === 'other') bwSetChip('pod state: ' + (_bw.rawState || 'unknown') + '…', 'warm');
+  else bwSetChip('⏳ starting pod…', '');
+  if (el != null) document.getElementById('bw-elapsed').textContent = '⏱ ' + el + 's';
+}
+
+function bwFindStatus(h) {
   var rs = (h && h.runpod) || [];
-  for (var i = 0; i < rs.length; i++)
-    if (rs[i].model === model || rs[i].alias === model) return rs[i];
+  for (var i = 0; i < rs.length; i++) {
+    var e = rs[i] || {};
+    if (_bw.model && (e.model === _bw.model || e.alias === _bw.model)) return e;
+    if (_bw.pod_id && e.pod_id && e.pod_id === _bw.pod_id) return e;
+  }
   return null;
 }
-function clStopBootPoll() {
-  if (_clBootTimer) { clearInterval(_clBootTimer); _clBootTimer = null; }
+
+function bwPollHealth() {
+  api('/healthz').then(function (h) {
+    if (!_bw || _bw.done) return;
+    var st = bwFindStatus(h);
+    if (st) {
+      _bw.missing = 0;
+      if (st.alias) _bw.alias = st.alias;
+      _bw.warm_s = (st.warm_s != null) ? st.warm_s : null;
+      if (st.state === 'warming-up') _bw.kind = 'warming';
+      else if (st.state === 'running') {
+        if (_bw.testing) _bw.kind = 'testing';
+        else if (_bw.tested) _bw.kind = 'testfail';
+        else bwStartTest();
+      } else if (st.state === 'not-deployed') _bw.kind = 'starting';
+      else { _bw.kind = 'other'; _bw.rawState = st.state; }
+    } else {
+      _bw.warm_s = null;
+      _bw.rawState = '';
+      _bw.kind = 'starting';
+      bwCheckInventory();
+    }
+    bwRenderState();
+  }).catch(function () { /* transient poll error — keep waiting */ });
 }
-function clStartBootPoll(model) {
-  clStopBootPoll();
-  var box = document.getElementById('dw-boot');
-  if (box) box.innerHTML = '<div class="kv" id="dw-boot-line">⏳ boot watch started for <b>' +
-    esc(model) + '</b>…</div>';
-  var deadline = Date.now() + 15 * 60 * 1000;
-  var tick = function () {
-    api('/healthz').then(function (h) {
-      var line = document.getElementById('dw-boot-line');
-      if (!line) { clStopBootPoll(); return; } // wizard unmounted — stop watching
-      var st = clModelStatus(h, model);
-      if (!st) {
-        line.innerHTML = '⏳ boot watch: waiting for <b>' + esc(model) + '</b> to register…';
-      } else if (st.state === 'warming-up') {
-        var s = st.warm_s != null ? Math.round(st.warm_s) : 0;
-        line.innerHTML = '⏳ warming up (' + s + 's) — model copy + load in progress…';
-      } else if (st.state === 'running') {
-        clStopBootPoll();
-        line.innerHTML = '<span style="color:var(--success)">running ✓ — ready for requests</span>';
-        notify('✓ ' + model + ' is up');
-        refreshRunpodPods();
-        return;
-      } else {
-        line.innerHTML = 'pod state: ' + esc(st.state) + '…';
-      }
-      if (Date.now() > deadline) {
-        clStopBootPoll();
-        line.innerHTML += ' <span class="muted">(boot watch gave up after 15 min — check the RunPod servers widget)</span>';
-      }
-    }).catch(function () { /* transient poll error — keep waiting */ });
-  };
-  tick();
-  _clBootTimer = setInterval(tick, 15000);
+
+// healthz has no entry — is the pod at least in the RunPod inventory?
+function bwCheckInventory() {
+  api('/admin/runpod/inventory', {method: 'POST'}).then(function (inv) {
+    if (!_bw || _bw.done) return;
+    var found = false;
+    ((inv && inv.pods) || []).forEach(function (p) {
+      if (p && p.id === _bw.pod_id) found = true;
+    });
+    if (found) return; // pod exists, gateway not tracking it yet — keep "starting pod…"
+    _bw.missing++;
+    if (_bw.missing >= 3) {
+      _bw.done = true;
+      bwStopTimer();
+      bwSetChip('pod not found — deploy may have failed', 'err');
+      document.getElementById('bw-banner').innerHTML =
+        '<div class="muted" style="margin-top:12px">The pod is not in the RunPod inventory and not in gateway health — it may have failed to deploy. Check the deploy result in the wizard or the RunPod servers widget.</div>';
+    }
+  }).catch(function () { /* inventory probe failed — keep current state */ });
+}
+
+function bwStartTest() {
+  _bw.tested = true;
+  _bw.testing = true;
+  _bw.kind = 'testing';
+  bwRenderState();
+  api('/admin/runpod/test', {method: 'POST',
+      body: {backend: _bw.backend, model: _bw.model, timeout_s: 180}})
+    .then(function (d) { bwTestResult(d || {}); })
+    .catch(function (e) { bwTestResult({ok: false, error: e.message}); });
+}
+
+function bwTestResult(d) {
+  if (!_bw || _bw.done) return;
+  _bw.testing = false;
+  if ((d.logs || []).length) {
+    _bw.logs = _bw.logs.concat(d.logs).slice(-150);
+    _bw.logsPending = false;
+    bwRenderLogs();
+  }
+  var chat = ((d.phases || {}).chat) || {};
+  if (d.ok) {
+    _bw.done = true;
+    bwStopTimer();
+    bwSetChip('✓ operational', 'ok');
+    document.getElementById('bw-elapsed').textContent =
+      '⏱ chat test passed in ' + (chat.elapsed_s != null ? chat.elapsed_s : '?') + 's';
+    var url = location.origin + '/v1/chat/completions';
+    document.getElementById('bw-banner').innerHTML =
+      '<div class="bw-banner ok">✓ Server <b>' + esc(_bw.pod_name || _bw.pod_id || 'pod') +
+      '</b> (model: <b>' + esc(_bw.alias) + '</b>) is operational' +
+      (chat.content ? '<div class="bw-sub muted">chat reply (' +
+        (chat.elapsed_s != null ? chat.elapsed_s + 's' : '?') + '): ' + esc(chat.content) + '</div>' : '') +
+      '<div class="bw-sub">Use model "' + esc(_bw.alias) +
+      '" in any OpenAI- or Anthropic-compatible tool → <code>' + esc(url) + '</code></div>' +
+      '<div style="margin-top:10px"><button class="btn btn-primary" onclick="bwClose()">Done</button></div></div>';
+    refreshRunpodPods();
+  } else {
+    var msg = d.error || chat.error || 'chat test failed';
+    _bw.kind = 'testfail';
+    bwRenderState();
+    document.getElementById('bw-banner').innerHTML =
+      '<div class="bw-banner warn">⚠ Server running but the chat test failed: ' + esc(msg) +
+      '<div class="bw-sub">Check the log tail below. ' +
+      '<button class="btn btn-sm" onclick="bwRetryTest()" style="margin-left:6px">↻ retry test</button></div></div>';
+  }
+}
+
+function bwRetryTest() {
+  if (!_bw || _bw.done) return;
+  _bw.tested = false;
+  _bw.testing = false;
+  document.getElementById('bw-banner').innerHTML = '';
+  bwRenderState();
+}
+
+function bwPollLogs() {
+  var headers = {'Content-Type': 'application/json'};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  fetch('/admin/runpod/logs', {method: 'POST', headers: headers,
+      body: JSON.stringify({backend: _bw.backend, pod_id: _bw.pod_id,
+                            model: _bw.model, tail: 120})})
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) {
+      if (!_bw || _bw.done) return;
+      if (!d) { _bw.logsPending = true; bwRenderLogs(); return; } // 4xx/5xx — keep waiting
+      _bw.logsPending = false;
+      _bw.logs = (d.lines || []).slice(-150);
+      bwRenderLogs();
+    })
+    .catch(function () {
+      if (_bw && !_bw.done) { _bw.logsPending = true; bwRenderLogs(); }
+    });
+}
+
+function bwRenderLogs() {
+  var box = document.getElementById('bw-logs');
+  if (!box || !_bw) return;
+  if (_bw.logsPending && !_bw.logs.length) {
+    box.innerHTML = '<div class="bw-waiting">waiting for pod logs…</div>';
+    return;
+  }
+  var nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  var prevTop = box.scrollTop;
+  var lines = _bw.logs.slice(-150);
+  var html = '';
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i] || {};
+    var text = String(l.line == null ? '' : l.line);
+    var mark = /^\[(boot|build|model)\]/.test(text);
+    html += '<div class="bw-log' + (mark ? ' bw-mark' : '') + '">' +
+      '<span class="bw-ts">' + esc(l.ts || '') + '</span>' + esc(text) + '</div>';
+  }
+  if (!lines.length) html = '<div class="bw-waiting">no log lines yet…</div>';
+  box.innerHTML = html;
+  box.scrollTop = nearBottom ? box.scrollHeight : prevTop;
 }
 
 // ---------- Performance ----------
