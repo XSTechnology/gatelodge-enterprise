@@ -110,6 +110,17 @@ td.num, th.num { text-align:right; }
 .kv { font-size:.78rem; color:var(--text-dim); margin:2px 0; }
 .kv b { color:var(--text); font-weight:600; }
 .muted { color:var(--text-faint); font-size:.75rem; }
+.dw-tagline { font-size:.75rem; color:var(--text-faint); margin:-2px 0 8px 148px; min-height:1em; }
+.dw-cost { font-size:1.1rem; font-weight:600; margin:12px 0 2px; }
+.dw-vram-ok { color:var(--success); } .dw-vram-low { color:var(--warning); }
+label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto; min-width:0;
+  font-size:.85rem; color:var(--text-dim); cursor:pointer; margin-right:12px; }
+.dw-msg { margin-top:10px; border-radius:var(--radius-sm); padding:10px 12px; font-size:.85rem; overflow-wrap:anywhere; }
+.dw-msg.err { background:rgba(220,38,38,.08); border:1px solid var(--danger); }
+.dw-msg.ok { background:rgba(22,163,74,.08); border:1px solid var(--success); }
+.dw-msg ul { margin:6px 0 0 18px; }
+.dw-msg code { font-family:Consolas,monospace; font-size:.8rem; background:var(--bg-deep); padding:1px 5px; border-radius:4px; }
+.dw-hint { font-size:.75rem; color:var(--text-faint); margin-top:6px; }
 @media (max-width:600px){ body{padding:12px} .settings-grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
   .cat-btn{padding:12px 6px;font-size:.75rem} .modal{padding:16px} }
 </style>
@@ -592,9 +603,11 @@ function showServices(ui) {
     var html = buildBackendForm(defs) +
       buildBackendTable(defs) +
       buildLiveChildren(children) +
+      buildDeployWizard() +
       buildRunpodServers();
     ui.body.innerHTML = html;
     setTimeout(function () { onSvcBackendChange(); }, 50);
+    dwInit();
     refreshRunpodPods();
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
@@ -1111,6 +1124,474 @@ function addServerless() {
   api('/admin/runpod/serverless', {method: 'POST', body: body})
     .then(function () { notify('✓ Added ' + backend + ':' + model); closeModal(); showPanel('services'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
+// ---------- Deploy wizard (catalog recipes) ----------
+var _dwCatalog = null;
+var _dwState = { recipeId: null, cloud: 'secure', gpuId: null, gpuCount: 1,
+  volumeMode: null, volumeId: null, dcId: '', volumeType: 'STANDARD',
+  volumeSizeGb: null, ctxKey: null, diskGb: null, idleS: 0 };
+var _dwMsg = null; // {type:'ok'|'err', html} — deploy result banner
+
+function buildDeployWizard() {
+  return '<div class="widget"><h3>Deploy model ' +
+    '<button class="btn btn-sm" onclick="dwRefreshOptions()" title="Re-fetch GPU prices, data centers and volumes">⟳ refresh options</button></h3>' +
+    '<div id="dw-body"><div class="muted">loading options…</div></div>' +
+    '<div class="muted" style="margin-top:6px">Deploys a ready-to-use llama-server pod on RunPod from a tested recipe. ' +
+    'Billing is per hour while the pod runs — stop it from the RunPod servers widget when you are done.</div></div>';
+}
+function dwInit() { dwLoadCatalog(false); }
+function dwRefreshOptions() { dwLoadCatalog(true); }
+function dwLoadCatalog(force) {
+  api('/admin/catalog').then(function (d) {
+    _dwCatalog = d;
+    dwValidateState();
+    dwRenderAll();
+    if (force) notify('✓ deploy options refreshed');
+  }).catch(function (e) {
+    var box = document.getElementById('dw-body');
+    if (box) box.innerHTML = errBox(e);
+  });
+}
+function dwRenderAll() {
+  var box = document.getElementById('dw-body');
+  if (!box) return;
+  if (!_dwCatalog) { box.innerHTML = '<div class="muted">loading options…</div>'; return; }
+  if (_dwState.recipeId && !dwRecipe()) _dwState.recipeId = null; // recipe vanished from catalog
+  box.innerHTML = dwModelRow() + (_dwState.recipeId ? dwPanel() : dwPickHint()) + dwMsgHtml();
+}
+
+// ----- catalog lookups -----
+function dwRecipe() {
+  if (!_dwCatalog || !_dwState.recipeId) return null;
+  var rs = _dwCatalog.recipes || [];
+  for (var i = 0; i < rs.length; i++) if (rs[i].id === _dwState.recipeId) return rs[i];
+  return null;
+}
+function dwFindGpu(id) {
+  var gs = (_dwCatalog && _dwCatalog.gpus) || [];
+  for (var i = 0; i < gs.length; i++) if (gs[i].id === id) return gs[i];
+  return null;
+}
+function dwGpuAvailable(g, cloud) {
+  if (!g) return false;
+  var p = (g.price || {})[cloud], mc = (g.maxCount || {})[cloud];
+  return p > 0 && mc > 0;
+}
+function dwCountFor(recipe, g, cloud) {
+  var opts = recipe.gpu_options || [];
+  for (var i = 0; i < opts.length; i++)
+    if (opts[i].gpu === g.id) return opts[i].count; // recommended count
+  var mc = Math.min((g.maxCount || {})[cloud] || 0, 8);
+  if (recipe.vram_min_gb && g.memory) {
+    var need = Math.ceil(recipe.vram_min_gb / g.memory);
+    if (need >= 1 && need <= mc) return need; // smallest count that fits VRAM
+  }
+  return 1;
+}
+function dwCapableDcs() { // data centers that support network volumes
+  var dcs = (_dwCatalog && _dwCatalog.datacenters) || [], out = [];
+  for (var i = 0; i < dcs.length; i++)
+    if ((dcs[i].networkVolumeTypes || []).length) out.push(dcs[i]);
+  out.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+  return out;
+}
+function dwSortedDcs() {
+  var dcs = ((_dwCatalog && _dwCatalog.datacenters) || []).slice();
+  dcs.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+  return dcs;
+}
+function dwDcTypes(dcId) {
+  var dcs = (_dwCatalog && _dwCatalog.datacenters) || [];
+  for (var i = 0; i < dcs.length; i++) if (dcs[i].id === dcId) return dcs[i].networkVolumeTypes || [];
+  return [];
+}
+function dwSelectedVolume() {
+  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+  for (var i = 0; i < vols.length; i++) if (vols[i].id === _dwState.volumeId) return vols[i];
+  return null;
+}
+
+// ----- defaults -----
+function dwApplyRecipeDefaults() {
+  var r = dwRecipe(); if (!r || !_dwCatalog) return;
+  var st = _dwState;
+  st.cloud = 'secure';
+  var g0 = null, opts = r.gpu_options || [], i;
+  for (i = 0; i < opts.length; i++) { g0 = dwFindGpu(opts[i].gpu); if (g0) break; }
+  if (!g0) { // fall back to first catalog GPU that fits the recipe on its own
+    var gs = _dwCatalog.gpus || [];
+    for (var j = 0; j < gs.length; j++)
+      if (dwGpuAvailable(gs[j], 'secure') && (!r.vram_min_gb || gs[j].memory >= r.vram_min_gb)) { g0 = gs[j]; break; }
+  }
+  if (!g0) g0 = (_dwCatalog.gpus || [])[0] || null;
+  st.gpuId = g0 ? g0.id : null;
+  st.gpuCount = g0 ? dwCountFor(r, g0, 'secure') : 1;
+  if (r.volume) {
+    var vols = _dwCatalog.volumes || [];
+    st.volumeMode = vols.length ? 'existing' : 'create';
+    st.volumeId = vols.length ? vols[0].id : null;
+    st.volumeSizeGb = r.volume.size_gb_min;
+    st.volumeType = 'STANDARD';
+    st.dcId = vols.length ? (vols[0].dataCenter || '') : (dwCapableDcs()[0] ? dwCapableDcs()[0].id : '');
+  } else {
+    st.volumeMode = 'none';
+    st.volumeId = null;
+    st.dcId = '';
+  }
+  var co = r.ctx_options || [];
+  st.ctxKey = r.ctx_default || (co[0] && co[0].key) || null;
+  st.diskGb = r.disk_gb_min;
+  st.idleS = 0;
+}
+function dwValidateState() { // keep _dwState consistent with the (possibly refreshed) catalog
+  var st = _dwState;
+  if (!_dwCatalog) return;
+  var r = dwRecipe();
+  if (st.recipeId && !r) { st.recipeId = null; return; }
+  if (!st.recipeId || !r) return;
+  if (st.gpuId && !dwFindGpu(st.gpuId)) dwApplyRecipeDefaults();
+  var co = r.ctx_options || [], found = false, i;
+  for (i = 0; i < co.length; i++) if (co[i].key === st.ctxKey) found = true;
+  if (!found) st.ctxKey = r.ctx_default || (co[0] && co[0].key) || null;
+  if (r.volume) {
+    var vols = _dwCatalog.volumes || [];
+    if (st.volumeMode !== 'create' && !vols.length) st.volumeMode = 'create';
+    if (st.volumeMode === 'existing') {
+      if (!dwSelectedVolume()) st.volumeId = vols.length ? vols[0].id : null;
+      if (!dwSelectedVolume()) st.volumeMode = 'create';
+    }
+    if (st.volumeMode === 'create') {
+      var caps = dwCapableDcs(), dcOk = false;
+      for (var j = 0; j < caps.length; j++) if (caps[j].id === st.dcId) dcOk = true;
+      if (!dcOk) st.dcId = caps.length ? caps[0].id : '';
+      var types = dwDcTypes(st.dcId);
+      if (types.length && types.indexOf(st.volumeType) < 0) st.volumeType = types[0];
+      if (r.volume.size_gb_min && (!st.volumeSizeGb || st.volumeSizeGb < r.volume.size_gb_min))
+        st.volumeSizeGb = r.volume.size_gb_min;
+    }
+  }
+  if (r.disk_gb_min && (!st.diskGb || st.diskGb < r.disk_gb_min)) st.diskGb = r.disk_gb_min;
+  var g = dwFindGpu(st.gpuId);
+  if (g) {
+    var maxC = Math.min((g.maxCount || {})[st.cloud] || 0, 8);
+    if (st.gpuCount > maxC) st.gpuCount = Math.max(1, maxC);
+    if (st.gpuCount < 1) st.gpuCount = 1;
+  }
+}
+
+// ----- renderers -----
+function dwModelRow() {
+  var rs = (_dwCatalog && _dwCatalog.recipes) || [], st = _dwState;
+  var html = '<div class="srow"><label for="dw-model">Model</label>' +
+    '<select id="dw-model" onchange="dwOnModelChange()"><option value="">— choose a model —</option>';
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i];
+    html += '<option value="' + esc(r.id) + '"' + (r.id === st.recipeId ? ' selected' : '') + '>' +
+      esc(r.model + ' (' + r.quant + ') — ' + r.size_gb + ' GB') + '</option>';
+  }
+  html += '</select></div>';
+  var sel = dwRecipe();
+  html += '<div class="dw-tagline" id="dw-tagline">' + (sel && sel.tagline ? esc(sel.tagline) : '&nbsp;') + '</div>';
+  return html;
+}
+function dwPickHint() {
+  return '<div class="muted" style="margin-left:148px">Pick a model above to configure GPU, region and cost.</div>';
+}
+function dwGpuOptions(r) {
+  var st = _dwState, seen = {}, recs = [], i;
+  var opts = r.gpu_options || [];
+  for (i = 0; i < opts.length; i++) {
+    var rg = dwFindGpu(opts[i].gpu);
+    if (rg && !seen[rg.id]) { recs.push(rg); seen[rg.id] = true; }
+  }
+  var rest = [], gs = (_dwCatalog && _dwCatalog.gpus) || [];
+  for (i = 0; i < gs.length; i++) if (!seen[gs[i].id]) rest.push(gs[i]);
+  rest.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+  var all = recs.concat(rest), html = '';
+  for (var k = 0; k < all.length; k++) {
+    var g = all[k];
+    var price = (g.price || {})[st.cloud];
+    var lbl = (seen[g.id] ? '★ ' : '') + g.id + ' (' + g.memory + ' GB)';
+    if (price > 0) lbl += ' — $' + price + '/' + st.cloud + '-hr';
+    if (!dwGpuAvailable(g, st.cloud)) lbl += ' (unavailable)';
+    html += '<option value="' + esc(g.id) + '"' + (g.id === st.gpuId ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+  }
+  return html;
+}
+function dwDcOptions(volumeOnly) {
+  var st = _dwState, html = '';
+  var dcs = volumeOnly ? dwCapableDcs() : dwSortedDcs();
+  if (!volumeOnly)
+    html += '<option value=""' + (st.dcId ? '' : ' selected') + '>RunPod picks (recommended)</option>';
+  for (var i = 0; i < dcs.length; i++)
+    html += '<option value="' + esc(dcs[i].id) + '"' + (dcs[i].id === st.dcId ? ' selected' : '') + '>' +
+      esc(dcs[i].id + ' (' + (dcs[i].region || '—') + ')') + '</option>';
+  return html;
+}
+function dwVTypeOptions() {
+  var types = dwDcTypes(_dwState.dcId), html = '';
+  for (var i = 0; i < types.length; i++)
+    html += '<option value="' + esc(types[i]) + '"' + (types[i] === _dwState.volumeType ? ' selected' : '') + '>' +
+      esc(types[i]) + '</option>';
+  return html;
+}
+function dwVolumeRows(r) {
+  var st = _dwState, i;
+  if (!r.volume)
+    return '<div class="srow"><label>Storage</label><span class="muted">No volume needed — weights download at boot</span></div>';
+  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+  var html = '<div class="srow"><label>Storage volume</label>';
+  if (vols.length) {
+    html += '<label class="dw-radio" for="dw-vm-existing"><input type="radio" name="dw-vmode" id="dw-vm-existing" value="existing"' +
+      (st.volumeMode === 'existing' ? ' checked' : '') + ' onchange="dwOnVolumeModeChange(\'existing\')"> use existing</label>' +
+      '<label class="dw-radio" for="dw-vm-create"><input type="radio" name="dw-vmode" id="dw-vm-create" value="create"' +
+      (st.volumeMode === 'create' ? ' checked' : '') + ' onchange="dwOnVolumeModeChange(\'create\')"> create new</label>';
+  } else {
+    html += '<span class="muted">create new (no existing volumes)</span>';
+  }
+  html += '</div>';
+  if (st.volumeMode === 'existing' && vols.length) {
+    html += '<div class="srow"><label for="dw-volume">Existing volume</label>' +
+      '<select id="dw-volume" onchange="dwOnVolumeSelectChange()">';
+    for (i = 0; i < vols.length; i++) {
+      var v = vols[i];
+      html += '<option value="' + esc(v.id) + '"' + (v.id === st.volumeId ? ' selected' : '') + '>' +
+        esc(v.name + ' — ' + v.size + ' GB — ' + v.dataCenter) + '</option>';
+    }
+    html += '</select></div>';
+    var sel = dwSelectedVolume();
+    html += '<div class="srow"><label>Data center</label><span class="muted">' +
+      esc((sel && sel.dataCenter) || '—') + ' (locked to the volume&#39;s data center)</span></div>';
+  } else {
+    html += '<div class="srow"><label for="dw-volsize">Volume size (GB)</label>' +
+      '<input id="dw-volsize" type="number" min="' + r.volume.size_gb_min + '" value="' +
+      (st.volumeSizeGb || r.volume.size_gb_min) + '" oninput="dwOnVolSizeInput()"></div>';
+    html += '<div class="srow"><label for="dw-vtype">Volume type</label>' +
+      '<select id="dw-vtype" onchange="dwOnVTypeChange()">' + dwVTypeOptions() + '</select></div>';
+    html += '<div class="srow"><label for="dw-dc">Data center</label>' +
+      '<select id="dw-dc" onchange="dwOnDcChange()">' + dwDcOptions(true) + '</select></div>';
+  }
+  return html;
+}
+function dwPanel() {
+  var r = dwRecipe(); if (!r) return '';
+  var st = _dwState, i;
+  var g = dwFindGpu(st.gpuId);
+  var avail = dwGpuAvailable(g, st.cloud);
+  var html = '';
+  // GPU type
+  html += '<div class="srow"><label for="dw-gpu">GPU type</label>' +
+    '<select id="dw-gpu" onchange="dwOnGpuChange()">' + dwGpuOptions(r) + '</select></div>';
+  // GPU count
+  if (avail) {
+    var maxC = Math.min((g.maxCount || {})[st.cloud] || 0, 8);
+    html += '<div class="srow"><label for="dw-count">GPU count</label><select id="dw-count" onchange="dwOnCountChange()">';
+    for (i = 1; i <= maxC; i++)
+      html += '<option value="' + i + '"' + (i === st.gpuCount ? ' selected' : '') + '>' + i + '</option>';
+    html += '</select><span class="muted">' +
+      (r.vram_min_gb ? 'needs ' + r.vram_min_gb + ' GB VRAM · ' : '') + g.memory + ' GB per GPU</span></div>';
+  } else {
+    html += '<div class="srow"><label>GPU count</label><span class="muted">not offered on ' +
+      esc(st.cloud) + ' cloud</span></div>';
+  }
+  // Cloud
+  html += '<div class="srow"><label for="dw-cloud">Cloud</label><select id="dw-cloud" onchange="dwOnCloudChange()">' +
+    '<option value="secure"' + (st.cloud === 'secure' ? ' selected' : '') + '>secure</option>' +
+    '<option value="community"' + (st.cloud === 'community' ? ' selected' : '') + '>community (spot — can be preempted)</option>' +
+    '</select></div>';
+  // Volume / data center
+  html += dwVolumeRows(r);
+  // Context
+  var co = r.ctx_options || [];
+  if (co.length) {
+    html += '<div class="srow"><label for="dw-ctx">Context</label><select id="dw-ctx" onchange="dwOnCtxChange()">';
+    for (i = 0; i < co.length; i++) {
+      var c = co[i];
+      html += '<option value="' + esc(c.key) + '"' + (c.key === st.ctxKey ? ' selected' : '') + '>' +
+        esc(c.label + (c.kv_est_gb ? ' (~' + c.kv_est_gb + ' GB KV cache)' : '')) + '</option>';
+    }
+    html += '</select></div>';
+  }
+  // Container disk
+  html += '<div class="srow"><label for="dw-disk">Container disk (GB)</label>' +
+    '<input id="dw-disk" type="number" min="' + r.disk_gb_min + '" value="' +
+    (st.diskGb || r.disk_gb_min) + '" oninput="dwOnDiskInput()"></div>';
+  // Idle auto-stop
+  html += '<div class="srow"><label for="dw-idle">Idle auto-stop</label><select id="dw-idle" onchange="dwOnIdleChange()">' +
+    '<option value="0"' + (!st.idleS ? ' selected' : '') + '>Keep running until I stop it</option>' +
+    '<option value="900"' + (st.idleS === 900 ? ' selected' : '') + '>after 15 min idle</option>' +
+    '<option value="3600"' + (st.idleS === 3600 ? ' selected' : '') + '>after 1 h idle</option>' +
+    '</select></div>';
+  // Cost + VRAM + deploy
+  html += '<div class="dw-cost" id="dw-cost">' + dwCostHtml() + '</div>';
+  html += '<div class="muted" id="dw-vram">' + dwVramHtml() + '</div>';
+  html += '<div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
+    '<button id="dw-deploy-btn" class="btn btn-primary"' + (avail ? '' : ' disabled') + ' onclick="dwDeploy()">Deploy</button>' +
+    '<span class="muted">creates a new pod and starts billing immediately</span></div>';
+  return html;
+}
+function dwCostHtml() {
+  var st = _dwState, g = dwFindGpu(st.gpuId);
+  if (!g) return '<span class="muted">—</span>';
+  if (!dwGpuAvailable(g, st.cloud))
+    return '<span style="color:var(--warning)">unavailable on ' + esc(st.cloud) + ' cloud</span>';
+  var total = (g.price || {})[st.cloud] * st.gpuCount;
+  return '$' + total.toFixed(2) + '/hr' +
+    (st.cloud === 'community' ? ' <span class="muted">(spot)</span>' : '');
+}
+function dwVramHtml() {
+  var r = dwRecipe(), st = _dwState, g = dwFindGpu(st.gpuId);
+  if (!r || !g || !r.vram_min_gb) return '';
+  var have = g.memory * st.gpuCount, need = r.vram_min_gb;
+  var html = '<span class="' + (have >= need ? 'dw-vram-ok' : 'dw-vram-low') + '">VRAM: ' +
+    have + ' GB selected · needs ' + need + ' GB</span>';
+  if (have < need) html += ' — pick a bigger GPU or more GPUs';
+  return html;
+}
+function dwMsgHtml() {
+  if (!_dwMsg) return '';
+  return '<div class="dw-msg ' + _dwMsg.type + '">' + _dwMsg.html + '</div>';
+}
+
+// ----- event handlers -----
+function dwOnModelChange() {
+  _dwMsg = null;
+  _dwState.recipeId = document.getElementById('dw-model').value || null;
+  if (_dwState.recipeId) dwApplyRecipeDefaults();
+  dwRenderAll();
+}
+function dwOnGpuChange() {
+  _dwState.gpuId = document.getElementById('dw-gpu').value;
+  var r = dwRecipe(), g = dwFindGpu(_dwState.gpuId);
+  if (r && g) _dwState.gpuCount = dwCountFor(r, g, _dwState.cloud);
+  dwRenderAll();
+}
+function dwOnCountChange() {
+  _dwState.gpuCount = parseInt(document.getElementById('dw-count').value, 10) || 1;
+  dwRenderAll();
+}
+function dwOnCloudChange() {
+  _dwState.cloud = document.getElementById('dw-cloud').value === 'community' ? 'community' : 'secure';
+  var g = dwFindGpu(_dwState.gpuId);
+  if (g) {
+    var maxC = Math.min((g.maxCount || {})[_dwState.cloud] || 0, 8);
+    if (_dwState.gpuCount > maxC) _dwState.gpuCount = Math.max(1, maxC);
+  }
+  dwRenderAll();
+}
+function dwOnVolumeModeChange(mode) {
+  _dwMsg = null;
+  _dwState.volumeMode = mode;
+  dwRenderAll();
+}
+function dwOnVolumeSelectChange() {
+  _dwState.volumeId = document.getElementById('dw-volume').value;
+  dwRenderAll();
+}
+function dwOnDcChange() {
+  _dwState.dcId = document.getElementById('dw-dc').value;
+  var types = dwDcTypes(_dwState.dcId);
+  if (types.length && types.indexOf(_dwState.volumeType) < 0) _dwState.volumeType = types[0];
+  dwRenderAll();
+}
+function dwOnVTypeChange() { _dwState.volumeType = document.getElementById('dw-vtype').value; }
+function dwOnVolSizeInput() { _dwState.volumeSizeGb = parseInt(document.getElementById('dw-volsize').value, 10) || 0; }
+function dwOnCtxChange() { _dwState.ctxKey = document.getElementById('dw-ctx').value; }
+function dwOnDiskInput() { _dwState.diskGb = parseInt(document.getElementById('dw-disk').value, 10) || 0; }
+function dwOnIdleChange() { _dwState.idleS = parseInt(document.getElementById('dw-idle').value, 10) || 0; }
+
+// ----- deploy -----
+function dwBuildPayload() {
+  var r = dwRecipe(), st = _dwState;
+  var body = {
+    recipe_id: r.id,
+    gpu_id: st.gpuId,
+    gpu_count: st.gpuCount,
+    cloud: st.cloud,
+    data_center_id: '',
+    volume_mode: r.volume ? st.volumeMode : 'none',
+    ctx_key: st.ctxKey,
+    container_disk_gb: st.diskGb || r.disk_gb_min,
+    idle_terminate_s: st.idleS,
+    alias: ''
+  };
+  if (r.volume) {
+    if (st.volumeMode === 'existing') {
+      var v = dwSelectedVolume();
+      if (v) {
+        body.volume_id = v.id;
+        body.volume_size_gb = v.size;
+        body.volume_type = v.type;
+        body.data_center_id = v.dataCenter;
+      }
+    } else {
+      body.volume_size_gb = st.volumeSizeGb || r.volume.size_gb_min;
+      body.volume_type = st.volumeType;
+      body.data_center_id = st.dcId;
+    }
+  } else {
+    body.data_center_id = st.dcId || '';
+  }
+  return body;
+}
+function dwSuccessHtml(d) {
+  var url = location.origin + '/v1/chat/completions';
+  return '<b>✓ Deploying ' + esc(d.model) + '</b>' +
+    (d.name ? ' — <code>' + esc(d.name) + '</code>' : '') +
+    ' · pod <code>' + esc(d.pod_id) + '</code>' +
+    (d.est_cost_per_hr != null ? ' · est $' + d.est_cost_per_hr + '/hr' : '') +
+    '<div style="margin-top:6px">Use model "' + esc(d.model) +
+    '" in any OpenAI- or Anthropic-compatible tool → <code>' + esc(url) + '</code></div>' +
+    '<div class="dw-hint">Boot takes a few minutes (model copy + load). Watch it appear in the RunPod servers widget below.</div>';
+}
+function dwDeploy() {
+  var r = dwRecipe(), st = _dwState;
+  if (!r) return;
+  var g = dwFindGpu(st.gpuId);
+  if (!g) { notify('✗ pick a GPU first', true); return; }
+  var p = (g.price || {})[st.cloud], cost = '';
+  if (p > 0) cost = ' · est $' + (p * st.gpuCount).toFixed(2) + '/hr';
+  var where = (r.volume && st.volumeMode === 'existing')
+    ? (dwSelectedVolume() || {}).dataCenter : st.dcId;
+  var msg = 'Deploy ' + r.model + ' (' + r.quant + ')?\n' +
+    st.gpuCount + '× ' + g.id + ' (' + st.cloud + ')' +
+    (where ? ' · ' + where : '') + cost + '\n' +
+    'The pod bills per hour until you stop it.';
+  if (!confirm(msg)) return;
+  var btn = document.getElementById('dw-deploy-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deploying…'; }
+  var headers = {'Content-Type': 'application/json'};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  fetch('/admin/catalog/deploy', {method: 'POST', headers: headers, body: JSON.stringify(dwBuildPayload())})
+    .then(function (resp) {
+      return resp.json().then(
+        function (d) { return {status: resp.status, data: d}; },
+        function () { return {status: resp.status, data: null}; });
+    })
+    .then(function (res) {
+      if (res.status === 200 && res.data && res.data.ok) {
+        _dwMsg = {type: 'ok', html: dwSuccessHtml(res.data)};
+        notify('✓ deploying ' + res.data.model);
+        refreshRunpodPods();
+      } else {
+        var errs = res.data && res.data.detail && res.data.detail.errors;
+        if (errs && errs.length) {
+          var lis = '';
+          for (var i = 0; i < errs.length; i++) lis += '<li>' + esc(errs[i]) + '</li>';
+          _dwMsg = {type: 'err', html: '<b>✗ This configuration cannot be deployed</b><ul>' + lis + '</ul>'};
+        } else {
+          var m = (res.data && res.data.detail && (res.data.detail.message || res.data.detail.code)) ||
+            (res.data && res.data.error && res.data.error.message) || ('HTTP ' + res.status);
+          _dwMsg = {type: 'err', html: '<b>✗ Deploy failed</b> — ' + esc(m)};
+        }
+      }
+      dwRenderAll();
+    })
+    .catch(function (e) {
+      _dwMsg = {type: 'err', html: '<b>✗ Deploy failed</b> — ' + esc(e.message)};
+      dwRenderAll();
+    });
 }
 
 // ---------- Performance ----------

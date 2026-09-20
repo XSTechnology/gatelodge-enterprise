@@ -105,6 +105,7 @@ except ImportError:
     huggingface_hub = None
 
 from . import cloud
+from . import catalog
 from . import llamaserver
 from . import runpod
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
@@ -2857,6 +2858,146 @@ async def admin_runpod_deploy(payload: RunPodDeployPayload) -> Response:
     _mutate_config(mutator)
     return {"ok": True, "pod_id": pod_id, "backend": payload.backend,
             "model": payload.model, "name": pod.get("name")}
+
+
+# ── Model catalogue + deploy wizard ────────────────────────────────────────
+
+class CatalogDeployPayload(BaseModel):
+    """Deploy a catalogue recipe with dropdown-chosen options. Every
+    option is validated against LIVE RunPod catalog data before
+    anything is created."""
+    model_config = ConfigDict(extra="ignore")
+    backend: str = ""
+    recipe_id: str = ""
+    gpu_id: str = ""
+    gpu_count: int = 0
+    cloud: str = "secure"          # secure | community (community = spot)
+    data_center_id: str = ""
+    volume_mode: str = "none"      # none | existing | create
+    volume_id: str = ""
+    volume_size_gb: int = 0
+    volume_type: str = "STANDARD"  # STANDARD | HIGH_PERFORMANCE
+    ctx_key: str = ""
+    container_disk_gb: int = 0
+    idle_terminate_s: float = 0
+    alias: str = ""
+
+
+def _runpod_api_key_env(cfg) -> tuple[str, str]:
+    """First runpod backend name + its api_key_env (wizard default)."""
+    rp = {n: b for n, b in cfg.backends.items() if b.get("type") == "runpod"}
+    name = next(iter(rp)) if rp else ""
+    env = rp.get(name, {}).get("api_key_env", "RUNPOD_API_KEY") if name else "RUNPOD_API_KEY"
+    return name, env
+
+
+@app.get("/admin/catalog")
+async def admin_catalog() -> Response:
+    """Curated recipes + live RunPod options (GPUs with prices,
+    data centers with volume support, account volumes) — the deploy
+    wizard's dropdown data. GPU/DC lists are cached 5 min."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend, api_key_env = _runpod_api_key_env(cfg)
+    if not backend:
+        return _error(400, "no runpod backend configured")
+    try:
+        opts = await catalog.live_options(api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    return {"recipes": catalog.public_recipes(),
+            "backend": backend, **opts}
+
+
+@app.post("/admin/catalog/deploy")
+async def admin_catalog_deploy(payload: CatalogDeployPayload) -> Response:
+    """Validate recipe + choices against live options, create the
+    network volume if requested, deploy the pod, save the spec."""
+    if not payload.recipe_id:
+        return _error(400, "recipe_id required")
+    recipe = catalog.find_recipe(payload.recipe_id)
+    if recipe is None:
+        return _error(400, f"unknown recipe {payload.recipe_id!r}")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if backend not in rp_backends:
+        return _error(400, f"backend {backend!r} is not a runpod backend")
+    api_key_env = rp_backends[backend].get("api_key_env", "RUNPOD_API_KEY")
+
+    try:
+        opts = await catalog.live_options(api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+
+    choices: dict[str, Any] = {
+        "gpu_id": payload.gpu_id,
+        "gpu_count": payload.gpu_count,
+        "cloud": payload.cloud,
+        "data_center_id": payload.data_center_id,
+        "volume_mode": payload.volume_mode,
+        "volume_id": payload.volume_id,
+        "volume_size_gb": payload.volume_size_gb,
+        "volume_type": payload.volume_type,
+        "ctx_key": payload.ctx_key,
+        "container_disk_gb": payload.container_disk_gb,
+        "alias": payload.alias,
+    }
+    # Existing volume: the pod MUST run in the volume's DC — derive it
+    # when the client didn't send one (network volumes are DC-pinned).
+    if payload.volume_mode == "existing" and payload.volume_id \
+            and not payload.data_center_id:
+        vol = next((v for v in opts["volumes"]
+                    if v.get("id") == payload.volume_id), None)
+        if vol:
+            choices["data_center_id"] = vol.get("dataCenter") or ""
+
+    errors = catalog.validate_selection(recipe, choices, opts["gpus"],
+                                        opts["datacenters"],
+                                        opts["volumes"])
+    if errors:
+        return JSONResponse(status_code=422, content={
+            "detail": {"code": "invalid_selection", "errors": errors}})
+
+    # Volume creation happens after validation (size/type/DC checked)
+    if payload.volume_mode == "create":
+        vol_name = f"gw-{recipe['id']}-{payload.data_center_id}".lower()[:60]
+        try:
+            vol = await runpod.create_volume(
+                vol_name, payload.data_center_id,
+                payload.volume_size_gb, payload.volume_type, api_key_env)
+        except runpod.RunPodError as e:
+            return _error(502, f"volume create failed: {e}",
+                          code="runpod_error")
+        if not isinstance(vol, dict) or not vol.get("id"):
+            return _error(502, f"volume create returned no id: "
+                               f"{str(vol)[:200]}", code="runpod_error")
+        choices["volume_id"] = vol["id"]
+
+    spec = catalog.build_spec(recipe, choices)
+    model_key = spec.get("alias") or recipe["id"]
+    deploy_payload = runpod.deploy_payload(backend, model_key, spec)
+    try:
+        pod = await runpod.deploy_pod(deploy_payload, api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    pod_id = pod.get("id")
+    spec["pod_id"] = pod_id
+
+    def mutator(raw: dict):
+        models = raw.setdefault("backends", {}).setdefault(
+            backend, {}).setdefault("models", {})
+        models[model_key] = spec
+
+    _mutate_config(mutator)
+    est = catalog.est_cost_per_hr(opts["gpus"], spec["gpu_type_ids"][0],
+                                  spec["gpu_count"],
+                                  payload.cloud or "secure")
+    return {"ok": True, "pod_id": pod_id, "backend": backend,
+            "model": model_key, "name": pod.get("name"),
+            "est_cost_per_hr": est}
 
 
 class RunPodServerlessPayload(BaseModel):

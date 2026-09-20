@@ -167,6 +167,51 @@ async def delete_endpoint(endpoint_id: str, api_key_env: str) -> Any:
     return await _rest("DELETE", f"/serverless/{endpoint_id}", api_key_env)
 
 
+# ── Catalog / volume REST (live option surface for the deploy wizard) ──────
+
+def _first_list(out: Any, *keys: str) -> list[dict[str, Any]]:
+    """Unwrap a REST response that may be a bare list or {key: [...]}."""
+    if isinstance(out, list):
+        return [x for x in out if isinstance(x, dict)]
+    if isinstance(out, dict):
+        for key in keys:
+            if isinstance(out.get(key), list):
+                return [x for x in out[key] if isinstance(x, dict)]
+    return []
+
+
+async def list_gpu_catalog(api_key_env: str) -> list[dict[str, Any]]:
+    """GET /v2/catalog/gpus — live GPU types: id, memory (GB), price
+    {community, secure, serverless}, maxCount {community, secure}."""
+    return _first_list(await _rest("GET", "/catalog/gpus", api_key_env),
+                       "gpus", "data", "items")
+
+
+async def list_datacenter_catalog(api_key_env: str) -> list[dict[str, Any]]:
+    """GET /v2/catalog/datacenters — DCs with region, compliance and
+    networkVolumeTypes ([] = volumes unsupported there)."""
+    return _first_list(await _rest("GET", "/catalog/datacenters", api_key_env),
+                       "dataCenters", "datacenters", "data", "items")
+
+
+async def list_volumes(api_key_env: str) -> list[dict[str, Any]]:
+    """GET /v2/network-volumes — the account's network volumes (id,
+    name, dataCenter, size GB, type). Network volumes are DC-pinned."""
+    return _first_list(await _rest("GET", "/network-volumes", api_key_env),
+                       "networkVolumes", "volumes", "data", "items")
+
+
+async def create_volume(name: str, data_center: str, size_gb: int,
+                        vol_type: str, api_key_env: str) -> dict[str, Any]:
+    """POST /v2/network-volumes {name, dataCenter, size, type} — type
+    STANDARD or HIGH_PERFORMANCE (3x throughput; only some DCs offer
+    it — check list_datacenter_catalog)."""
+    return await _rest("POST", "/network-volumes", api_key_env, {
+        "name": name, "dataCenter": data_center,
+        "size": int(size_gb), "type": vol_type or "STANDARD",
+    })
+
+
 def pod_state(pod: dict[str, Any]) -> str:
     """Best-effort pod state: status / desiredStatus fields vary by API
     version — upper-cased when present, else 'unknown'."""
@@ -326,6 +371,17 @@ def _pod_name(backend_name: str, model_key: str) -> str:
     return tag[:60]
 
 
+def _normalize_ports(ports: Any) -> list[str]:
+    """v2 wants an ARRAY. Config specs store "8080/http" (string) —
+    the config loader normalizes on reload, but specs built at runtime
+    (deploy wizard, /admin/runpod/deploy) bypass that path, so the
+    string reached the API verbatim and RunPod 422'd ($.ports: got
+    string, want array — live-verified via the catalog deploy E2E)."""
+    if isinstance(ports, list):
+        return [str(p).strip() for p in ports if str(p).strip()]
+    return [p.strip() for p in str(ports or "").split(",") if p.strip()]
+
+
 def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any],
                    gpu_id: str | None = None) -> dict[str, Any]:
     """Config pod spec → POST /v2/pods payload (snake_case, nested gpu).
@@ -356,7 +412,7 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any],
     payload: dict[str, Any] = {
         "name": _pod_name(backend_name, model_key),
         "image": spec.get("image"),
-        "ports": spec.get("ports"),
+        "ports": _normalize_ports(spec.get("ports")),
         "disk": spec.get("container_disk_gb"),
         "env": _normalize_env(spec.get("env")),
     }
