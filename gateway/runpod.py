@@ -32,6 +32,7 @@ import logging
 import re
 import shlex
 import time
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 import httpx
@@ -256,22 +257,57 @@ async def fetch_pod_logs(pod_id: str, api_key_env: str,
 
 
 # Whitelisted pod-object fields for diagnostics — the v2 schema varies,
-# only what exists is reported.
+# only what exists is reported. Additionally pod_info() normalizes the
+# two schemas seen in the wild (deploy response vs pods-list object):
+# gpuTypeId ← gpuTypeId | gpu.id, costPerHour ← costPerHour | cost,
+# uptimeSeconds ← uptimeSeconds | startedAt, imageName ← image.
 _POD_INFO_KEYS = ("id", "name", "status", "desiredStatus", "imageName",
                   "image", "gpuTypeId", "costPerHour", "containerDiskInGb",
-                  "volumeInGb", "cloudType", "uptimeSeconds", "licenseFee")
+                  "volumeInGb", "cloudType", "uptimeSeconds", "licenseFee",
+                  "actions", "cloud", "dataCenterId")
 
 
 def pod_info(pod: dict[str, Any] | None) -> dict[str, Any]:
-    """Trimmed pod object for diagnostics (schema-tolerant)."""
+    """Trimmed pod object for diagnostics (schema-tolerant, normalized)."""
     if not isinstance(pod, dict):
         return {}
     out = {k: pod[k] for k in _POD_INFO_KEYS if k in pod}
     gpu = pod.get("gpu")
     if isinstance(gpu, dict):
         out["gpu"] = gpu.get("id") or gpu.get("type") or gpu
+        if isinstance(gpu.get("count"), int):
+            out["gpuCount"] = gpu["count"]
     elif isinstance(gpu, str):
         out["gpu"] = gpu
+    if "gpuTypeId" not in out and isinstance(out.get("gpu"), str):
+        out["gpuTypeId"] = out["gpu"]
+    if "costPerHour" not in out and pod.get("cost") is not None:
+        try:
+            out["costPerHour"] = float(pod["cost"])
+        except (TypeError, ValueError):
+            pass
+    if "uptimeSeconds" not in out and pod.get("startedAt"):
+        try:  # "2026-09-20T06:11:16.12Z" — fromisoformat needs +00:00
+            started = datetime.fromisoformat(
+                str(pod["startedAt"]).replace("Z", "+00:00"))
+            out["uptimeSeconds"] = max(0, int(
+                (datetime.now(timezone.utc) - started).total_seconds()))
+        except ValueError:
+            pass
+    if "imageName" not in out and pod.get("image"):
+        out["imageName"] = pod["image"]
+    runtime = pod.get("runtime")
+    if isinstance(runtime, dict) and isinstance(runtime.get("gpus"), list):
+        utils = [g.get("util") for g in runtime["gpus"]
+                 if isinstance(g, dict)
+                 and isinstance(g.get("util"), (int, float))]
+        if utils:
+            out["gpuUtil"] = max(utils)
+        mems = [g.get("memoryUtil") for g in runtime["gpus"]
+                if isinstance(g, dict)
+                and isinstance(g.get("memoryUtil"), (int, float))]
+        if mems:
+            out["gpuMemUtil"] = max(mems)
     return out
 
 

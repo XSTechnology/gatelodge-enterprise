@@ -585,16 +585,17 @@ function showServices(ui) {
   _editBackendName = null;
   Promise.all([api('/admin/backends'), api('/healthz')]).then(function (r) {
     var defs = r[0], hz = r[1];
-    var children = hz.llama_server || [], pods = hz.runpod || [];
+    var children = hz.llama_server || [];
     // Store backend data for edit
     _svcBackends = {};
     (defs.backends || []).forEach(function (b) { _svcBackends[b.name] = b; });
     var html = buildBackendForm(defs) +
       buildBackendTable(defs) +
       buildLiveChildren(children) +
-      buildLivePods(pods);
+      buildRunpodServers();
     ui.body.innerHTML = html;
     setTimeout(function () { onSvcBackendChange(); }, 50);
+    refreshRunpodPods();
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
 
@@ -699,18 +700,180 @@ function buildLiveChildren(children) {
   return html;
 }
 
-function buildLivePods(pods) {
-  if (!pods.length) return '';
-  var html = '<div class="widget"><h3>Live runpod pods</h3><table><tbody>';
-  pods.forEach(function (p) {
-    html += '<tr><td><b>' + esc(p.backend) + ':' + esc(p.model) + '</b></td>' +
-      '<td>' + esc(p.state) + '</td><td class="muted">' + esc(p.pod_id || '') + '</td>' +
-      '<td class="muted">idle ' + (p.idle_s || 0) + 's</td>' +
-      '<td><button class="btn btn-sm" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',false)">stop</button> ' +
-      '<button class="btn btn-sm btn-danger" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',true)">terminate</button></td></tr>';
+function buildRunpodServers() {
+  return '<div class="widget"><h3>RunPod servers ' +
+    '<button class="btn btn-sm" onclick="refreshRunpodPods()">⟳ refresh</button></h3>' +
+    '<div id="rp-pods-body"><div class="muted">loading…</div></div>' +
+    '<div class="muted" style="margin-top:6px">Live from the RunPod API — includes pods the gateway does not manage. ' +
+    'start resumes a stopped pod (keeps storage) · stop idles it · terminate frees everything · ' +
+    '⚗ test loads &amp; verifies with a full diagnostic report.</div></div>';
+}
+function refreshRunpodPods() {
+  var box = document.getElementById('rp-pods-body');
+  if (!box) return;
+  box.innerHTML = '<div class="muted">loading…</div>';
+  Promise.all([api('/admin/runpod/inventory', {method: 'POST'}),
+               api('/healthz'), api('/admin/backends')])
+    .then(function (r) {
+      renderRunpodPods(r[0], r[1].runpod || [], _rpPodSpecs(r[2]));
+    })
+    .catch(function (e) { box.innerHTML = errBox(e); });
+}
+// deployable pod models from config (runpod backends, non-serverless)
+function _rpPodSpecs(defs) {
+  var specs = [];
+  ((defs && defs.backends) || []).forEach(function (b) {
+    if (b.type !== 'runpod') return;
+    Object.keys(b.models || {}).forEach(function (m) {
+      var spec = b.models[m] || {};
+      if (spec.endpoint_id) return; // serverless — no pod
+      if (!spec.pod_id && !spec.image) return; // draft entry — not deployable
+      specs.push({backend: b.name, model: m, pod_id: spec.pod_id || null});
+    });
   });
-  html += '</tbody></table><div class="muted">stop keeps storage (cheap resume); terminate frees everything (full redeploy next request).</div></div>';
+  return specs;
+}
+// gateway-managed pods are named gw-<backend>-<model> (runpod._pod_name)
+function _gwPodName(backend, model) {
+  return ('gw-' + backend + '-' + model).toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+}
+function _rpMatch(p, mgrs, specs) {
+  for (var i = 0; i < mgrs.length; i++)
+    if (mgrs[i].pod_id === p.id) return mgrs[i];
+  for (var j = 0; j < specs.length; j++)
+    if (specs[j].pod_id && specs[j].pod_id === p.id) return specs[j];
+  for (var k = 0; k < specs.length; k++)
+    if (_gwPodName(specs[k].backend, specs[k].model) === p.name) return specs[k];
+  return null;
+}
+function _fmtDur(s) {
+  if (s == null) return '—';
+  s = Math.round(s);
+  if (s < 90) return s + 's';
+  if (s < 5400) return Math.round(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+function _rpStatusBadge(p) {
+  var st = p.status || 'UNKNOWN';
+  var cls = st === 'RUNNING' ? 'ok' : (st === 'STOPPED' || st === 'EXITED') ? 'dim' : 'warn';
+  var html = '<span class="badge ' + cls + '">' + esc(st) + '</span>';
+  if (p.desiredStatus && p.desiredStatus !== p.status)
+    html += ' <span class="muted">→ ' + esc(p.desiredStatus) + '</span>';
   return html;
+}
+function renderRunpodPods(inv, mgrs, specs) {
+  var box = document.getElementById('rp-pods-body');
+  if (!box) return;
+  if (inv.error) { box.innerHTML = errBox({message: inv.error}); return; }
+  var html = '<table><thead><tr><th>server</th><th>status</th><th>gpu</th><th>cost</th><th></th></tr></thead><tbody>';
+  var matched = {};  // "backend:model" -> true (live pod exists)
+  inv.pods.forEach(function (p) {
+    var m = _rpMatch(p, mgrs, specs), running = (p.status || '') === 'RUNNING';
+    var acts = p.actions || [];
+    var wantStart = acts.length ? acts.indexOf('start') >= 0 : !running;
+    var wantStop = acts.length ? acts.indexOf('stop') >= 0 : running;
+    var label = m ? '<b>' + esc(m.backend) + ':' + esc(m.model) + '</b>' : '<b>' + esc(p.name || 'pod') + '</b>';
+    if (m) { label += ' <span class="badge runpod">managed</span>'; matched[m.backend + ':' + m.model] = true; }
+    label += '<div class="muted"><code>' + esc(p.id) + '</code>' +
+      (m && m.idle_s != null ? ' · idle ' + _fmtDur(m.idle_s) : '') + '</div>';
+    var gpu = p.gpuTypeId ? (p.gpuCount > 1 ? p.gpuCount + '× ' : '') + esc(p.gpuTypeId) : '—';
+    if (p.gpuUtil != null) gpu += ' <span class="muted">' + p.gpuUtil + '%</span>';
+    var cost = [];
+    if (p.costPerHour) cost.push('$' + p.costPerHour + '/hr');
+    if (p.costPerHour && p.uptimeSeconds != null)
+      cost.push('$' + (p.uptimeSeconds / 3600 * p.costPerHour).toFixed(2) + ' session');
+    var btns = '';
+    if (wantStop) btns += '<button class="btn btn-sm" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'stop\')">stop</button> ';
+    if (wantStart) btns += '<button class="btn btn-sm" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'start\')">start</button> ';
+    if (m) btns += '<button class="btn btn-sm" onclick="testRunpodModel(\'' + esc(m.backend) + '\',\'' + esc(m.model) + '\')">⚗ test</button> ';
+    btns += '<button class="btn btn-sm btn-danger" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'terminate\')">terminate</button>';
+    html += '<tr><td>' + label + '</td><td>' + _rpStatusBadge(p) + '</td>' +
+      '<td class="muted">' + gpu + '</td>' +
+      '<td class="muted">' + (cost.length ? cost.join('<br>') : '—') +
+      (p.uptimeSeconds != null ? '<div class="muted">up ' + _fmtDur(p.uptimeSeconds) + '</div>' : '') + '</td>' +
+      '<td>' + btns + '</td></tr>';
+  });
+  // configured pod specs with no live pod yet (lazy-deploy models)
+  specs.forEach(function (s) {
+    if (matched[s.backend + ':' + s.model]) return;
+    html += '<tr><td><b>' + esc(s.backend) + ':' + esc(s.model) + '</b> <span class="badge runpod">managed</span>' +
+      '<div class="muted">configured spec — not deployed' +
+      (s.pod_id ? ' · pinned <code>' + esc(s.pod_id) + '</code> (not found)' : '') + '</div></td>' +
+      '<td><span class="badge dim">not deployed</span></td><td class="muted">—</td><td class="muted">—</td>' +
+      '<td><button class="btn btn-sm" onclick="testRunpodModel(\'' + esc(s.backend) + '\',\'' + esc(s.model) + '\')">⚗ test (deploys)</button></td></tr>';
+  });
+  if (!inv.pods.length && !specs.length)
+    html += '<tr><td colspan="5" class="muted">No pods deployed.</td></tr>';
+  html += '</tbody></table>';
+  box.innerHTML = html;
+}
+function runpodPodAction(podId, action) {
+  var msg = action === 'terminate'
+    ? 'Terminate pod ' + podId + '? This cannot be undone — it frees all storage.'
+    : action + ' pod ' + podId + '?';
+  if (!confirm(msg)) return;
+  api('/admin/runpod/action', {method: 'POST', body: {pod_id: podId, action: action}})
+    .then(function () { notify('✓ pod ' + action + 'd'); refreshRunpodPods(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); refreshRunpodPods(); });
+}
+function testRunpodModel(backend, model) {
+  if (!confirm('Test ' + backend + ':' + model + '?\nLoads the pod if needed (may take a minute) and runs a diagnostic chat.'))
+    return;
+  notify('⚗ testing ' + backend + ':' + model + '…');
+  api('/admin/runpod/test', {method: 'POST', body: {backend: backend, model: model, after: 'keep'}})
+    .then(function (d) { showRunpodTestReport(backend, model, d); refreshRunpodPods(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function showRunpodTestReport(backend, model, d) {
+  notify((d.ok ? '✓ ' : '✗ ') + backend + ':' + model + (d.ok ? ' passed' : ' failed'), !d.ok);
+  var ph = d.phases || {};
+  var html = '<div class="widget"><h3>⚗ ' + esc(backend) + ':' + esc(model) + ' ' +
+    (d.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">FAILED</span>') +
+    ' <span class="muted">' + (d.elapsed_s || 0) + 's total</span></h3>';
+  if (d.error) html += '<div class="kv" style="color:var(--danger)">' + esc(d.error) + '</div>';
+  var p = ph.pod || {};
+  html += '<div class="kv"><b>pod</b>: ' + esc(p.action || '—') +
+    (p.pod_id ? ' · <code>' + esc(p.pod_id) + '</code>' : '') +
+    (p.state ? ' · ' + esc(p.state) : '') +
+    (p.elapsed_s != null ? ' · ' + p.elapsed_s + 's' : '') + '</div>';
+  if (p.pod && (p.pod.gpuTypeId || p.pod.costPerHour))
+    html += '<div class="kv muted">' + esc(p.pod.gpuTypeId || '') +
+      (p.pod.costPerHour ? ' · $' + p.pod.costPerHour + '/hr' : '') + '</div>';
+  if (p.error) html += '<div class="kv" style="color:var(--danger)">pod: ' + esc(p.error) + '</div>';
+  var h = ph.health || {};
+  if (h.base_url) html += '<div class="kv"><b>proxy</b>: <code>' + esc(h.base_url) + '</code></div>';
+  ['health', 'models'].forEach(function (k) {
+    var pr = h[k];
+    if (!pr) return;
+    html += '<div class="kv muted">' + k + ' probe: ' +
+      (pr.error ? '✗ ' + esc(pr.error)
+        : pr.status + ' (' + pr.ms + 'ms)' +
+          (pr.ids && pr.ids.length ? ' · serving ' + esc(pr.ids.join(', ')) : '')) + '</div>';
+  });
+  if (h.error) html += '<div class="kv" style="color:var(--danger)">health: ' + esc(h.error) + '</div>';
+  var c = ph.chat || {};
+  if (c.content) html += '<div class="kv"><b>chat reply</b>: ' + esc(c.content) +
+    (c.elapsed_s != null ? ' <span class="muted">(' + c.elapsed_s + 's)</span>' : '') + '</div>';
+  if (c.usage && c.usage.total_tokens) html += '<div class="kv muted">' +
+    (c.usage.prompt_tokens || 0) + ' in + ' + (c.usage.completion_tokens || 0) +
+    ' out = ' + c.usage.total_tokens + ' tokens</div>';
+  if (c.error) html += '<div class="kv" style="color:var(--danger)">chat: ' + esc(c.error) + '</div>';
+  if (c.skipped) html += '<div class="kv muted">chat: skipped (' + esc(c.skipped) + ')</div>';
+  if (d.logs_error) html += '<div class="kv" style="color:var(--warning)">logs: ' + esc(d.logs_error) + '</div>';
+  if ((d.logs || []).length) {
+    html += '<div class="kv" style="margin-top:8px"><b>container logs</b> (tail ' + d.logs.length + '):</div>' +
+      '<div class="logs" style="max-height:200px">';
+    d.logs.forEach(function (l) {
+      html += '<div class="log-entry"><span class="log-time">' + esc(l.ts || '') + '</span> ' +
+        '<span class="log-level">' + esc(l.source || '') + '</span> <span class="log-msg">' + esc(l.line) + '</span></div>';
+    });
+    html += '</div>';
+  }
+  html += '</div>';
+  document.getElementById('modal-title').textContent = '⚗ RunPod test — ' + backend + ':' + model;
+  document.getElementById('modal-body').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
 }
 
 // ---------- Backend CRUD actions ----------
@@ -798,11 +961,6 @@ function cancelBackendEdit() {
 function stopChild(backend, model) {
   api('/admin/llama-server/stop', {method: 'POST', body: {backend: backend, model: model}})
     .then(function () { notify('✓ child stopped'); showPanel('services'); })
-    .catch(function (e) { notify('✗ ' + e.message, true); });
-}
-function stopPod(backend, model, terminate) {
-  api('/admin/runpod/stop', {method: 'POST', body: {backend: backend, model: model, terminate: terminate}})
-    .then(function () { notify('✓ pod ' + (terminate ? 'terminated' : 'stopped')); showPanel('services'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 function checkRunpodInventory() {
@@ -1245,7 +1403,7 @@ function showHealth(ui) {
         '<div class="bar"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div>' +
         '<div class="kv" style="margin-top:4px;"><b>' + fmtMB(used) + '</b> used · <b>' + fmtMB(g.free_mb) + '</b> free (' + pct + '%)</div></div>';
     });
-    var children = h.llama_server || [], pods = h.runpod || [];
+    var children = h.llama_server || [];
     if (children.length) {
       html += '<div class="widget"><h3>llama-server children (' + children.length + ')</h3><table><tbody>';
       children.forEach(function (c) {
@@ -1254,21 +1412,14 @@ function showHealth(ui) {
       });
       html += '</tbody></table></div>';
     }
-    if (pods.length) {
-      html += '<div class="widget"><h3>runpod pods (' + pods.length + ')</h3><table><tbody>';
-      pods.forEach(function (p) {
-        html += '<tr><td><b>' + esc(p.backend) + ':' + esc(p.model) + '</b></td><td>' + esc(p.state) +
-          '</td><td><button class="btn btn-sm" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',false)">stop</button> ' +
-          '<button class="btn btn-sm btn-danger" onclick="stopPod(\'' + esc(p.backend) + '\',\'' + esc(p.model) + '\',true)">terminate</button></td></tr>';
-      });
-      html += '</tbody></table></div>';
-    }
+    html += buildRunpodServers();
     html += '<div class="widget"><h3>Recovery actions</h3><div style="display:flex;gap:8px;flex-wrap:wrap;">' +
       '<button class="btn" onclick="unloadAll()">⏏ Unload all embedded models</button>' +
       '<button class="btn" onclick="stopAllChildren()">■ Stop all llama-server children</button>' +
       '<button class="btn" onclick="reloadConfig()">↻ Reload config</button></div>' +
       '<div class="muted" style="margin-top:6px">Everything respawns lazily — unloading/stopping only frees resources until the next request.</div></div>';
     ui.body.innerHTML = html;
+    refreshRunpodPods();
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
 function unloadAll() {

@@ -2989,7 +2989,10 @@ async def admin_runpod_inventory() -> Response:
                 stale.append({"backend": bname, "model": mname, "type": "endpoint", "id": eid})
 
     return {
-        "pods": [{"id": p.get("id"), "name": p.get("name"), "status": p.get("status") or p.get("desiredStatus")} for p in pods],
+        # pod_info: whitelisted live fields (gpu, cost/hr, uptime, status…)
+        "pods": [runpod.pod_info(p)
+                 | {"status": p.get("status") or p.get("desiredStatus")}
+                 for p in pods],
         "endpoints": [{"id": e.get("id"), "name": e.get("name"), "workersMax": e.get("workersMax")} for e in endpoints],
         "stale": stale,
     }
