@@ -160,6 +160,13 @@ async def terminate_pod(pod_id: str, api_key_env: str) -> Any:
     return await _rest("POST", f"/pods/{pod_id}/action", api_key_env, {"action": "terminate"})
 
 
+async def delete_endpoint(endpoint_id: str, api_key_env: str) -> Any:
+    """DELETE /v2/serverless/{id} — permanently deletes a serverless
+    endpoint: terminates its workers, cancels queued/active jobs, and
+    removes its bound template."""
+    return await _rest("DELETE", f"/serverless/{endpoint_id}", api_key_env)
+
+
 def pod_state(pod: dict[str, Any]) -> str:
     """Best-effort pod state: status / desiredStatus fields vary by API
     version — upper-cased when present, else 'unknown'."""

@@ -986,9 +986,13 @@ function checkRunpodInventory() {
       }
       html += '<h4 style="margin-top:10px;">Live endpoints (' + d.endpoints.length + ')</h4>';
       if (d.endpoints.length) {
-        html += '<table><thead><tr><th>id</th><th>name</th><th>max workers</th></tr></thead><tbody>';
+        html += '<table><thead><tr><th>id</th><th>name</th><th>max workers</th><th></th></tr></thead><tbody>';
         d.endpoints.forEach(function (e) {
-          html += '<tr><td><code>' + esc(e.id) + '</code></td><td>' + esc(e.name) + '</td><td>' + esc(e.workersMax) + '</td></tr>';
+          var refs = (e.referenced_by || []).join(', ');
+          html += '<tr><td><code>' + esc(e.id) + '</code></td><td>' + esc(e.name) +
+            (refs ? '<div class="muted">used by ' + esc(refs) + '</div>' : '') + '</td>' +
+            '<td>' + (e.workersMax == null ? '—' : e.workersMax) + '</td>' +
+            '<td><button class="btn btn-sm btn-danger" onclick="deleteEndpoint(\'' + esc(e.id) + '\')">delete</button></td></tr>';
         });
         html += '</tbody></table>';
       } else {
@@ -1025,6 +1029,15 @@ function runpodAction(podId, action) {
   if (!confirm(msg)) return;
   api('/admin/runpod/action', {method: 'POST', body: {pod_id: podId, action: action}})
     .then(function () { notify('✓ pod ' + action + 'd'); checkRunpodInventory(); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function deleteEndpoint(endpointId) {
+  if (!confirm('Delete serverless endpoint ' + endpointId + '?\n' +
+      'This is permanent: workers are terminated, queued jobs cancelled, ' +
+      'and its bound template removed. Config entries referencing it ' +
+      'become stale (removable below).')) return;
+  api('/admin/runpod/action', {method: 'POST', body: {endpoint_id: endpointId, action: 'delete'}})
+    .then(function () { notify('✓ endpoint deleted'); checkRunpodInventory(); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 function showDeployPod() {

@@ -115,6 +115,37 @@ def test_inventory_pods_enriched(wired, monkeypatch):
     assert body["stale"] == [{"backend": "rp", "model": "gone",
                               "type": "pod", "id": "pod-dead9"}]
     assert body["endpoints"][0]["id"] == "ep-ok"
+    assert body["endpoints"][0]["referenced_by"] == ["rp:ep"]
+
+
+def test_action_endpoint_delete(wired, monkeypatch):
+    wired(CONFIG)
+    calls = []
+
+    async def fake_delete(endpoint_id, api_key_env):
+        calls.append((endpoint_id, api_key_env))
+        return {}
+
+    monkeypatch.setattr(rp, "delete_endpoint", fake_delete)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/runpod/action",
+                        json={"endpoint_id": "ep-ok", "action": "delete"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["endpoint_id"] == "ep-ok"
+    assert calls == [("ep-ok", "RUNPOD_API_KEY_TEST")]
+    # validation: endpoints only support delete; ids are required
+    with TestClient(gw_app.app) as client:
+        for payload in (
+                {"endpoint_id": "ep-ok", "action": "start"},
+                {"endpoint_id": "ep-ok", "action": "stop"},
+                {"endpoint_id": "ep-ok"},
+                {"action": "delete"},
+                {"pod_id": "", "action": "start"},
+                {"pod_id": "pod-live1", "action": "reboot"}):
+            r = client.post("/admin/runpod/action", json=payload)
+            assert r.status_code == 400, (payload, r.text)
 
 
 def test_inventory_error_path(wired, monkeypatch):

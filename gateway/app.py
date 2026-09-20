@@ -2581,18 +2581,22 @@ async def admin_runpod_stop(payload: StopPayload) -> Response:
 
 
 class RunPodActionPayload(BaseModel):
-    """Payload for runpod pod lifecycle actions."""
+    """Payload for runpod lifecycle actions: pods (start/stop/terminate
+    by pod_id) and serverless endpoints (delete by endpoint_id)."""
     model_config = ConfigDict(extra="ignore")
     pod_id: str = ""
-    action: str = ""  # start, stop, terminate
+    endpoint_id: str = ""
+    action: str = ""  # pods: start, stop, terminate; endpoints: delete
 
 
 @app.post("/admin/runpod/action")
 async def admin_runpod_action(payload: RunPodActionPayload) -> Response:
-    """Direct pod lifecycle action on any pod (managed or BYO).
-    Actions: start (resume stopped), stop (keep storage), terminate (delete)."""
-    if not payload.pod_id:
-        return _error(400, "pod_id required")
+    """Direct lifecycle action on any runpod entity (managed or BYO).
+    Pods: start (resume stopped), stop (keep storage), terminate (delete).
+    Serverless endpoints: delete — permanent; workers, queued jobs and
+    the bound template go with it."""
+    if not payload.pod_id and not payload.endpoint_id:
+        return _error(400, "pod_id or endpoint_id required")
     cfg = get_gateway_config()
     cfg.maybe_reload()
     rp_backends = {n: b for n, b in cfg.backends.items() if b.get("type") == "runpod"}
@@ -2600,6 +2604,13 @@ async def admin_runpod_action(payload: RunPodActionPayload) -> Response:
         return _error(400, "no runpod backends configured")
     api_key_env = list(rp_backends.values())[0].get("api_key_env", "RUNPOD_API_KEY")
     try:
+        if payload.endpoint_id:
+            if payload.action != "delete":
+                return _error(400, "unknown action: endpoint actions are "
+                                   "delete")
+            await runpod.delete_endpoint(payload.endpoint_id, api_key_env)
+            return {"ok": True, "endpoint_id": payload.endpoint_id,
+                    "action": "delete"}
         if payload.action == "start":
             await runpod.start_pod(payload.pod_id, api_key_env)
         elif payload.action == "stop":
@@ -2979,6 +2990,7 @@ async def admin_runpod_inventory() -> Response:
 
     # Check configured models for stale references
     stale = []
+    ep_refs: dict[str, list[str]] = {}  # endpoint_id -> ["backend:model", ...]
     for bname, bdef in rp_backends.items():
         for mname, mdef in (bdef.get("models") or {}).items():
             pid = mdef.get("pod_id")
@@ -2987,13 +2999,18 @@ async def admin_runpod_inventory() -> Response:
                 stale.append({"backend": bname, "model": mname, "type": "pod", "id": pid})
             elif eid and eid not in ep_ids:
                 stale.append({"backend": bname, "model": mname, "type": "endpoint", "id": eid})
+            if eid:
+                ep_refs.setdefault(eid, []).append(f"{bname}:{mname}")
 
     return {
         # pod_info: whitelisted live fields (gpu, cost/hr, uptime, status…)
         "pods": [runpod.pod_info(p)
                  | {"status": p.get("status") or p.get("desiredStatus")}
                  for p in pods],
-        "endpoints": [{"id": e.get("id"), "name": e.get("name"), "workersMax": e.get("workersMax")} for e in endpoints],
+        "endpoints": [{"id": e.get("id"), "name": e.get("name"),
+                       "workersMax": e.get("workersMax"),
+                       "referenced_by": ep_refs.get(e.get("id"), [])}
+                      for e in endpoints],
         "stale": stale,
     }
 
