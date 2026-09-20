@@ -570,7 +570,9 @@ def build_spec(recipe: dict[str, Any], choices: dict[str, Any]) -> dict[str, Any
         "container_disk_gb": int(choices.get("container_disk_gb")
                                  or recipe["disk_gb_min"]),
         "start_timeout_s": recipe.get("start_timeout_s", 1800),
-        "idle_stop_s": 0,
+        # v3 cost-safety default: 30 min idle auto-stop (0 disables) —
+        # volume recipes pay ~10 min per cold start, so don't go lower
+        "idle_stop_s": float(choices.get("idle_stop_s", 1800)),
         "idle_terminate_s": float(choices.get("idle_terminate_s") or 0),
         "alias": choices.get("alias") or recipe["id"],
     }

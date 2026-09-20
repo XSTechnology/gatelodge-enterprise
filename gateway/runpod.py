@@ -32,6 +32,7 @@ import logging
 import re
 import shlex
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -785,12 +786,32 @@ class _PodManager:
         # diagnostics (set by ensure_ready; read by /admin/runpod/test)
         self.last_action: str = ""      # reused|pinned|found|resumed|deployed
         self.last_pod_info: dict[str, Any] = {}
+        # v3 lifecycle: in-flight request count — the idle rule never
+        # fires while a request (incl. a long SSE stream) is live
+        self.inflight: int = 0
+        # monotonic first RUNNING sighting for THIS boot attempt — the
+        # never-healthy reaper clock; reset when the pod isn't running
+        self.first_seen_s: float | None = None
 
     def base_url(self) -> str:
         return f"https://{self.pod_id}-{self.spec['port']}.proxy.runpod.net"
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
+
+    @asynccontextmanager
+    async def request(self):
+        """One live request: touch + inflight guard. Wrap the WHOLE
+        request — ensure_ready through the final proxied byte — so the
+        lifecycle watchdog can't idle-stop the pod mid-flight. Inside
+        an async generator the finally runs on completion OR client
+        disconnect, which is exactly the semantics streams need."""
+        self.touch()
+        self.inflight += 1
+        try:
+            yield self
+        finally:
+            self.inflight -= 1
 
     def is_ready(self) -> bool:
         return self.ready and self.pod_id is not None
@@ -1023,6 +1044,7 @@ def status() -> list[dict[str, Any]]:
             "base_url": m.base_url() if m.is_ready() else None,
             "idle_s": (round(time.monotonic() - m.last_used, 1)
                        if m.is_ready() else None),
+            "inflight": m.inflight,
             "idle_stop_s": m.spec.get("idle_stop_s", 0),
             "idle_terminate_s": m.spec.get("idle_terminate_s", 0),
         })
@@ -1076,12 +1098,15 @@ async def refresh_status(cfg) -> list[dict[str, Any]]:
             if m.pod_id:
                 m.pod_status = "TERMINATED"
                 m.ready = False
+                m.first_seen_s = None
             continue
         if not m.pod_id:
             m.pod_id = str(pod.get("id"))
         st = pod_state(pod)
         m.pod_status = st
         if st in ("RUNNING", "READY", "UNKNOWN"):
+            if m.first_seen_s is None:
+                m.first_seen_s = time.monotonic()
             if not m.ready:
                 try:
                     if await pod_healthy(m.base_url()):
@@ -1090,6 +1115,7 @@ async def refresh_status(cfg) -> list[dict[str, Any]]:
                     pass
         else:
             m.ready = False
+            m.first_seen_s = None
     return status()
 
 

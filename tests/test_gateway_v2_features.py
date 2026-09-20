@@ -13,6 +13,7 @@ Provider layer: registry + RunPod account (volumes with usage markers,
 pod billing) + volume create/delete with an in-use guard.
 """
 import asyncio
+import contextlib
 import json
 import sys
 import time
@@ -134,6 +135,10 @@ def test_sse_keepalive_during_cold_start(wired, monkeypatch):
         async def ensure_ready(self, timeout_s=None):
             await asyncio.sleep(0.25)
             return "https://pod-live1-8080.proxy.runpod.net"
+
+        @contextlib.asynccontextmanager
+        async def request(self):
+            yield self
 
     monkeypatch.setattr(rp, "get_manager", lambda *a, **k: FakeMgr())
     monkeypatch.setattr(rp, "ensure_reaper", lambda: None)

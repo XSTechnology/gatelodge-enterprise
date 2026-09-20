@@ -337,6 +337,14 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         "start_timeout_s": _num("start_timeout_s", 600),
                         "idle_stop_s": _num("idle_stop_s", 0),
                         "idle_terminate_s": _num("idle_terminate_s", 0),
+                        # v3 lifecycle: monthly spend cap (0 = off),
+                        # unexpected-death policy, and the LANDED price
+                        # the deploy wizard persists for live accrual
+                        "monthly_budget_usd": _num("monthly_budget_usd", 0),
+                        "auto_recover": ("redeploy" if str(
+                            m.get("auto_recover") or "").strip() == "redeploy"
+                            else "alert"),
+                        "est_cost_per_hr": _num("est_cost_per_hr", 0),
                         "deploy": m.get("deploy") if isinstance(m.get("deploy"), dict) else {},
                     }
                     if not pod["image"] and not pod["pod_id"]:
@@ -473,6 +481,11 @@ class GatewayConfig:
         except (KeyError, TypeError, ValueError):
             timeout_s = 120.0
         self.queue = {"max_waiting": max_waiting, "timeout_s": timeout_s}
+        # v3 lifecycle: account-wide monthly spend cap (0 = off)
+        try:
+            self.budget_usd_month = float(raw.get("budget_usd_month") or 0)
+        except (TypeError, ValueError):
+            self.budget_usd_month = 0.0
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""

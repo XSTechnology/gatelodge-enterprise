@@ -747,19 +747,20 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         # clients to retry rather than dying on a silent long poll.
         hold = min(float(mgr.spec.get("start_timeout_s") or 600),
                    runpod.WARMUP_MAX_HOLD_S)
-        base = await mgr.ensure_ready(timeout_s=hold)
-        payload = {
-            "model": mgr.spec.get("alias", model_key),
-            "messages": body.messages,
-        }
-        if body.tools:
-            payload["tools"] = body.tools
-        if body.temperature is not None:
-            payload["temperature"] = body.temperature
-        if body.max_tokens:
-            payload["max_tokens"] = body.max_tokens
-        resp = await llamaserver.post_chat(base, payload,
-                                           cfg.queue["timeout_s"])
+        async with mgr.request():  # v3: inflight guard for the watchdog
+            base = await mgr.ensure_ready(timeout_s=hold)
+            payload = {
+                "model": mgr.spec.get("alias", model_key),
+                "messages": body.messages,
+            }
+            if body.tools:
+                payload["tools"] = body.tools
+            if body.temperature is not None:
+                payload["temperature"] = body.temperature
+            if body.max_tokens:
+                payload["max_tokens"] = body.max_tokens
+            resp = await llamaserver.post_chat(base, payload,
+                                               cfg.queue["timeout_s"])
         resp["model"] = requested
         return resp, backend_name, model_key
 
@@ -1108,33 +1109,37 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 # see "warming up" instead of timing out on silence.
                 runpod.ensure_reaper()
                 mgr = runpod.get_manager(cfg, backend_name, model_key)
-                warm = asyncio.ensure_future(mgr.ensure_ready())
-                while True:
-                    try:
-                        base = await asyncio.wait_for(
-                            asyncio.shield(warm), RUNPOD_SSE_KEEPALIVE_S)
-                        break
-                    except asyncio.TimeoutError:
-                        st = mgr.pod_status or "starting"
-                        yield (": runpod pod warming up "
-                               f"({st}) — first request after a cold "
-                               "start; model weights are loading\n\n")
-                payload = {
-                    "model": mgr.spec.get("alias", model_key),
-                    "messages": body.messages,
-                    "stream": True,
-                }
-                if body.tools:
-                    payload["tools"] = body.tools
-                if body.temperature is not None:
-                    payload["temperature"] = body.temperature
-                if body.max_tokens:
-                    payload["max_tokens"] = body.max_tokens
-                async for data in llamaserver.stream_chat(
-                        base, payload, cfg.queue["timeout_s"]):
-                    if data == "[DONE]":
-                        break
-                    yield f"data: {data}\n\n"
+                async with mgr.request():  # v3: inflight guard — the
+                    # generator's finally runs on completion OR client
+                    # disconnect, so the watchdog can't stop the pod
+                    # under a live stream
+                    warm = asyncio.ensure_future(mgr.ensure_ready())
+                    while True:
+                        try:
+                            base = await asyncio.wait_for(
+                                asyncio.shield(warm), RUNPOD_SSE_KEEPALIVE_S)
+                            break
+                        except asyncio.TimeoutError:
+                            st = mgr.pod_status or "starting"
+                            yield (": runpod pod warming up "
+                                   f"({st}) — first request after a cold "
+                                   "start; model weights are loading\n\n")
+                    payload = {
+                        "model": mgr.spec.get("alias", model_key),
+                        "messages": body.messages,
+                        "stream": True,
+                    }
+                    if body.tools:
+                        payload["tools"] = body.tools
+                    if body.temperature is not None:
+                        payload["temperature"] = body.temperature
+                    if body.max_tokens:
+                        payload["max_tokens"] = body.max_tokens
+                    async for data in llamaserver.stream_chat(
+                            base, payload, cfg.queue["timeout_s"]):
+                        if data == "[DONE]":
+                            break
+                        yield f"data: {data}\n\n"
             elif (backend.get("type") == "runpod"
                     and backend["models"][model_key].get("endpoint_id")
                     and backend["models"][model_key].get("transport") == "runsync"):
@@ -1525,15 +1530,16 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         if btype == "runpod" and not backend["models"][model_key].get("endpoint_id"):
             runpod.ensure_reaper()
             mgr = runpod.get_manager(cfg, backend_name, model_key)
-            base = await mgr.ensure_ready()
-            payload = {"model": mgr.spec.get("alias", model_key),
-                       "prompt": prompts[0]}
-            if body.temperature is not None:
-                payload["temperature"] = body.temperature
-            if body.max_tokens:
-                payload["max_tokens"] = body.max_tokens
-            resp = await llamaserver.post_completions(
-                base, payload, cfg.queue["timeout_s"])
+            async with mgr.request():  # v3: inflight guard
+                base = await mgr.ensure_ready()
+                payload = {"model": mgr.spec.get("alias", model_key),
+                           "prompt": prompts[0]}
+                if body.temperature is not None:
+                    payload["temperature"] = body.temperature
+                if body.max_tokens:
+                    payload["max_tokens"] = body.max_tokens
+                resp = await llamaserver.post_completions(
+                    base, payload, cfg.queue["timeout_s"])
             resp["model"] = requested
             ms = int((time.perf_counter() - t0) * 1000)
             _log_request(requested, backend_name, False, ms,
@@ -2914,6 +2920,7 @@ class CatalogDeployPayload(BaseModel):
     volume_type: str = "STANDARD"  # STANDARD | HIGH_PERFORMANCE
     ctx_key: str = ""
     container_disk_gb: int = 0
+    idle_stop_s: float = 1800       # 0 disables auto-stop
     idle_terminate_s: float = 0
     alias: str = ""
 
@@ -2978,6 +2985,7 @@ async def admin_catalog_deploy(payload: CatalogDeployPayload) -> Response:
         "volume_type": payload.volume_type,
         "ctx_key": payload.ctx_key,
         "container_disk_gb": payload.container_disk_gb,
+        "idle_stop_s": payload.idle_stop_s,
         "alias": payload.alias,
     }
     # Existing volume: the pod MUST run in the volume's DC — derive it
@@ -3042,6 +3050,9 @@ async def admin_catalog_deploy(payload: CatalogDeployPayload) -> Response:
             "tried": tried})
     pod_id = pod.get("id")
     spec["pod_id"] = pod_id
+    # v3: persist the LANDED price — live budget accrual reads it
+    if (landed or {}).get("est_cost_per_hr"):
+        spec["est_cost_per_hr"] = float(landed["est_cost_per_hr"])
 
     def mutator(raw: dict):
         models = raw.setdefault("backends", {}).setdefault(
