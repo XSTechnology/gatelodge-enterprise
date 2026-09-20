@@ -402,6 +402,25 @@ def test_pod_deploy_docker_script_single_arg(wired, gguf, monkeypatch):
     assert payload["entrypoint"] == ["sh", "-c"]
 
 
+def test_pod_vanished_during_poll_aborts(wired, gguf, monkeypatch):
+    """Terminate is ASYNC: a terminating pod lingers in the list, gets
+    adopted by find-by-name, then vanishes — the poll must abort instead
+    of hammering the dead proxy URL for the full start timeout."""
+    wired(_rp_config(gguf))
+    rest = _patch_rest(monkeypatch)
+
+    async def vanished_pods(api_key_env):
+        return []  # pod gone from the list mid-poll
+
+    monkeypatch.setattr(rp, "list_pods", vanished_pods)
+    _patch_pod_http(monkeypatch, health=False)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
+    assert "vanished" in r.json()["error"]["message"]
+
+
 def test_pod_reuse_when_running(wired, gguf, monkeypatch):
     wired(_rp_config(gguf))
     rest = _patch_rest(monkeypatch)

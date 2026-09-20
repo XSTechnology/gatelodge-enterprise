@@ -625,6 +625,17 @@ class _PodManager:
             deadline = time.monotonic() + float(self.spec.get("start_timeout_s") or 600)
             while time.monotonic() < deadline:
                 pod_now = await self._find_pod()
+                # Stale-pod guard: terminate is ASYNC — a terminating pod
+                # lingers in the list long enough for find-by-name to
+                # adopt it, then it vanishes and the poll keeps hitting
+                # its dead proxy URL for the full timeout (live-observed
+                # three times). Abort the moment our pod is gone or
+                # replaced; the NEXT request deploys a fresh pod.
+                if pod_now is None or str(pod_now.get("id")) != self.pod_id:
+                    raise RunPodError(
+                        f"runpod pod {self.pod_id} vanished during startup "
+                        "(terminated while health-polling) — retry the "
+                        "request to deploy a fresh pod")
                 self.pod_status = pod_state(pod_now) if pod_now else "UNKNOWN"
                 if self.pod_status in ("EXITED", "FAILED", "TERMINATED", "CRASHED"):
                     raise RunPodError(
