@@ -2613,6 +2613,158 @@ async def admin_runpod_action(payload: RunPodActionPayload) -> Response:
     return {"ok": True, "pod_id": payload.pod_id, "action": payload.action}
 
 
+class RunPodTestPayload(BaseModel):
+    """Full remote-GPU diagnostic: ensure the pod (deploy / resume /
+    reuse), health-probe, one test chat, container logs — a structured
+    per-phase report. A failed test is a SUCCESSFUL diagnostic (HTTP 200
+    with ok:false + phase errors), so scripts can act on the detail."""
+    model_config = ConfigDict(extra="ignore")
+    backend: str = ""
+    model: str = ""
+    prompt: str = "Reply with exactly: OK"
+    max_tokens: int = 16
+    timeout_s: float | None = None   # overrides spec start_timeout_s
+    after: str = "keep"              # keep | stop | terminate
+    deploy: bool = True              # False = probe-only, never deploys/starts
+    logs: bool = True
+    log_tail: int = 100
+
+
+@app.post("/admin/runpod/test")
+async def admin_runpod_test(payload: RunPodTestPayload) -> Response:
+    """Test a runpod POD model end-to-end with diagnostics reported back:
+    pod (find/deploy/resume, timings, pod info) → health (per-probe
+    status/latency + served model ids) → chat (content + usage) →
+    container logs (best-effort, tail) → optional stop/terminate after."""
+    if not payload.backend or not payload.model:
+        return _error(400, "backend and model required")
+    if payload.after not in ("keep", "stop", "terminate"):
+        return _error(400, "after must be keep|stop|terminate")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = cfg.backends.get(payload.backend)
+    if not backend or backend.get("type") != "runpod":
+        return _error(400, f"backend {payload.backend!r} is not a runpod backend")
+    mspec = (backend.get("models") or {}).get(payload.model)
+    if mspec is None:
+        return _error(400, f"unknown model {payload.model!r} on backend "
+                           f"{payload.backend!r}")
+    if mspec.get("endpoint_id"):
+        return _error(400, f"model {payload.model!r} is a serverless endpoint "
+                           "— no pod to test (send a chat request instead)")
+
+    api_key_env = backend.get("api_key_env", "RUNPOD_API_KEY")
+    runpod.ensure_reaper()
+    mgr = runpod.get_manager(cfg, payload.backend, payload.model)
+    t_total = time.monotonic()
+    res: dict[str, Any] = {"backend": payload.backend, "model": payload.model,
+                           "ok": False, "phases": {}, "error": None}
+
+    def _fail(phase: str, err: str) -> None:
+        res["phases"][phase] = {"ok": False, "error": err}
+        res["error"] = f"{phase}: {err}"
+
+    # ── phase: pod (find / deploy / resume / reuse) ──────────────────
+    base: str | None = None
+    t0 = time.monotonic()
+    try:
+        if payload.deploy:
+            base = await mgr.ensure_ready(payload.timeout_s)
+            res["phases"]["pod"] = {
+                "ok": True, "action": mgr.last_action or "ready",
+                "elapsed_s": round(time.monotonic() - t0, 2)}
+        else:
+            pod = await mgr.find_pod()
+            if pod is None:
+                _fail("pod", "not deployed — probe-only mode never deploys")
+            else:
+                mgr.pod_id = str(pod.get("id"))
+                mgr.last_pod_info = runpod.pod_info(pod)
+                mgr.last_action = "probed"
+                state = runpod.pod_state(pod)
+                mgr.pod_status = state
+                res["phases"]["pod"] = {"ok": True, "action": "probed",
+                                        "state": state,
+                                        "elapsed_s": round(time.monotonic() - t0, 2)}
+                if state in ("RUNNING", "READY", "UNKNOWN"):
+                    base = mgr.base_url()
+                else:
+                    _fail("pod", f"pod is {state} — probe-only mode never "
+                                 "starts it")
+    except runpod.RunPodError as e:
+        _fail("pod", str(e))
+    if mgr.pod_id:
+        pod_phase = res["phases"].setdefault(
+            "pod", {"ok": False, "error": "unknown"})
+        pod_phase["pod_id"] = mgr.pod_id
+        if mgr.last_pod_info:
+            pod_phase["pod"] = mgr.last_pod_info
+
+    # ensure_ready failed or probe-only found a stopped pod — if a pod id
+    # is known, STILL probe it: the pod may have come up just after the
+    # timeout, and the report should say so rather than give up.
+    if base is None and mgr.pod_id:
+        base = mgr.base_url()
+
+    # ── phase: health probe ─────────────────────────────────────────
+    if base:
+        t0 = time.monotonic()
+        try:
+            det = await runpod.pod_health_details(base)
+            res["phases"]["health"] = {
+                "ok": bool(det.get("healthy")),
+                "base_url": base,
+                "elapsed_s": round(time.monotonic() - t0, 2), **det}
+        except Exception as e:  # noqa: BLE001 — diagnostics must not 500
+            _fail("health", repr(e))
+    else:
+        res["phases"]["health"] = {"ok": False, "skipped": "no base url"}
+
+    # ── phase: test chat ────────────────────────────────────────────
+    if base and res["phases"].get("health", {}).get("ok"):
+        t0 = time.monotonic()
+        try:
+            chat = await llamaserver.post_chat(base, {
+                "model": mgr.spec.get("alias") or payload.model,
+                "messages": [{"role": "user", "content": payload.prompt}],
+                "max_tokens": payload.max_tokens, "temperature": 0,
+            }, float(payload.timeout_s or cfg.queue["timeout_s"]))
+            msg = ((chat.get("choices") or [{}])[0].get("message") or {})
+            res["phases"]["chat"] = {
+                "ok": True, "elapsed_s": round(time.monotonic() - t0, 2),
+                "content": (msg.get("content") or "")[:200],
+                "usage": chat.get("usage") or {}}
+        except Exception as e:  # noqa: BLE001 — diagnostics must not 500
+            _fail("chat", str(e))
+    else:
+        res["phases"]["chat"] = {"ok": False, "skipped":
+                                 "pod not healthy" if base else "no base url"}
+
+    res["ok"] = bool(res["phases"].get("chat", {}).get("ok"))
+
+    # ── phase: container logs (best-effort, always attempted) ───────
+    if payload.logs and mgr.pod_id:
+        try:
+            res["logs"] = await runpod.fetch_pod_logs(
+                mgr.pod_id, api_key_env, payload.log_tail)
+        except Exception as e:  # noqa: BLE001 — logs are a bonus
+            res["logs"] = []
+            res["logs_error"] = str(e)
+    else:
+        res["logs"] = []
+
+    # ── after-action (keep | stop | terminate) ──────────────────────
+    if payload.after in ("stop", "terminate") and mgr.pod_id:
+        await mgr.stop(terminate=payload.after == "terminate")
+        res["after"] = payload.after
+
+    res["elapsed_s"] = round(time.monotonic() - t_total, 2)
+    logger.info("runpod test [%s/%s]: ok=%s %.1fs (action=%s)",
+                payload.backend, payload.model, res["ok"],
+                res["elapsed_s"], mgr.last_action)
+    return res
+
+
 class RunPodDeployPayload(BaseModel):
     """Payload for deploying a new runpod pod."""
     model_config = ConfigDict(extra="ignore")

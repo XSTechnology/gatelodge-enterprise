@@ -184,6 +184,97 @@ async def pod_healthy(base_url: str) -> bool:
     return False
 
 
+async def pod_health_details(base_url: str) -> dict[str, Any]:
+    """Diagnostic variant of pod_healthy: per-probe status + latency,
+    plus the model ids the pod is serving. 'healthy' semantics are
+    identical to pod_healthy (either probe 200)."""
+    out: dict[str, Any] = {"healthy": False, "health": None, "models": None}
+    async with httpx.AsyncClient(timeout=10.0) as ac:
+        t0 = time.monotonic()
+        try:
+            r = await ac.get(f"{base_url}/health")
+            out["health"] = {"status": r.status_code,
+                             "ms": round((time.monotonic() - t0) * 1000)}
+        except httpx.HTTPError as e:
+            out["health"] = {"error": type(e).__name__}
+        t0 = time.monotonic()
+        try:
+            r = await ac.get(f"{base_url}/v1/models")
+            entry: dict[str, Any] = {
+                "status": r.status_code,
+                "ms": round((time.monotonic() - t0) * 1000)}
+            if r.status_code == 200:
+                ids: list[str] = []
+                try:
+                    for m in (r.json().get("data") or [])[:8]:
+                        ids.append(str(m.get("id")))
+                except Exception:  # noqa: BLE001 — body shape varies by image
+                    pass
+                entry["ids"] = ids
+            out["models"] = entry
+        except httpx.HTTPError as e:
+            out["models"] = {"error": type(e).__name__}
+    out["healthy"] = bool((out["health"] or {}).get("status") == 200
+                          or (out["models"] or {}).get("status") == 200)
+    return out
+
+
+async def fetch_pod_logs(pod_id: str, api_key_env: str,
+                         tail: int = 100) -> list[dict[str, Any]]:
+    """GET /v2/pods/{id}/logs?tail=N — SSE (id:/data: lines; data is
+    JSON with ts/source/line). The stream stays open for NEW lines, so
+    the read is bounded: at most ``tail`` events or ~8s, whichever comes
+    first. Raises RunPodError on HTTP >= 400; transport errors raise only
+    when nothing was collected (partial logs still count)."""
+    headers = {"Authorization": f"Bearer {_api_key(api_key_env)}"}
+    url = f"{REST_BASE}/pods/{pod_id}/logs?tail={int(tail)}"
+    events: list[dict[str, Any]] = []
+    deadline = time.monotonic() + 8.0
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as ac:
+            async with ac.stream("GET", url, headers=headers) as r:
+                if r.status_code >= 400:
+                    body = (await r.aread()).decode("utf-8", "replace")
+                    raise RunPodError(f"runpod pod logs {r.status_code}: "
+                                      f"{body[:300]}")
+                async for line in r.aiter_lines():
+                    if len(events) >= tail or time.monotonic() > deadline:
+                        break
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        ev = json.loads(line[6:])
+                        events.append({"ts": ev.get("ts"),
+                                       "source": ev.get("source"),
+                                       "line": str(ev.get("line"))[:400]})
+                    except (ValueError, TypeError):
+                        continue
+    except httpx.HTTPError as e:
+        if not events:
+            raise RunPodError(f"runpod pod logs fetch failed: {e}") from e
+    return events
+
+
+# Whitelisted pod-object fields for diagnostics — the v2 schema varies,
+# only what exists is reported.
+_POD_INFO_KEYS = ("id", "name", "status", "desiredStatus", "imageName",
+                  "image", "gpuTypeId", "costPerHour", "containerDiskInGb",
+                  "volumeInGb", "cloudType", "uptimeSeconds", "licenseFee")
+
+
+def pod_info(pod: dict[str, Any] | None) -> dict[str, Any]:
+    """Trimmed pod object for diagnostics (schema-tolerant)."""
+    if not isinstance(pod, dict):
+        return {}
+    out = {k: pod[k] for k in _POD_INFO_KEYS if k in pod}
+    gpu = pod.get("gpu")
+    if isinstance(gpu, dict):
+        out["gpu"] = gpu.get("id") or gpu.get("type") or gpu
+    elif isinstance(gpu, str):
+        out["gpu"] = gpu
+    return out
+
+
 # ── Deploy payload builder ─────────────────────────────────────────────────
 
 def _pod_name(backend_name: str, model_key: str) -> str:
@@ -546,6 +637,9 @@ class _PodManager:
         self.ready = False
         self.last_used = time.monotonic()
         self.deployed_s: float | None = None
+        # diagnostics (set by ensure_ready; read by /admin/runpod/test)
+        self.last_action: str = ""      # reused|pinned|found|resumed|deployed
+        self.last_pod_info: dict[str, Any] = {}
 
     def base_url(self) -> str:
         return f"https://{self.pod_id}-{self.spec['port']}.proxy.runpod.net"
@@ -563,19 +657,28 @@ class _PodManager:
                 return p
         return None
 
-    async def ensure_ready(self) -> str:
+    async def find_pod(self) -> dict[str, Any] | None:
+        """Public find-by-name/pod-id — probe-only diagnostics use this
+        WITHOUT the deploy/resume side effects of ensure_ready."""
+        return await self._find_pod()
+
+    async def ensure_ready(self, timeout_s: float | None = None) -> str:
         """Pinned pod (config pod_id) → use it directly; else find-by-name
         → resume stopped → deploy new. Then health-poll the proxy URL.
-        Returns the proxy base URL."""
+        Returns the proxy base URL. timeout_s overrides the spec's
+        start_timeout_s for ONE call (diagnostics want tight bounds)."""
         self.touch()
         async with self.lock:
             if self.is_ready():
+                self.last_action = "reused"
                 return self.base_url()
             pinned = str(self.spec.get("pod_id") or "").strip()
             if pinned:
                 # BYO pod — never deployed or renamed by the gateway
                 self.pod_id = pinned
                 pod = await self._find_pod()
+                self.last_pod_info = pod_info(pod)
+                self.last_action = "pinned"
                 if pod is None:
                     raise RunPodError(
                         f"runpod pod {pinned!r} (pod_id in config) not found")
@@ -583,8 +686,10 @@ class _PodManager:
                     logger.info("runpod pod %s (pinned) is %s — starting",
                                 pinned, pod_state(pod))
                     await start_pod(pinned, self.api_key_env)
+                    self.last_action = "pinned-resumed"
             else:
                 pod = await self._find_pod()
+                self.last_pod_info = pod_info(pod)
                 if pod is None:
                     # Deploy — walking gpu_type_ids on capacity errors:
                     # RunPod 400s ("no longer available with the requested
@@ -615,14 +720,22 @@ class _PodManager:
                         raise last_err or RunPodError(
                             f"runpod deploy failed for {self.model_key!r}")
                     self.deployed_s = time.monotonic()
+                    self.last_pod_info = pod_info(pod)
+                    self.last_action = "deployed"
+                else:
+                    self.last_action = "found"
                 self.pod_id = str(pod.get("id"))
                 if pod_state(pod) not in ("RUNNING", "READY", "UNKNOWN"):
                     logger.info("runpod pod %s is %s — starting",
                                 self.pod_id, pod_state(pod))
                     await start_pod(self.pod_id, self.api_key_env)
+                    self.last_action = "resumed"
             # health-poll the proxy URL (llama.cpp /health, Ollama
             # /v1/models); pods take 30s–minutes (image pull + download)
-            deadline = time.monotonic() + float(self.spec.get("start_timeout_s") or 600)
+            start_to = float(
+                timeout_s if timeout_s is not None
+                else (self.spec.get("start_timeout_s") or 600))
+            deadline = time.monotonic() + start_to
             while time.monotonic() < deadline:
                 pod_now = await self._find_pod()
                 # Stale-pod guard: terminate is ASYNC — a terminating pod
@@ -650,7 +763,7 @@ class _PodManager:
                 await asyncio.sleep(5.0)
             raise RunPodError(
                 f"runpod pod [{self.backend_name}/{self.model_key}] not "
-                f"healthy after {self.spec.get('start_timeout_s'):.0f}s "
+                f"healthy after {start_to:.1f}s "
                 f"(pod {self.pod_id})")
 
     async def stop(self, terminate: bool) -> None:
