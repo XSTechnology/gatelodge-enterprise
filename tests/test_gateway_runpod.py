@@ -352,6 +352,34 @@ def test_pod_deploy_full_command_knobs(wired, gguf, monkeypatch):
     assert payload["entrypoint"] == ["/bin/sh", "-c"]
 
 
+def test_pod_deploy_gpu_type_fallback(wired, gguf, monkeypatch):
+    """RunPod 400s when a gpu type has no free hosts ("no longer
+    available with the requested specifications") — the deploy walks
+    gpu_type_ids (live-observed: RTX A4000 dry in EUR-IS-1, 3090 next)."""
+    wired(_rp_config(gguf, gpu_type_ids=["NVIDIA RTX A4000",
+                                          "NVIDIA GeForce RTX 3090"],
+                     spot=False))
+    rest = _patch_rest(monkeypatch)
+    deploys: list[dict] = []
+    real_deploy = rp.deploy_pod
+
+    async def flaky_deploy(payload, api_key_env):
+        deploys.append(payload)
+        if payload["gpu"]["id"] == "NVIDIA RTX A4000":
+            raise rp.RunPodError("runpod POST /pods -> 400: no hosts")
+        return await real_deploy(payload, api_key_env)
+
+    monkeypatch.setattr(rp, "deploy_pod", flaky_deploy)
+    _patch_pod_http(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "big", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert len(deploys) == 2
+    assert deploys[0]["gpu"]["id"] == "NVIDIA RTX A4000"
+    assert deploys[1]["gpu"]["id"] == "NVIDIA GeForce RTX 3090"
+
+
 def test_pod_reuse_when_running(wired, gguf, monkeypatch):
     wired(_rp_config(gguf))
     rest = _patch_rest(monkeypatch)

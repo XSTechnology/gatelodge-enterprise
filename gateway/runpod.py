@@ -192,8 +192,14 @@ def _pod_name(backend_name: str, model_key: str) -> str:
     return tag[:60]
 
 
-def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> dict[str, Any]:
+def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any],
+                   gpu_id: str | None = None) -> dict[str, Any]:
     """Config pod spec → POST /v2/pods payload (snake_case, nested gpu).
+
+    gpu_id overrides the FIRST gpu_type_ids entry — the deploy retry
+    loop in _PodManager.ensure_ready walks the list when a type has no
+    free hosts (RunPod 400 "no longer available with the requested
+    specifications" — observed live with RTX A4000 in EUR-IS-1).
 
     v2 schema changes from v1:
     - imageName → image
@@ -222,7 +228,12 @@ def deploy_payload(backend_name: str, model_key: str, spec: dict[str, Any]) -> d
     }
     # GPU spec: nested object {id, count}
     gpu_type_ids = spec.get("gpu_type_ids")
-    if gpu_type_ids:
+    if gpu_id:
+        payload["gpu"] = {
+            "id": gpu_id,
+            "count": spec.get("gpu_count") or 1,
+        }
+    elif gpu_type_ids:
         # v2 takes a single GPU id; use first from list (scheduler picks)
         gpu_id = gpu_type_ids[0] if isinstance(gpu_type_ids, list) else gpu_type_ids
         payload["gpu"] = {
@@ -568,11 +579,34 @@ class _PodManager:
             else:
                 pod = await self._find_pod()
                 if pod is None:
-                    payload = deploy_payload(self.backend_name, self.model_key,
-                                             self.spec)
-                    logger.info("runpod deploy [%s/%s]: %s", self.backend_name,
-                                self.model_key, payload)
-                    pod = await deploy_pod(payload, self.api_key_env)
+                    # Deploy — walking gpu_type_ids on capacity errors:
+                    # RunPod 400s ("no longer available with the requested
+                    # specifications") when a type has no free hosts, and
+                    # the list exists precisely to give the scheduler
+                    # alternatives (observed live: A4000 dry in EUR-IS-1,
+                    # RTX 3090 next in line).
+                    last_err: Exception | None = None
+                    types = self.spec.get("gpu_type_ids")
+                    gpu_ids = ([t for t in types if isinstance(t, str)]
+                               if isinstance(types, list) else [None])
+                    for gid in gpu_ids:
+                        payload = deploy_payload(
+                            self.backend_name, self.model_key, self.spec,
+                            gpu_id=gid)
+                        logger.info("runpod deploy [%s/%s] (gpu %s): %s",
+                                    self.backend_name, self.model_key,
+                                    gid or "any", payload)
+                        try:
+                            pod = await deploy_pod(payload, self.api_key_env)
+                            break
+                        except RunPodError as e:
+                            last_err = e
+                            logger.warning("runpod deploy with gpu %s "
+                                           "failed: %s", gid or "any", e)
+                            continue
+                    if pod is None:
+                        raise last_err or RunPodError(
+                            f"runpod deploy failed for {self.model_key!r}")
                     self.deployed_s = time.monotonic()
                 self.pod_id = str(pod.get("id"))
                 if pod_state(pod) not in ("RUNNING", "READY", "UNKNOWN"):
