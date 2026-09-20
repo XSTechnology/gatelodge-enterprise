@@ -107,6 +107,7 @@ except ImportError:
 from . import cloud
 from . import catalog
 from . import llamaserver
+from . import providers
 from . import runpod
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
@@ -740,7 +741,13 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         # native OpenAI wire format through the pod's runpod.net URL.
         runpod.ensure_reaper()
         mgr = runpod.get_manager(cfg, backend_name, model_key)
-        base = await mgr.ensure_ready()
+        # Cold start: hold the request while the pod boots, but cap the
+        # non-streaming hold well under the spec's full start_timeout_s
+        # (glm recipes: 3600s) — past the cap, a structured 503 tells
+        # clients to retry rather than dying on a silent long poll.
+        hold = min(float(mgr.spec.get("start_timeout_s") or 600),
+                   runpod.WARMUP_MAX_HOLD_S)
+        base = await mgr.ensure_ready(timeout_s=hold)
         payload = {
             "model": mgr.spec.get("alias", model_key),
             "messages": body.messages,
@@ -958,6 +965,14 @@ async def chat_completions(body: ChatRequest) -> Response:
         try:
             resp, winner, model_key = await _exec_chain(
                 cfg, entries, plan["hedge_s"], body, requested)
+        except runpod.RunPodWarmingUp as e:
+            # Cold start still booting past the non-streaming hold cap —
+            # retryable state, not a failure of the model.
+            ms = int((time.perf_counter() - t0) * 1000)
+            logger.info("gateway chat warming up (%s): %s", requested, e)
+            _log_request(requested, "", body.stream, ms, {}, 503)
+            return _error(503, str(e), err_type="overloaded_error",
+                          code="warming_up", headers={"Retry-After": "30"})
         except Exception as e:
             ms = int((time.perf_counter() - t0) * 1000)
             logger.warning("gateway chat failed (%s): %s", requested, e)
@@ -975,6 +990,12 @@ async def chat_completions(body: ChatRequest) -> Response:
 
 
 # ── POST /v1/chat/completions (stream) ─────────────────────────────────────
+
+# SSE comment cadence while a cold runpod pod boots (keep-alive so
+# clients don't idle-timeout on a silent stream). Constant so tests
+# can tighten it.
+RUNPOD_SSE_KEEPALIVE_S = 15.0
+
 
 def _stream_chat(requested: str, entry: tuple[str, str],
                  body: ChatRequest, slot: int) -> StreamingResponse:
@@ -1081,9 +1102,23 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     and not backend["models"][model_key].get("endpoint_id")):
                 # Managed GPU POD — same native SSE passthrough as the
                 # llama-server subprocess, through the pod's proxy URL.
+                # Cold start: hold the stream open for the FULL boot
+                # window (glm recipes take 6+ min) while emitting SSE
+                # comment keep-alives — clients stay connected and can
+                # see "warming up" instead of timing out on silence.
                 runpod.ensure_reaper()
                 mgr = runpod.get_manager(cfg, backend_name, model_key)
-                base = await mgr.ensure_ready()
+                warm = asyncio.ensure_future(mgr.ensure_ready())
+                while True:
+                    try:
+                        base = await asyncio.wait_for(
+                            asyncio.shield(warm), RUNPOD_SSE_KEEPALIVE_S)
+                        break
+                    except asyncio.TimeoutError:
+                        st = mgr.pod_status or "starting"
+                        yield (": runpod pod warming up "
+                               f"({st}) — first request after a cold "
+                               "start; model weights are loading\n\n")
                 payload = {
                     "model": mgr.spec.get("alias", model_key),
                     "messages": body.messages,
@@ -2978,11 +3013,33 @@ async def admin_catalog_deploy(payload: CatalogDeployPayload) -> Response:
 
     spec = catalog.build_spec(recipe, choices)
     model_key = spec.get("alias") or recipe["id"]
-    deploy_payload = runpod.deploy_payload(backend, model_key, spec)
-    try:
-        pod = await runpod.deploy_pod(deploy_payload, api_key_env)
-    except runpod.RunPodError as e:
-        return _error(502, str(e), code="runpod_error")
+    # Capacity fallback: try the user's GPU combo, then the recipe's
+    # other recommended combos (same DC — volumes are DC-pinned). All
+    # failures are collected so the console can show what was tried.
+    candidates = catalog.candidate_combos(recipe, choices, opts["gpus"])
+    if not candidates:
+        return _error(400, "no deployable GPU combination for this recipe "
+                          "and cloud", code="no_candidates")
+    tried: list[dict[str, Any]] = []
+    pod: dict[str, Any] | None = None
+    landed: dict[str, Any] | None = None
+    for cand in candidates:
+        spec["gpu_type_ids"] = [cand["gpu_id"]]
+        spec["gpu_count"] = cand["gpu_count"]
+        deploy_payload = runpod.deploy_payload(backend, model_key, spec)
+        try:
+            pod = await runpod.deploy_pod(deploy_payload, api_key_env)
+            landed = cand
+            break
+        except runpod.RunPodError as e:
+            tried.append({**cand, "error": str(e)[:250]})
+    if pod is None:
+        return JSONResponse(status_code=502, content={
+            "error": {"message": "deploy failed for every GPU combination "
+                                 f"({len(tried)} tried) — capacity or API "
+                                 "error; see 'tried'",
+                      "code": "runpod_deploy_failed"},
+            "tried": tried})
     pod_id = pod.get("id")
     spec["pod_id"] = pod_id
 
@@ -2992,12 +3049,99 @@ async def admin_catalog_deploy(payload: CatalogDeployPayload) -> Response:
         models[model_key] = spec
 
     _mutate_config(mutator)
-    est = catalog.est_cost_per_hr(opts["gpus"], spec["gpu_type_ids"][0],
-                                  spec["gpu_count"],
-                                  payload.cloud or "secure")
     return {"ok": True, "pod_id": pod_id, "backend": backend,
             "model": model_key, "name": pod.get("name"),
-            "est_cost_per_hr": est}
+            "est_cost_per_hr": (landed or {}).get("est_cost_per_hr"),
+            "landed": landed, "tried": tried}
+
+
+# ── Provider registry + RunPod account panel ───────────────────────────────
+
+@app.get("/admin/providers")
+async def admin_providers() -> Response:
+    """Registered cloud providers — the console builds one panel per
+    entry (RunPod today; the registry is how other vendors onboard)."""
+    return {"providers": providers.list_providers()}
+
+
+@app.get("/admin/providers/runpod/account")
+async def admin_provider_runpod_account() -> Response:
+    """RunPod panel data: account volumes + recent pod billing."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend, api_key_env = _runpod_api_key_env(cfg)
+    if not backend:
+        return _error(400, "no runpod backend configured")
+    try:
+        vol = await runpod.list_volumes(api_key_env)
+        billing = await runpod.list_pod_billing(api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    # which volumes are referenced by configured models (delete guard
+    # + console "in use" markers)
+    used: dict[str, list[str]] = {}
+    for bname, b in cfg.backends.items():
+        if b.get("type") != "runpod":
+            continue
+        for mname, m in (b.get("models") or {}).items():
+            vid = (m or {}).get("volume_id") if isinstance(m, dict) else ""
+            if vid:
+                used.setdefault(str(vid), []).append(f"{bname}:{mname}")
+    return {"backend": backend, "volumes": vol, "billing": billing,
+            "volume_usage": used}
+
+
+class VolumeManagePayload(BaseModel):
+    """Create or delete a network volume (RunPod panel)."""
+    model_config = ConfigDict(extra="ignore")
+    backend: str = ""
+    action: str = ""        # create | delete
+    name: str = ""
+    data_center_id: str = ""
+    size_gb: int = 0
+    volume_type: str = "STANDARD"
+    volume_id: str = ""
+
+
+@app.post("/admin/runpod/volumes")
+async def admin_runpod_volumes(payload: VolumeManagePayload) -> Response:
+    """Volume manager: create (name/DC/size/type) or delete (id —
+    refused while a configured model still references it)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if backend not in rp_backends:
+        return _error(400, f"backend {backend!r} is not a runpod backend")
+    api_key_env = rp_backends[backend].get("api_key_env", "RUNPOD_API_KEY")
+    if payload.action == "create":
+        if not (payload.name and payload.data_center_id and payload.size_gb > 0):
+            return _error(400, "name, data_center_id and size_gb required")
+        try:
+            vol = await runpod.create_volume(
+                payload.name, payload.data_center_id, payload.size_gb,
+                payload.volume_type, api_key_env)
+        except runpod.RunPodError as e:
+            return _error(502, str(e), code="runpod_error")
+        return {"ok": True, "volume": vol}
+    if payload.action == "delete":
+        if not payload.volume_id:
+            return _error(400, "volume_id required")
+        for bname, b in cfg.backends.items():
+            if b.get("type") != "runpod":
+                continue
+            for mname, m in (b.get("models") or {}).items():
+                if isinstance(m, dict) and m.get("volume_id") == payload.volume_id:
+                    return _error(409, f"volume is configured on model "
+                                       f"{bname}:{mname} — remove that "
+                                       "model first", code="volume_in_use")
+        try:
+            out = await runpod.delete_volume(payload.volume_id, api_key_env)
+        except runpod.RunPodError as e:
+            return _error(502, str(e), code="runpod_error")
+        return {"ok": True, "result": out}
+    return _error(400, "action must be 'create' or 'delete'")
 
 
 class RunPodServerlessPayload(BaseModel):

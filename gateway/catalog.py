@@ -206,6 +206,34 @@ CATALOG: list[dict[str, Any]] = [
         "script": "glm5next_volume",
         "start_timeout_s": 3600,
     },
+    {
+        "id": "glm53-flash-mi300x",
+        "model": "GLM-5.3-Flash",
+        "quant": "UD-IQ4_XS",
+        "quant_glob": "IQ4_XS",
+        "tagline": ("Experimental — GLM-5.3-Flash on ONE AMD MI300X "
+                    "(192GB, ROCm build); 32k ctx fits, 64k does not"),
+        "build": "glm5next",
+        "image": "rocm/pytorch:latest",
+        "repo": "unsloth/GLM-5.3-Flash-GGUF",
+        "allow_patterns": ["*UD-IQ4_XS*"],
+        "size_gb": 157,
+        "vram_min_gb": 185,
+        "gpu_options": [
+            {"gpu": "AMD Instinct MI300X OAM", "count": 1},
+        ],
+        "volume": {"size_gb_min": 200},
+        "disk_gb_min": 200,
+        "ctx_options": [
+            {"key": "32k", "parallel": 2, "ctx_total": 65536,
+             "label": "2 slots × 32k (fits 192GB)", "kv_est_gb": 23},
+        ],
+        "ctx_default": "32k",
+        "thinking": True,
+        "script": "glm5next_volume_rocm",
+        "start_timeout_s": 3600,
+        "experimental": True,
+    },
 ]
 
 # ── Boot script templates ──────────────────────────────────────────────────
@@ -234,18 +262,26 @@ def _mainline_script(recipe: dict[str, Any], ctx: dict[str, Any]) -> str:
     )
 
 
-def _glm5next_volume_script(recipe: dict[str, Any], ctx: dict[str, Any]) -> str:
+def _glm5next_volume_script(recipe: dict[str, Any], ctx: dict[str, Any],
+                            rocm: bool = False) -> str:
     """Big models on the glm5next arch: (1) build unsloth's llama.cpp
     fork if the volume doesn't have it cached, (2) download weights to
     the volume if missing, (3) copy weights to container disk (NFS
     mmap is ~34 MB/s and wedges the container in D-state), (4) serve
     with explicit --parallel/--ctx-size (build's ctx semantics are
-    per-slot when --parallel is default — always pass both)."""
+    per-slot when --parallel is default — always pass both).
+    rocm=True builds with GGML_HIP (AMD MI300X = gfx942) instead of
+    CUDA — used by the MI300X recipe (experimental: ROCm build
+    unverified live)."""
     repo = recipe["repo"]
     pats = ", ".join(f"'{p}'" for p in recipe["allow_patterns"])
     glob = recipe["quant_glob"]
+    cmake_defines = ("-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx942" if rocm
+                     else "-DGGML_CUDA=ON")
+    path_export = ("" if rocm
+                   else "export PATH=/usr/local/cuda/bin:$PATH; ")
     return (
-        "set -e; export PATH=/usr/local/cuda/bin:$PATH; "
+        "set -e; " + path_export +
         "echo '[boot] start'; "
         # 1) llama.cpp glm5next build — cached on the volume
         "if [ ! -x /workspace/llama.cpp/build/bin/llama-server ]; then "
@@ -257,7 +293,7 @@ def _glm5next_volume_script(recipe: dict[str, Any], ctx: dict[str, Any]) -> str:
         "https://github.com/unslothai/llama.cpp /workspace/llama.cpp; "
         "echo '[build] cmake configure'; "
         "cmake -S /workspace/llama.cpp -B /workspace/llama.cpp/build "
-        "-DGGML_CUDA=ON > /workspace/cmake.log 2>&1; "
+        f"{cmake_defines} > /workspace/cmake.log 2>&1; "
         "echo '[build] compiling (once — cached on the volume)'; "
         "cmake --build /workspace/llama.cpp/build --config Release -j "
         "> /workspace/build.log 2>&1; "
@@ -296,6 +332,8 @@ def render_script(recipe: dict[str, Any], ctx: dict[str, Any]) -> str:
         return _mainline_script(recipe, ctx)
     if kind == "glm5next_volume":
         return _glm5next_volume_script(recipe, ctx)
+    if kind == "glm5next_volume_rocm":
+        return _glm5next_volume_script(recipe, ctx, rocm=True)
     raise ValueError(f"unknown script template {kind!r}")
 
 
@@ -374,6 +412,50 @@ def est_cost_per_hr(gpus: list[dict[str, Any]], gpu_id: str,
     if not isinstance(price, (int, float)) or price <= 0:
         return None
     return round(price * int(count), 2)
+
+
+def candidate_combos(recipe: dict[str, Any], choices: dict[str, Any],
+                     gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ordered deploy candidates for capacity fallback: the user's
+    choice first, then the recipe's other recommended gpu_options —
+    each still checked against the live catalog (VRAM fit, maxCount,
+    cloud availability). Same data center throughout: network volumes
+    are DC-pinned, so the wizard only falls back across GPU combos,
+    never across DCs. Live motivation: 3× A100-SXM4 EUR-IS-1 sat dry
+    for 80+ minutes while 2× H200 in the same DC was bookable."""
+    cloud = choices.get("cloud") or "secure"
+    seen: set[tuple[str, int]] = set()
+    out: list[dict[str, Any]] = []
+
+    def add(gpu_id: Any, count: Any) -> None:
+        try:
+            n = int(count or 0)
+        except (TypeError, ValueError):
+            return
+        if not gpu_id or n < 1:
+            return
+        g = _gpu_entry(gpus, str(gpu_id))
+        if g is None:
+            return
+        maxc = (g.get("maxCount") or {}).get(cloud)
+        price = (g.get("price") or {}).get(cloud)
+        if not isinstance(maxc, (int, float)) or maxc < n:
+            return
+        if not isinstance(price, (int, float)) or price <= 0:
+            return
+        if float(g.get("memory") or 0) * n < recipe["vram_min_gb"]:
+            return
+        key = (str(gpu_id), n)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"gpu_id": str(gpu_id), "gpu_count": n,
+                    "est_cost_per_hr": round(price * n, 2)})
+
+    add(choices.get("gpu_id"), choices.get("gpu_count"))
+    for opt in recipe.get("gpu_options") or []:
+        add(opt.get("gpu"), opt.get("count"))
+    return out
 
 
 def validate_selection(recipe: dict[str, Any], choices: dict[str, Any],

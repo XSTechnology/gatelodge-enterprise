@@ -115,9 +115,10 @@ def test_recipes_well_formed():
             assert r.get(key), f"{r.get('id')}: missing {key}"
         assert r["vram_min_gb"] >= r["size_gb"]
         assert r["disk_gb_min"] >= r["size_gb"]
-        assert r["script"] in ("mainline", "glm5next_volume")
+        assert r["script"] in ("mainline", "glm5next_volume",
+                               "glm5next_volume_rocm")
         if r["build"] == "glm5next":
-            assert r["script"] == "glm5next_volume"
+            assert r["script"] in ("glm5next_volume", "glm5next_volume_rocm")
         keys = [o["key"] for o in r["ctx_options"]]
         assert len(keys) == len(set(keys)), "duplicate ctx keys"
         assert r["ctx_default"] in keys

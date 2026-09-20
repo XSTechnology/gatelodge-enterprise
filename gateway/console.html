@@ -143,6 +143,8 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
     <span class="cat-icon">🧠</span><span>Models</span></button>
   <button class="cat-btn" onclick="showPanel('services')" title="Backend service definitions: connection params, models, live children & pods">
     <span class="cat-icon">🔌</span><span>Services</span></button>
+  <button class="cat-btn" onclick="showPanel('cloud')" title="GPU cloud providers: deploy wizard, volumes, spend, live pods (RunPod)">
+    <span class="cat-icon">☁</span><span>Cloud</span></button>
   <button class="cat-btn" onclick="showPanel('perf')" title="GPU memory, per-model latency/token stats, recent requests">
     <span class="cat-icon">📊</span><span>Performance</span></button>
   <button class="cat-btn dashed" onclick="showPanel('syslog')" title="Live gateway log events">
@@ -170,7 +172,7 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
 <script>
 'use strict';
 var KEY = localStorage.getItem('gw_key') || '';
-var _syslogTimer = null, _perfTimer = null;
+var _syslogTimer = null, _perfTimer = null, _clBootTimer = null;
 
 // ---------- api ----------
 function api(path, opts) {
@@ -232,7 +234,7 @@ function showPanel(name) {
   stopTimers();
   var t = document.getElementById('modal-title'), b = document.getElementById('modal-body');
   b.innerHTML = '<div class="loading">Loading…</div>';
-  ({models: showModels, services: showServices, perf: showPerf,
+  ({models: showModels, services: showServices, cloud: showCloud, perf: showPerf,
     syslog: showSyslog, params: showParams, keys: showKeys,
     health: showHealth, aliases: showAliases}[name] || function(){})(
       {title: t, body: b});
@@ -243,6 +245,7 @@ function closeModal() {
 function stopTimers() {
   if (_syslogTimer) { clearInterval(_syslogTimer); _syslogTimer = null; }
   if (_perfTimer) { clearInterval(_perfTimer); _perfTimer = null; }
+  if (_clBootTimer) { clearInterval(_clBootTimer); _clBootTimer = null; }
 }
 
 // ---------- Models ----------
@@ -602,13 +605,9 @@ function showServices(ui) {
     (defs.backends || []).forEach(function (b) { _svcBackends[b.name] = b; });
     var html = buildBackendForm(defs) +
       buildBackendTable(defs) +
-      buildLiveChildren(children) +
-      buildDeployWizard() +
-      buildRunpodServers();
+      buildLiveChildren(children);
     ui.body.innerHTML = html;
     setTimeout(function () { onSvcBackendChange(); }, 50);
-    dwInit();
-    refreshRunpodPods();
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
 
@@ -767,7 +766,14 @@ function _fmtDur(s) {
   if (s < 5400) return Math.round(s / 60) + 'm';
   return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
 }
-function _rpStatusBadge(p) {
+function _rpStatusBadge(p, m) {
+  var warm = (p.status || '') === 'warming-up' ||
+    (m && (m.state === 'warming-up' || m.warming));
+  if (warm) {
+    var whtml = '<span class="badge warn">warming up</span>';
+    if (m && m.warm_s != null) whtml += ' <span class="muted">' + Math.round(m.warm_s) + 's</span>';
+    return whtml;
+  }
   var st = p.status || 'UNKNOWN';
   var cls = st === 'RUNNING' ? 'ok' : (st === 'STOPPED' || st === 'EXITED') ? 'dim' : 'warn';
   var html = '<span class="badge ' + cls + '">' + esc(st) + '</span>';
@@ -801,7 +807,7 @@ function renderRunpodPods(inv, mgrs, specs) {
     if (wantStart) btns += '<button class="btn btn-sm" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'start\')">start</button> ';
     if (m) btns += '<button class="btn btn-sm" onclick="testRunpodModel(\'' + esc(m.backend) + '\',\'' + esc(m.model) + '\')">⚗ test</button> ';
     btns += '<button class="btn btn-sm btn-danger" onclick="runpodPodAction(\'' + esc(p.id) + '\',\'terminate\')">terminate</button>';
-    html += '<tr><td>' + label + '</td><td>' + _rpStatusBadge(p) + '</td>' +
+    html += '<tr><td>' + label + '</td><td>' + _rpStatusBadge(p, m) + '</td>' +
       '<td class="muted">' + gpu + '</td>' +
       '<td class="muted">' + (cost.length ? cost.join('<br>') : '—') +
       (p.uptimeSeconds != null ? '<div class="muted">up ' + _fmtDur(p.uptimeSeconds) + '</div>' : '') + '</td>' +
@@ -1137,6 +1143,7 @@ function buildDeployWizard() {
   return '<div class="widget"><h3>Deploy model ' +
     '<button class="btn btn-sm" onclick="dwRefreshOptions()" title="Re-fetch GPU prices, data centers and volumes">⟳ refresh options</button></h3>' +
     '<div id="dw-body"><div class="muted">loading options…</div></div>' +
+    '<div id="dw-boot"></div>' +
     '<div class="muted" style="margin-top:6px">Deploys a ready-to-use llama-server pod on RunPod from a tested recipe. ' +
     'Billing is per hour while the pod runs — stop it from the RunPod servers widget when you are done.</div></div>';
 }
@@ -1537,13 +1544,37 @@ function dwBuildPayload() {
 }
 function dwSuccessHtml(d) {
   var url = location.origin + '/v1/chat/completions';
-  return '<b>✓ Deploying ' + esc(d.model) + '</b>' +
+  var html = '<b>✓ Deploying ' + esc(d.model) + '</b>' +
     (d.name ? ' — <code>' + esc(d.name) + '</code>' : '') +
     ' · pod <code>' + esc(d.pod_id) + '</code>' +
-    (d.est_cost_per_hr != null ? ' · est $' + d.est_cost_per_hr + '/hr' : '') +
-    '<div style="margin-top:6px">Use model "' + esc(d.model) +
+    (d.est_cost_per_hr != null ? ' · est $' + d.est_cost_per_hr + '/hr' : '');
+  // capacity fallback: the combo that LANDED may differ from the user's choice
+  var landed = d.landed || {};
+  if (landed.gpu_id && (landed.gpu_id !== _dwState.gpuId ||
+                        landed.gpu_count !== _dwState.gpuCount)) {
+    html += '<div style="margin-top:6px;color:var(--warning)">⚠ Note: your GPU choice had no capacity — deployed on ' +
+      esc(landed.gpu_id) + ' × ' + esc(landed.gpu_count) +
+      (landed.est_cost_per_hr != null ? ' ($' + Number(landed.est_cost_per_hr).toFixed(2) + '/hr)' : '') +
+      ' instead</div>';
+  }
+  html += clTriedHtml(d.tried);
+  html += '<div style="margin-top:6px">Use model "' + esc(d.model) +
     '" in any OpenAI- or Anthropic-compatible tool → <code>' + esc(url) + '</code></div>' +
     '<div class="dw-hint">Boot takes a few minutes (model copy + load). Watch it appear in the RunPod servers widget below.</div>';
+  return html;
+}
+// list of GPU combos that were tried but had no capacity (deploy fallback info)
+function clTriedHtml(tried) {
+  if (!tried || !tried.length) return '';
+  var html = '<div class="muted" style="margin-top:6px">GPU combos that had no capacity:</div>' +
+    '<ul class="muted" style="margin:4px 0 0 18px">';
+  for (var i = 0; i < tried.length; i++) {
+    var t = tried[i] || {};
+    html += '<li>' + esc((t.gpu_count || 1) + '× ' + (t.gpu_id || '?')) +
+      (t.est_cost_per_hr != null ? ' ($' + Number(t.est_cost_per_hr).toFixed(2) + '/hr)' : '') +
+      (t.error ? ' — ' + esc(t.error) : '') + '</li>';
+  }
+  return html + '</ul>';
 }
 function dwDeploy() {
   var r = dwRecipe(), st = _dwState;
@@ -1573,6 +1604,7 @@ function dwDeploy() {
       if (res.status === 200 && res.data && res.data.ok) {
         _dwMsg = {type: 'ok', html: dwSuccessHtml(res.data)};
         notify('✓ deploying ' + res.data.model);
+        clStartBootPoll(res.data.model);
         refreshRunpodPods();
       } else {
         var errs = res.data && res.data.detail && res.data.detail.errors;
@@ -1580,6 +1612,10 @@ function dwDeploy() {
           var lis = '';
           for (var i = 0; i < errs.length; i++) lis += '<li>' + esc(errs[i]) + '</li>';
           _dwMsg = {type: 'err', html: '<b>✗ This configuration cannot be deployed</b><ul>' + lis + '</ul>'};
+        } else if (res.data && res.data.error && res.data.error.message &&
+                   res.data.tried && res.data.tried.length) {
+          _dwMsg = {type: 'err', html: '<b>✗ Deploy failed</b> — ' + esc(res.data.error.message) +
+            clTriedHtml(res.data.tried)};
         } else {
           var m = (res.data && res.data.detail && (res.data.detail.message || res.data.detail.code)) ||
             (res.data && res.data.error && res.data.error.message) || ('HTTP ' + res.status);
@@ -1592,6 +1628,295 @@ function dwDeploy() {
       _dwMsg = {type: 'err', html: '<b>✗ Deploy failed</b> — ' + esc(e.message)};
       dwRenderAll();
     });
+}
+
+// ---------- Cloud (provider panels — RunPod first) ----------
+var _clProvider = null;
+var _clAccount = null;   // /admin/providers/runpod/account response
+var _clCatalog = null;   // /admin/catalog response (datacenter list for the volume form)
+var _clVolMsg = null;    // {type:'ok'|'err', text} — volume manager result banner
+var _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
+
+function showCloud(ui) {
+  ui.title.textContent = '☁ Cloud';
+  _clProvider = null;
+  _clAccount = null;
+  _clCatalog = null;
+  _clVolMsg = null;
+  _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
+  api('/admin/providers').then(function (d) {
+    var ps = d.providers || [];
+    var html = '<div class="widget"><h3>Provider</h3>' +
+      '<div class="srow"><label for="cl-provider">Cloud provider</label>' +
+      '<select id="cl-provider" onchange="clOnProviderChange()">';
+    for (var i = 0; i < ps.length; i++)
+      html += '<option value="' + esc(ps[i].id) + '">' + esc(ps[i].name) + '</option>';
+    html += '</select><span class="muted">More providers coming</span></div>' +
+      '<div id="cl-provider-panel"><div class="muted">loading…</div></div></div>';
+    ui.body.innerHTML = html;
+    clShowProviderPanel(ps.length ? ps[0].id : null);
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function clOnProviderChange() {
+  clShowProviderPanel(document.getElementById('cl-provider').value || null);
+}
+// One panel per provider — a vendor registers in the backend provider
+// registry and plugs a renderer in here.
+function clShowProviderPanel(providerId) {
+  _clProvider = providerId;
+  var panel = document.getElementById('cl-provider-panel');
+  if (!panel) return;
+  if (providerId === 'runpod') {
+    panel.innerHTML = buildDeployWizard() +
+      '<div class="widget"><h3>Network volumes ' +
+      '<button class="btn btn-sm" onclick="clLoadAccount()">⟳ refresh</button></h3>' +
+      '<div id="cl-vol-body"><div class="muted">loading…</div></div>' +
+      '<div class="muted" style="margin-top:6px">Volumes are pinned to one data center — deploy the wizard\'s pod ' +
+      'into the same DC to attach it. A volume referenced by a configured model cannot be deleted.</div></div>' +
+      '<div class="widget"><h3>Spend</h3><div id="cl-spend-body"><div class="muted">loading…</div></div>' +
+      '<div class="muted" style="margin-top:6px">Per-pod GPU + disk charges for the last 7 days, straight from the provider API.</div></div>' +
+      buildRunpodServers();
+    dwInit();
+    clLoadAccount();
+    refreshRunpodPods();
+  } else {
+    panel.innerHTML = '<div class="muted">No panel for this provider yet.</div>';
+  }
+}
+
+// ----- RunPod account: volumes + billing -----
+function clLoadAccount() {
+  var volBox = document.getElementById('cl-vol-body');
+  var spendBox = document.getElementById('cl-spend-body');
+  if (volBox) volBox.innerHTML = '<div class="muted">loading…</div>';
+  if (spendBox) spendBox.innerHTML = '<div class="muted">loading…</div>';
+  Promise.all([api('/admin/providers/runpod/account'), api('/admin/catalog')])
+    .then(function (r) {
+      _clAccount = r[0];
+      _clCatalog = r[1];
+      if (!_clVolForm.dcId || !clDcTypes(_clVolForm.dcId).length) {
+        var d0 = clCapableDcs()[0];
+        _clVolForm.dcId = d0 ? d0.id : '';
+      }
+      var types = clDcTypes(_clVolForm.dcId);
+      if (types.length && types.indexOf(_clVolForm.type) < 0) _clVolForm.type = types[0];
+      clRenderVolumes();
+      clRenderSpend();
+    })
+    .catch(function (e) {
+      if (volBox) volBox.innerHTML = errBox(e);
+      if (spendBox) spendBox.innerHTML = errBox(e);
+    });
+}
+function clVolMsg(type, text) {
+  _clVolMsg = {type: type, text: text};
+  clRenderVolumes();
+}
+function clRenderVolumes() {
+  var box = document.getElementById('cl-vol-body');
+  if (!box) return;
+  if (!_clAccount) { box.innerHTML = '<div class="muted">loading…</div>'; return; }
+  var vols = _clAccount.volumes || [], usage = _clAccount.volume_usage || {};
+  var html = '<table><thead><tr><th>name</th><th class="num">size GB</th><th>type</th>' +
+    '<th>data center</th><th>used by</th><th></th></tr></thead><tbody>';
+  for (var i = 0; i < vols.length; i++) {
+    var v = vols[i] || {}, users = usage[v.id] || [];
+    var del = users.length
+      ? '<button class="btn btn-sm btn-danger" disabled title="in use by ' + esc(users.join(', ')) + '">delete</button>'
+      : '<button class="btn btn-sm btn-danger" onclick="clDeleteVolume(\'' + esc(v.id) + '\')">delete</button>';
+    html += '<tr><td><b>' + esc(v.name || v.id) + '</b>' +
+      '<div class="muted"><code>' + esc(v.id) + '</code></div></td>' +
+      '<td class="num">' + esc(v.size != null ? v.size : '—') + '</td>' +
+      '<td class="muted">' + esc(v.type || '—') + '</td>' +
+      '<td class="muted">' + esc(v.dataCenter || '—') + '</td>' +
+      '<td class="muted">' + (users.length ? esc(users.join(', ')) : '—') + '</td>' +
+      '<td>' + del + '</td></tr>';
+  }
+  if (!vols.length) html += '<tr><td colspan="6" class="muted">No network volumes.</td></tr>';
+  html += '</tbody></table>';
+  html += clVolumeForm();
+  if (_clVolMsg)
+    html += '<div class="dw-msg ' + esc(_clVolMsg.type) + '" style="margin-top:8px">' + esc(_clVolMsg.text) + '</div>';
+  box.innerHTML = html;
+}
+function clVolumeForm() {
+  var st = _clVolForm;
+  var html = '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bg-deep)">' +
+    '<div class="kv" style="margin-bottom:6px"><b>New volume</b></div>';
+  if (!_clCatalog) { html += '<div class="muted">loading data centers…</div></div>'; return html; }
+  var dcs = clCapableDcs();
+  html += '<div class="srow"><label for="cl-vol-name">Name</label>' +
+    '<input id="cl-vol-name" placeholder="glm53-EUR-IS-1" value="' + esc(st.name) + '" oninput="clOnVolNameInput()"></div>';
+  html += '<div class="srow"><label for="cl-vol-dc">Data center</label>' +
+    '<select id="cl-vol-dc" onchange="clOnVolDcChange()">';
+  for (var i = 0; i < dcs.length; i++)
+    html += '<option value="' + esc(dcs[i].id) + '"' + (dcs[i].id === st.dcId ? ' selected' : '') + '>' +
+      esc(dcs[i].id + ' (' + (dcs[i].region || '—') + ')') + '</option>';
+  html += '</select>' +
+    '<span class="muted">' + (dcs.length ? dcs.length + ' with volume support' : 'none listed') + '</span></div>';
+  html += '<div class="srow"><label for="cl-vol-size">Size (GB)</label>' +
+    '<input id="cl-vol-size" type="number" min="1" value="' + esc(st.sizeGb) + '" oninput="clOnVolSizeInput()"></div>';
+  html += '<div class="srow"><label for="cl-vol-type">Type</label>' +
+    '<select id="cl-vol-type">' + clVolTypeOptions() + '</select></div>';
+  html += '<div style="margin-top:6px"><button class="btn btn-primary" onclick="clCreateVolume()">Create volume</button></div>' +
+    '</div>';
+  return html;
+}
+function clCapableDcs() { // data centers that support network volumes
+  var dcs = (_clCatalog && _clCatalog.datacenters) || [], out = [];
+  for (var i = 0; i < dcs.length; i++)
+    if ((dcs[i].networkVolumeTypes || []).length) out.push(dcs[i]);
+  out.sort(function (a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; });
+  return out;
+}
+function clDcTypes(dcId) {
+  var dcs = (_clCatalog && _clCatalog.datacenters) || [];
+  for (var i = 0; i < dcs.length; i++) if (dcs[i].id === dcId) return dcs[i].networkVolumeTypes || [];
+  return [];
+}
+function clVolTypeOptions() {
+  var types = clDcTypes(_clVolForm.dcId), html = '';
+  for (var i = 0; i < types.length; i++)
+    html += '<option value="' + esc(types[i]) + '"' + (types[i] === _clVolForm.type ? ' selected' : '') + '>' +
+      esc(types[i]) + '</option>';
+  return html;
+}
+function clOnVolNameInput() { _clVolForm.name = document.getElementById('cl-vol-name').value; }
+function clOnVolSizeInput() { _clVolForm.sizeGb = parseInt(document.getElementById('cl-vol-size').value, 10) || 0; }
+function clOnVolDcChange() {
+  _clVolForm.dcId = document.getElementById('cl-vol-dc').value;
+  var types = clDcTypes(_clVolForm.dcId);
+  if (types.length && types.indexOf(_clVolForm.type) < 0) _clVolForm.type = types[0];
+  clRenderVolumes(); // type options follow the selected data center
+}
+// POST /admin/runpod/volumes — raw fetch so 4xx/5xx JSON error bodies survive
+function clVolPost(body) {
+  var headers = {'Content-Type': 'application/json'};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  return fetch('/admin/runpod/volumes', {method: 'POST', headers: headers, body: JSON.stringify(body)})
+    .then(function (r) {
+      return r.json().then(
+        function (d) { return {status: r.status, data: d}; },
+        function () { return {status: r.status, data: null}; });
+    });
+}
+function clCreateVolume() {
+  var st = _clVolForm;
+  var name = (st.name || '').trim();
+  if (!name || !st.dcId || !st.sizeGb || st.sizeGb < 1) {
+    clVolMsg('err', '✗ name, data center and a positive size are required');
+    return;
+  }
+  clVolPost({action: 'create', name: name, data_center_id: st.dcId,
+             size_gb: st.sizeGb, volume_type: st.type || 'STANDARD'})
+    .then(function (res) {
+      if (res.status === 200 && res.data && res.data.ok) {
+        var dc = (res.data.volume || {}).dataCenter || st.dcId;
+        clVolMsg('ok', '✓ volume ' + name + ' created in ' + dc);
+        notify('✓ volume created');
+        clLoadAccount();
+        dwLoadCatalog(false); // refresh the deploy wizard's volume list
+      } else {
+        var m = (res.data && res.data.error && res.data.error.message) || ('HTTP ' + res.status);
+        clVolMsg('err', '✗ volume create failed — ' + m);
+      }
+    })
+    .catch(function (e) { clVolMsg('err', '✗ volume create failed — ' + e.message); });
+}
+function clDeleteVolume(volumeId) {
+  if (!confirm('Delete volume ' + volumeId + '? This cannot be undone.')) return;
+  clVolPost({action: 'delete', volume_id: volumeId})
+    .then(function (res) {
+      if (res.status === 200 && res.data && res.data.ok) {
+        clVolMsg('ok', '✓ volume ' + volumeId + ' deleted');
+        notify('✓ volume deleted');
+        clLoadAccount();
+        dwLoadCatalog(false);
+      } else {
+        var m = (res.data && res.data.error && res.data.error.message) || ('HTTP ' + res.status);
+        clVolMsg('err', '✗ volume delete failed — ' + m); // 409 in-use guard surfaces here
+      }
+    })
+    .catch(function (e) { clVolMsg('err', '✗ volume delete failed — ' + e.message); });
+}
+function clRenderSpend() {
+  var box = document.getElementById('cl-spend-body');
+  if (!box) return;
+  if (!_clAccount) { box.innerHTML = '<div class="muted">loading…</div>'; return; }
+  var b = _clAccount.billing;
+  if (!b || !b.metadata || !b.metadata.totals || b.metadata.totals.totalAmount == null) {
+    box.innerHTML = '<div class="muted">no billing data</div>';
+    return;
+  }
+  var totals = b.metadata.totals, meta = b.metadata;
+  var html = '<div class="dw-cost">Total spend (7d): $' + Number(totals.totalAmount).toFixed(2) + '</div>';
+  var recs = (b.records || []).slice();
+  recs.sort(function (a, c) {
+    var sa = String(a.startTime || ''), sc = String(c.startTime || '');
+    return sa > sc ? -1 : sa < sc ? 1 : 0;
+  });
+  html += '<table style="margin-top:8px"><thead><tr><th>pod</th><th>day</th>' +
+    '<th class="num">GPU $</th><th class="num">disk $</th><th class="num">total $</th></tr></thead><tbody>';
+  for (var i = 0; i < recs.length; i++) {
+    var rec = recs[i] || {};
+    html += '<tr><td><code>' + esc(rec.podId || '—') + '</code></td>' +
+      '<td class="muted">' + esc(String(rec.startTime || '').slice(0, 10) || '—') + '</td>' +
+      '<td class="num">' + Number(rec.gpuAmount || 0).toFixed(2) + '</td>' +
+      '<td class="num">' + Number(rec.diskAmount || 0).toFixed(2) + '</td>' +
+      '<td class="num"><b>' + Number(rec.totalAmount || 0).toFixed(2) + '</b></td></tr>';
+  }
+  if (!recs.length) html += '<tr><td colspan="5" class="muted">no billing records</td></tr>';
+  html += '</tbody></table>';
+  var parts = [];
+  if (meta.recordCount != null) parts.push(meta.recordCount + ' record(s)');
+  if (meta.uniquePodCount != null) parts.push(meta.uniquePodCount + ' pod(s)');
+  if (parts.length) html += '<div class="muted" style="margin-top:6px">' + esc(parts.join(' · ')) + '</div>';
+  box.innerHTML = html;
+}
+
+// ----- post-deploy boot watch (poll state every 15 s, up to 15 min) -----
+function clModelStatus(h, model) {
+  var rs = (h && h.runpod) || [];
+  for (var i = 0; i < rs.length; i++)
+    if (rs[i].model === model || rs[i].alias === model) return rs[i];
+  return null;
+}
+function clStopBootPoll() {
+  if (_clBootTimer) { clearInterval(_clBootTimer); _clBootTimer = null; }
+}
+function clStartBootPoll(model) {
+  clStopBootPoll();
+  var box = document.getElementById('dw-boot');
+  if (box) box.innerHTML = '<div class="kv" id="dw-boot-line">⏳ boot watch started for <b>' +
+    esc(model) + '</b>…</div>';
+  var deadline = Date.now() + 15 * 60 * 1000;
+  var tick = function () {
+    api('/healthz').then(function (h) {
+      var line = document.getElementById('dw-boot-line');
+      if (!line) { clStopBootPoll(); return; } // wizard unmounted — stop watching
+      var st = clModelStatus(h, model);
+      if (!st) {
+        line.innerHTML = '⏳ boot watch: waiting for <b>' + esc(model) + '</b> to register…';
+      } else if (st.state === 'warming-up') {
+        var s = st.warm_s != null ? Math.round(st.warm_s) : 0;
+        line.innerHTML = '⏳ warming up (' + s + 's) — model copy + load in progress…';
+      } else if (st.state === 'running') {
+        clStopBootPoll();
+        line.innerHTML = '<span style="color:var(--success)">running ✓ — ready for requests</span>';
+        notify('✓ ' + model + ' is up');
+        refreshRunpodPods();
+        return;
+      } else {
+        line.innerHTML = 'pod state: ' + esc(st.state) + '…';
+      }
+      if (Date.now() > deadline) {
+        clStopBootPoll();
+        line.innerHTML += ' <span class="muted">(boot watch gave up after 15 min — check the RunPod servers widget)</span>';
+      }
+    }).catch(function () { /* transient poll error — keep waiting */ });
+  };
+  tick();
+  _clBootTimer = setInterval(tick, 15000);
 }
 
 // ---------- Performance ----------

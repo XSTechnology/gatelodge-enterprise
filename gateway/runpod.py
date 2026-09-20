@@ -52,9 +52,22 @@ class RunPodError(Exception):
     """RunPod API failure or pod never became healthy — maps to 502."""
 
 
+class RunPodWarmingUp(RunPodError):
+    """Pod exists and is still BOOTING when the wait budget ran out
+    (image pull / weights download / load). Distinct from a hard
+    failure: the caller should surface 503 + Retry-After so clients
+    retry instead of treating the model as broken."""
+
+
 class RunPodStreamUnavailable(RunPodError):
     """GET /stream/{id} rejected — endpoint/worker without stream support;
     callers may fall back to collect-then-emit (runsync)."""
+
+
+# Non-streaming requests hold at most this long while a cold pod boots
+# (streaming holds up to the spec's start_timeout_s but emits SSE
+# keep-alive comments, so it can afford the longer wait).
+WARMUP_MAX_HOLD_S = 300.0
 
 
 # 429 backoff (docs: "Implement retry logic with exponential backoff" —
@@ -210,6 +223,23 @@ async def create_volume(name: str, data_center: str, size_gb: int,
         "name": name, "dataCenter": data_center,
         "size": int(size_gb), "type": vol_type or "STANDARD",
     })
+
+
+async def delete_volume(volume_id: str, api_key_env: str) -> Any:
+    """DELETE /v2/network-volumes/{id} — the volume must not be mounted
+    by a running pod (RunPod refuses; callers surface that error)."""
+    return await _rest("DELETE", f"/network-volumes/{volume_id}",
+                       api_key_env)
+
+
+async def list_pod_billing(api_key_env: str, days: int = 7) -> dict[str, Any]:
+    """GET /v2/billing/pods — per-pod billing history. Response shape
+    varies by account state ({} / {pods: [...]} / {billing: [...]});
+    returned as-is and rendered defensively by the console."""
+    out = await _rest("GET", "/billing/pods", api_key_env)
+    if isinstance(out, dict):
+        return out
+    return {"items": out}
 
 
 def pod_state(pod: dict[str, Any]) -> str:
@@ -747,6 +777,11 @@ class _PodManager:
         self.ready = False
         self.last_used = time.monotonic()
         self.deployed_s: float | None = None
+        # warmup visibility: an ensure_ready is in flight (booting or
+        # waiting on the lock behind one) — /admin/models + the console
+        # surface this as "warming up"
+        self.warming: bool = False
+        self.warm_started_s: float | None = None
         # diagnostics (set by ensure_ready; read by /admin/runpod/test)
         self.last_action: str = ""      # reused|pinned|found|resumed|deployed
         self.last_pod_info: dict[str, Any] = {}
@@ -776,8 +811,24 @@ class _PodManager:
         """Pinned pod (config pod_id) → use it directly; else find-by-name
         → resume stopped → deploy new. Then health-poll the proxy URL.
         Returns the proxy base URL. timeout_s overrides the spec's
-        start_timeout_s for ONE call (diagnostics want tight bounds)."""
+        start_timeout_s for ONE call (diagnostics want tight bounds).
+        Raises RunPodWarmingUp when the wait budget expires while the
+        pod is still booting (alive, not failed) — callers map that to
+        503 + Retry-After instead of 502."""
         self.touch()
+        if not self.ready and not self.warming:
+            self.warming = True
+            self.warm_started_s = time.monotonic()
+        try:
+            return await self._ensure_ready_locked(timeout_s)
+        finally:
+            # Still-locked means another request is resuming/deploying
+            # behind this one — keep the warming badge lit for it.
+            self.warming = self.lock.locked()
+            if not self.warming and self.ready:
+                self.warm_started_s = None
+
+    async def _ensure_ready_locked(self, timeout_s: float | None) -> str:
         async with self.lock:
             if self.is_ready():
                 self.last_action = "reused"
@@ -871,10 +922,11 @@ class _PodManager:
                                 self.base_url())
                     return self.base_url()
                 await asyncio.sleep(5.0)
-            raise RunPodError(
-                f"runpod pod [{self.backend_name}/{self.model_key}] not "
-                f"healthy after {start_to:.1f}s "
-                f"(pod {self.pod_id})")
+            raise RunPodWarmingUp(
+                f"runpod pod [{self.backend_name}/{self.model_key}] still "
+                f"booting after {start_to:.1f}s (pod {self.pod_id}, state "
+                f"{self.pod_status}) — image pull / weights download / "
+                "load in progress; retry shortly")
 
     async def stop(self, terminate: bool) -> None:
         pod_id, self.ready = self.pod_id, False
@@ -961,8 +1013,13 @@ def status() -> list[dict[str, Any]]:
             "backend": b, "model": k, "alias": m.spec.get("alias", k),
             "mode": "pod",
             "pod_id": m.pod_id,
-            "state": ("running" if m.is_ready()
+            "state": ("warming-up" if (m.warming and not m.ready)
+                      else "running" if m.is_ready()
                       else m.pod_status if m.pod_id else "not-deployed"),
+            "warming": bool(m.warming and not m.ready),
+            "warm_s": (round(time.monotonic() - m.warm_started_s, 1)
+                       if (m.warming and not m.ready
+                           and m.warm_started_s) else None),
             "base_url": m.base_url() if m.is_ready() else None,
             "idle_s": (round(time.monotonic() - m.last_used, 1)
                        if m.is_ready() else None),

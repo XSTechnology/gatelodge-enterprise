@@ -510,7 +510,10 @@ def test_pod_exited_during_startup_502(wired, gguf, monkeypatch):
     assert "EXITED" in r.json()["error"]["message"]
 
 
-def test_pod_startup_timeout_502(wired, gguf, monkeypatch):
+def test_pod_startup_timeout_503_warming_up(wired, gguf, monkeypatch):
+    """Boot timeout while the pod is alive = warming up, NOT a failure:
+    503 + warming_up code + Retry-After so clients retry the cold start
+    (was a flat 502 before cold-start semantics were introduced)."""
     cfg = _rp_config(gguf, start_timeout_s=0.01)
     wired(cfg)
     _patch_rest(monkeypatch)
@@ -522,8 +525,11 @@ def test_pod_startup_timeout_502(wired, gguf, monkeypatch):
     with TestClient(gw_app.app) as client:
         r = client.post("/v1/chat/completions", json={
             "model": "big", "messages": [{"role": "user", "content": "hi"}]})
-    assert r.status_code == 502
-    assert "not healthy" in r.json()["error"]["message"]
+    assert r.status_code == 503
+    body = r.json()
+    assert body["error"]["code"] == "warming_up"
+    assert "still booting" in body["error"]["message"]
+    assert r.headers.get("retry-after") == "30"
 
 
 def test_pod_pinned_pod_id(wired, gguf, monkeypatch):

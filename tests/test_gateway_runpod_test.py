@@ -300,7 +300,7 @@ def test_diag_ready_timeout_reports_error_and_logs(wired, gguf, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is False
-    assert "not healthy after 0.1s" in body["phases"]["pod"]["error"]
+    assert "still booting after 0.1s" in body["phases"]["pod"]["error"]
     assert body["phases"]["chat"]["skipped"] == "pod not healthy"
     # pod WAS deployed (id known) — logs still fetched for the report
     assert body["phases"]["pod"]["pod_id"] == POD_ID
