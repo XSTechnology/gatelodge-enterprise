@@ -396,3 +396,94 @@ def test_budget_stream_error_event(wired, monkeypatch):
             body = "".join(line for line in r.iter_lines())
     assert "budget_exceeded" in body
     assert "[DONE]" in body
+
+
+# ── admin endpoints (lc-4) ──────────────────────────────────────────────────
+
+def test_lifecycle_endpoint(wired):
+    cfgfile, _ = wired(CONFIG)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/lifecycle")
+    assert r.status_code == 200
+    body = r.json()
+    # watchdog off under GATEWAY_WATCHDOG=0 (conftest)
+    assert body["watchdog"]["running"] is False
+    assert body["budget_usd_month"] == 0
+    rule = next(x for x in body["rules"] if x["model"] == "big")
+    assert rule["backend"] == "rp"
+    assert rule["auto_recover"] == "alert"
+    assert rule["idle_stop_s"] == 0
+    assert "alerts" in body and "month_to_date" in body
+
+
+def test_lifecycle_settings_persist(wired):
+    cfgfile, _ = wired(CONFIG)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/lifecycle/settings", json={
+            "budget_usd_month": 25,
+            "model_budgets": {"rp|big": 5.5},
+            "model_auto_recover": {"rp|big": "redeploy"},
+        })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["budget_usd_month"] == 25
+    rule = next(x for x in body["rules"] if x["model"] == "big")
+    assert rule["monthly_budget_usd"] == 5.5
+    assert rule["auto_recover"] == "redeploy"
+    # persisted to the config file (survives restart)
+    raw = json.loads(cfgfile.read_text(encoding="utf-8"))
+    assert raw["budget_usd_month"] == 25
+    spec = raw["backends"]["rp"]["models"]["big"]
+    assert spec["monthly_budget_usd"] == 5.5
+    assert spec["auto_recover"] == "redeploy"
+    # invalid auto_recover values never reach the config
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/lifecycle/settings", json={
+            "model_auto_recover": {"rp|big": "nuke"}})
+    spec = json.loads(cfgfile.read_text(encoding="utf-8"))[
+        "backends"]["rp"]["models"]["big"]
+    assert spec["auto_recover"] == "redeploy"
+
+
+def test_stop_all_panic(wired, monkeypatch):
+    wired(CONFIG)
+    pods = [
+        {"id": "pod-run1", "name": "gw-rp-a", "status": "RUNNING"},
+        {"id": "pod-run2", "name": "byo", "status": "READY"},
+        {"id": "pod-stop", "name": "gw-rp-b", "status": "EXITED"},
+    ]
+
+    async def list_pods(env):
+        return pods
+
+    stopped: list = []
+
+    async def stop_pod(pid, env):
+        stopped.append(pid)
+
+    monkeypatch.setattr(rp, "list_pods", list_pods)
+    monkeypatch.setattr(rp, "stop_pod", stop_pod)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/runpod/stop-all")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert sorted(x["pod_id"] for x in body["stopped"]) == \
+        ["pod-run1", "pod-run2"]      # only running pods, BYO included
+    assert stopped == ["pod-run1", "pod-run2"]
+    assert any(a["kind"] == "panic_stop" for a in lc.alerts())
+
+
+def test_healthz_lifecycle_section(wired, monkeypatch):
+    wired(CONFIG)
+
+    async def _rs(c):
+        return []
+
+    monkeypatch.setattr(rp, "refresh_status", _rs)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/healthz")
+    assert r.status_code == 200
+    sec = r.json()["lifecycle"]
+    assert sec["watchdog"] is False
+    assert "budget_usd_month" in sec and "alerts" in sec

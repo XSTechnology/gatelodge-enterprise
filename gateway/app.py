@@ -1711,6 +1711,10 @@ async def healthz() -> dict[str, Any]:
         "loaded": loaded,  # Ollama-ps shaped: alias/path/size_vram/n_ctx/load_s
         "llama_server": llamaserver.status(),  # managed children (subprocess)
         "runpod": await runpod.refresh_status(cfg),  # lifecycle-managed pods (serverless is stateless)
+        "lifecycle": {"watchdog": lifecycle.watchdog_running(),
+                      "budget_usd_month": getattr(cfg, "budget_usd_month", 0),
+                      "month_to_date": lifecycle.budget_snapshot(),
+                      "alerts": lifecycle.alerts(10)},
         "gpus": gpus,
     }
 
@@ -2708,6 +2712,134 @@ async def admin_runpod_action(payload: RunPodActionPayload) -> Response:
     except runpod.RunPodError as e:
         return _error(502, str(e), code="runpod_error")
     return {"ok": True, "pod_id": payload.pod_id, "action": payload.action}
+
+
+# ── Admin: v3 pod lifecycle ─────────────────────────────────────────────────
+
+@app.post("/admin/runpod/stop-all")
+async def admin_runpod_stop_all() -> Response:
+    """PANIC: stop every RUNNING runpod pod across all backends (stop,
+    not terminate — pods stay resumable). In-flight requests break by
+    design; volume/storage spend continues (it's storage, not compute).
+    Covers the whole account — BYO pods included."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if not rp_backends:
+        return _error(400, "no runpod backends configured")
+    stopped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for name, b in rp_backends.items():
+        env = b.get("api_key_env", "RUNPOD_API_KEY")
+        try:
+            pods = await runpod.list_pods(env)
+        except runpod.RunPodError as e:
+            errors.append({"backend": name, "error": str(e)})
+            continue
+        for pod in pods if isinstance(pods, list) else []:
+            if runpod.pod_state(pod) not in ("RUNNING", "READY", "UNKNOWN"):
+                continue
+            pid = pod.get("id")
+            try:
+                await runpod.stop_pod(pid, env)
+                stopped.append({"backend": name, "pod_id": pid,
+                                "name": pod.get("name")})
+            except runpod.RunPodError as e:
+                errors.append({"backend": name, "pod_id": pid,
+                               "error": str(e)})
+    if stopped:
+        lifecycle._emit("panic_stop", "",
+                        f"panic button: stopped {len(stopped)} running "
+                        f"pod(s)", severity="warn")
+    return {"ok": not errors, "stopped": stopped, "errors": errors}
+
+
+class LifecycleSettingsPayload(BaseModel):
+    """Per-model lifecycle knobs + the global monthly cap. Model keys
+    are "backend|model" (same shape as month_to_date.per_model)."""
+    model_config = ConfigDict(extra="ignore")
+
+    budget_usd_month: float | None = None          # 0 disables the cap
+    model_budgets: dict[str, float] | None = None  # "b|m" -> USD, 0 off
+    model_auto_recover: dict[str, str] | None = None  # "b|m" -> alert|redeploy
+    clear_alerts: bool = False
+
+
+@app.get("/admin/lifecycle")
+async def admin_lifecycle() -> Response:
+    """Lifecycle panel data: watchdog state, cached month-to-date,
+    per-model rules, recent alerts. Cached snapshot only — this never
+    triggers a billing/pods fetch (D8)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    rules: list[dict[str, Any]] = []
+    for name, b in cfg.backends.items():
+        if b.get("type") != "runpod":
+            continue
+        for mkey, mspec in (b.get("models") or {}).items():
+            if isinstance(mspec, dict) and not mspec.get("endpoint_id"):
+                rules.append({
+                    "backend": name, "model": mkey,
+                    "alias": mspec.get("alias", mkey),
+                    "idle_stop_s": mspec.get("idle_stop_s", 0),
+                    "idle_terminate_s": mspec.get("idle_terminate_s", 0),
+                    "monthly_budget_usd": mspec.get("monthly_budget_usd", 0),
+                    "auto_recover": mspec.get("auto_recover", "alert"),
+                    "est_cost_per_hr": mspec.get("est_cost_per_hr", 0),
+                })
+    return {
+        "watchdog": {"running": lifecycle.watchdog_running(),
+                     "interval_s": lifecycle.WATCHDOG_INTERVAL_S},
+        "budget_usd_month": getattr(cfg, "budget_usd_month", 0),
+        "month_to_date": lifecycle.budget_snapshot(),
+        "rules": rules,
+        "alerts": lifecycle.alerts(50),
+    }
+
+
+@app.post("/admin/lifecycle/settings")
+async def admin_lifecycle_settings(
+        payload: LifecycleSettingsPayload) -> Response:
+    """Set the global monthly cap + per-model budget/auto-recover
+    (persisted to gateway_config.json, hot-reloaded). Returns the new
+    panel state so the console can re-render in one round trip."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    if payload.clear_alerts:
+        lifecycle.clear_alerts()
+
+    def _mspec(raw: dict, key: str) -> dict | None:
+        b, _, mkey = str(key).partition("|")
+        spec = (raw.get("backends", {}).get(b, {})
+                .get("models", {}).get(mkey))
+        return spec if isinstance(spec, dict) else None
+    def mutator(raw: dict):
+        if payload.budget_usd_month is not None:
+            raw["budget_usd_month"] = max(
+                0.0, float(payload.budget_usd_month))
+        if payload.model_budgets:
+            for key, val in payload.model_budgets.items():
+                spec = _mspec(raw, key)
+                if spec is not None:
+                    try:
+                        spec["monthly_budget_usd"] = max(0.0, float(val or 0))
+                    except (TypeError, ValueError):
+                        pass
+        if payload.model_auto_recover:
+            for key, val in payload.model_auto_recover.items():
+                spec = _mspec(raw, key)
+                if spec is not None and val in ("alert", "redeploy"):
+                    spec["auto_recover"] = val
+
+    _mutate_config(mutator)
+    # stale budget cache could mask the new caps for up to 60s — drop it
+    lifecycle.reset_budget_cache()
+    try:
+        await lifecycle.month_to_date(cfg)   # freshen for the response
+    except Exception:  # noqa: BLE001 — panel state is best-effort
+        pass
+    return await admin_lifecycle()
 
 
 class RunPodTestPayload(BaseModel):

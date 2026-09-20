@@ -493,3 +493,16 @@ def ensure_watchdog() -> None:
 
 def watchdog_running() -> bool:
     return bool(_WATCHDOG_TASK and not _WATCHDOG_TASK.done())
+
+
+def budget_snapshot() -> dict[str, Any] | None:
+    """Cached month-to-date (NO fetch) — healthz / GET /admin/lifecycle
+    render this; only the watchdog tick refreshes it (D8)."""
+    return _BUDGET_STATE["snapshot"]
+
+
+def reset_budget_cache() -> None:
+    """Drop the cached month-to-date — settings changes want immediate
+    effect, not a 60s TTL wait."""
+    _BUDGET_STATE["snapshot"] = None
+    _BUDGET_STATE["at"] = 0.0
