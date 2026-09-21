@@ -3953,6 +3953,34 @@ async def admin_serverless_settings(
             "scaling": scaling}
 
 
+@app.get("/admin/serverless/workers")
+async def admin_serverless_workers(model: str, worker_id: str = "",
+                                   backend: str = "") -> Response:
+    """Serverless worker inspection: list an endpoint's workers, or
+    fetch one worker's container logs (?worker_id=...). The logs API
+    is the only programmatic window into serverless worker output
+    (v2 OpenAPI discovery 2026-09-21 — previously console-only) —
+    THE debugging path for crash-looping workers."""
+    if not model:
+        return _error(400, "model required")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = backend or _runpod_api_key_env(cfg)[0]
+    b = cfg.backends.get(backend) or {}
+    m = (b.get("models") or {}).get(model) or {}
+    ep_id = str(m.get("endpoint_id") or "").strip()
+    if not ep_id:
+        return _error(400, f"model {model!r} is not a serverless "
+                           "endpoint model")
+    env = b.get("api_key_env", "RUNPOD_API_KEY")
+    try:
+        if worker_id:
+            return await runpod.get_worker_logs(ep_id, worker_id, env)
+        return {"workers": await runpod.list_endpoint_workers(ep_id, env)}
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+
+
 # ── Provider registry + RunPod account panel ───────────────────────────────
 
 @app.get("/admin/providers")

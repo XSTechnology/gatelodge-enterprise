@@ -215,6 +215,58 @@ async def get_endpoint(endpoint_id: str,
     return out if isinstance(out, dict) else {}
 
 
+async def list_endpoint_workers(endpoint_id: str,
+                                api_key_env: str) -> list[dict[str, Any]]:
+    """GET /v2/serverless/{id}/workers — the endpoint's workers (id,
+    status, host...). Shape varies; returned defensively."""
+    out = await _rest("GET", f"/serverless/{endpoint_id}/workers",
+                      api_key_env)
+    if isinstance(out, list):
+        return [w for w in out if isinstance(w, dict)]
+    for k in ("workers", "data", "items"):
+        if isinstance(out, dict) and isinstance(out.get(k), list):
+            return [w for w in out[k] if isinstance(w, dict)]
+    return []
+
+
+async def _stream_collect(url: str, api_key: str, read_s: float = 10.0,
+                          max_lines: int = 200) -> list[str]:
+    """Bounded read of a STREAMING endpoint (some RunPod log endpoints
+    tail forever): collect lines until EOF, a per-read timeout (the
+    stream stalls) or max_lines. E2E-proven necessary 2026-09-21 —
+    /workers/{id}/logs never closes and a plain GET hangs forever."""
+    collected: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(
+                read_s, connect=10.0)) as ac:
+            async with ac.stream("GET", url, headers={
+                    "Authorization": f"Bearer {api_key}"}) as r:
+                if r.status_code >= 400:
+                    body = (await r.aread()).decode("utf-8", "replace")
+                    raise RunPodError(
+                        f"runpod GET {url} -> {r.status_code}: "
+                        f"{body[:800]}")
+                async for line in r.aiter_lines():
+                    collected.append(line)
+                    if len(collected) >= max_lines:
+                        break
+    except httpx.TimeoutException:
+        pass  # stalled stream — return what we collected
+    return collected
+
+
+async def get_worker_logs(endpoint_id: str, worker_id: str,
+                          api_key_env: str) -> dict[str, Any]:
+    """GET /v2/serverless/{id}/workers/{wid}/logs — container log
+    lines for one serverless worker (v2 OpenAPI discovery 2026-09-21;
+    previously believed console-only). The endpoint STREAMS tail-style
+    and never closes — collected with a bounded read."""
+    lines = await _stream_collect(
+        f"{REST_BASE}/serverless/{endpoint_id}/workers/{worker_id}/logs",
+        _api_key(api_key_env))
+    return {"lines": lines}
+
+
 # ── Serverless deploy builder ───────────────────────────────────────────────
 
 # Community standard GGUF worker: llama.cpp server-cuda base + the
@@ -230,7 +282,8 @@ def serverless_endpoint_payload(*, name: str, pool: str, env: dict,
                                 queue_delay: int = 4,
                                 network_volume_id: str = "",
                                 data_center_id: str = "",
-                                disk_gb: int = 0
+                                disk_gb: int = 0,
+                                flashboot: bool = True
                                 ) -> dict[str, Any]:
     """POST /v2/serverless body (shape verified live 2026-09-20).
     workers.min=0 = scale-to-zero; disk_gb sizes the workers' container
@@ -238,7 +291,15 @@ def serverless_endpoint_payload(*, name: str, pool: str, env: dict,
     must match the network volume's DC when one is attached. The worker
     image builds on llama.cpp server-cuda and requires CUDA 12.8+
     hosts — pinned via gpu.minCudaVersion (README-documented, live in
-    the v4.5 E2E endpoint)."""
+    the v4.5 E2E endpoint).
+
+    flashboot=True (default): CRIU-style per-(host, image-SHA) process
+    snapshot taken when a worker scales to zero; restores cut cold
+    starts to seconds. Works for this worker because start.sh loads
+    the model EAGERLY at boot (llama-server before the handler), so
+    the snapshot carries the loaded model forward (RunPod model
+    caching itself is console-only — no v2/v1 API field, GraphQL
+    dead; probed 2026-09-21)."""
     payload: dict[str, Any] = {
         "name": name,
         "image": SERVERLESS_WORKER_IMAGE,
@@ -249,6 +310,7 @@ def serverless_endpoint_payload(*, name: str, pool: str, env: dict,
         "scaling": {"type": "QUEUE_DELAY", "queueDelay": int(queue_delay)},
         "env": dict(env),
         "timeout": 300000,
+        "flashboot": "FLASHBOOT" if flashboot else "OFF",
     }
     if disk_gb:
         payload["disk"] = int(disk_gb)

@@ -88,11 +88,52 @@ def test_serverless_endpoint_payload():
     assert p["networkVolumes"] == ["vol-1"]
     assert p["dataCenterIds"] == ["EUR-IS-1"]
     assert p["disk"] == 46
+    assert p["flashboot"] == "FLASHBOOT"    # default: snapshot cold starts
     assert p["env"]["LLAMA_ARG_MODEL"] == "/workspace/uploads/m.gguf"
-    # optional attachments omitted when not given
-    p2 = rp.serverless_endpoint_payload(name="n", pool="P", env={})
+    # optional attachments omitted when not given; flashboot opt-out
+    p2 = rp.serverless_endpoint_payload(name="n", pool="P", env={},
+                                        flashboot=False)
     assert "networkVolumes" not in p2 and "dataCenterIds" not in p2
     assert "disk" not in p2
+    assert p2["flashboot"] == "OFF"
+
+
+async def test_worker_wrappers(monkeypatch):
+    calls = []
+
+    async def fake_rest(method, path, api_key_env, json_body=None):
+        calls.append((method, path))
+        if path.endswith("/workers"):
+            return {"workers": [{"id": "w-1", "status": "RUNNING"}]}
+        raise AssertionError("unexpected _rest call")
+
+    monkeypatch.setattr(rp, "_rest", fake_rest)
+    ws = await rp.list_endpoint_workers("ep-1", "E")
+    assert ws == [{"id": "w-1", "status": "RUNNING"}]
+    assert calls[0] == ("GET", "/serverless/ep-1/workers")
+    # bare-list response shape tolerated
+    async def fake_list(method, path, env, json_body=None):
+        return [{"id": "w-2"}]
+    monkeypatch.setattr(rp, "_rest", fake_list)
+    assert await rp.list_endpoint_workers("ep-1", "E") == [{"id": "w-2"}]
+
+
+async def test_get_worker_logs_bounded_stream(monkeypatch):
+    """worker logs STREAM tail-style — _stream_collect must stop at
+    max_lines (E2E: a plain GET hangs forever)."""
+    seen = {}
+    monkeypatch.setenv("E", "test-key")
+
+    async def fake_stream(url, key, read_s=10.0, max_lines=200):
+        seen["url"] = url
+        seen["key"] = key
+        return [f"line {i}" for i in range(max_lines + 50)]
+
+    monkeypatch.setattr(rp, "_stream_collect", fake_stream)
+    out = await rp.get_worker_logs("ep-1", "w-9", "E")
+    assert seen["url"].endswith("/serverless/ep-1/workers/w-9/logs")
+    # the seam is expected to bound itself; wrapper passes through
+    assert len(out["lines"]) == 250
 
 
 async def test_create_patch_get_endpoint_wrappers(monkeypatch):
@@ -403,6 +444,38 @@ def test_admin_serverless_list_and_settings(wired, monkeypatch):
     cfg = gw_config.get_gateway_config()
     assert cfg.backends["rp"]["models"]["slm"]["serverless"][
         "workers_max"] == 3
+
+
+def test_admin_serverless_workers_and_logs(wired, monkeypatch):
+    wired(models={"slm": {
+        "endpoint_id": "ep-1", "remote_id": "slm", "timeout_s": 600,
+        "serverless": {"source": "hf", "pool": "ADA_24"}}})
+    got = []
+
+    async def fake_list(eid, env):
+        got.append(("list", eid))
+        return [{"id": "w-1", "status": "RUNNING"}]
+
+    async def fake_logs(eid, wid, env):
+        got.append(("logs", eid, wid))
+        return {"lines": [{"line": "start.sh: llama-server is up"}]}
+
+    monkeypatch.setattr(gw_app.runpod, "list_endpoint_workers", fake_list)
+    monkeypatch.setattr(gw_app.runpod, "get_worker_logs", fake_logs)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/serverless/workers?model=slm")
+        assert r.status_code == 200
+        assert r.json() == {"workers": [{"id": "w-1",
+                                         "status": "RUNNING"}]}
+        r = client.get("/admin/serverless/workers?model=slm"
+                       "&worker_id=w-1")
+        assert r.status_code == 200
+        assert r.json()["lines"][0]["line"] == "start.sh: llama-server is up"
+        # unknown model -> 400
+        r = client.get("/admin/serverless/workers?model=nope")
+        assert r.status_code == 400
+    assert got[0] == ("list", "ep-1")
+    assert got[1] == ("logs", "ep-1", "w-1")
 
 
 def test_config_normalization_preserves_serverless_meta(wired):
