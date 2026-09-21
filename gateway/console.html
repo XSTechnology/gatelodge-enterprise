@@ -1255,8 +1255,7 @@ var _fmState = {gpuId: null, gpuCount: 1, cloud: 'secure', ctxKey: null,
                 volumeType: 'STANDARD', diskGb: 0, idleS: 1800,
                 alias: '', expert: false,
                 deployType: 'pod',           // 'pod' | 'serverless' (v4.5)
-                slWorkers: 1, slIdleMin: 5,  // serverless scaler
-                slVolMode: 'reuse', slVolumeId: null, slVolSizeGb: 0};
+                slWorkers: 1, slIdleMin: 5}; // serverless scaler
 var _fmMsg = null;    // {type:'ok'|'err', html} — custom-deploy banner
 var _fmUp = null;     // upload session {podId, reused, filename, sizeBytes,
                       //  file, xhr, timer, got, done}
@@ -1502,10 +1501,7 @@ function fmConfigFromPick() {
   _fmState.ctxKey = null;
   _fmState.diskGb = 0;
   _fmState.alias = '';
-  _fmState.slVolumeId = null;
-  _fmState.slVolSizeGb = 0;
   fmEnsureCatalog(function () {
-    if (_fmState.deployType === 'serverless') svSeedVolume();
     fmAutoPlan();
   });
 }
@@ -1987,24 +1983,6 @@ function svOnTypeChange(type) {
   fmRenderConfig();
 }
 
-// pick a sensible serverless volume: an upload's own volume, else the first
-// existing one (reuse mode); create mode when there is nothing to reuse
-function svSeedVolume() {
-  if (_fmPick && _fmPick.upload && _fmPick.volumeId) {
-    _fmState.slVolMode = 'reuse';
-    _fmState.slVolumeId = _fmPick.volumeId;
-    return;
-  }
-  if (_fmState.slVolumeId) {
-    var keep = (_dwCatalog && _dwCatalog.volumes) || [];
-    for (var j = 0; j < keep.length; j++)
-      if (keep[j].id === _fmState.slVolumeId) return; // still valid
-  }
-  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
-  _fmState.slVolMode = vols.length ? 'reuse' : 'create';
-  _fmState.slVolumeId = vols.length ? vols[0].id : null;
-}
-
 // serverless rows of the fm config panel: GPU (pool-only), ctx, workers,
 // idle, volume. p = _fmPick, ctxRow = shared context-preset markup.
 function svConfigRows(p, ctxRow) {
@@ -2050,8 +2028,9 @@ function svGpuOptions() {
   return html;
 }
 
-// serverless volume rows: reuse an existing volume or create one; uploads
-// MUST reuse (their file is already on the receiver's volume)
+// serverless storage: uploads MUST mount the receiver's volume; hf
+// repo picks need NO volume — the worker downloads the model from
+// Hugging Face at cold start (no pod storage for serverless)
 function svVolumeRows(p) {
   var st = _fmState;
   if (p.upload) {
@@ -2064,39 +2043,14 @@ function svVolumeRows(p) {
       'this upload went to the receiver pod&#39;s ephemeral disk. Pick a network volume in the ' +
       'Local file card above and upload again, then switch back to Serverless.</div>';
   }
-  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
-  var html = '<div class="srow"><label>Storage volume</label>';
-  if (vols.length) {
-    html += '<label class="dw-radio" for="fm-svm-reuse"><input type="radio" name="fm-svmode" id="fm-svm-reuse" value="reuse"' +
-      (st.slVolMode !== 'create' ? ' checked' : '') + ' onchange="svOnVolModeChange(\'reuse\')"> use existing</label>' +
-      '<label class="dw-radio" for="fm-svm-create"><input type="radio" name="fm-svmode" id="fm-svm-create" value="create"' +
-      (st.slVolMode === 'create' ? ' checked' : '') + ' onchange="svOnVolModeChange(\'create\')"> create new</label></div>';
-  } else {
-    html += '<span class="muted">create new (no existing volumes)</span></div>';
-    st.slVolMode = 'create';
+  if (p.source !== 'hf') {
+    return '<div class="dw-msg err" style="margin-top:8px"><b>Serverless supports Hugging Face repos and local uploads</b> — ' +
+      'a worker can only download from Hugging Face at cold start. Use Pod deployment for ' +
+      esc(p.source) + ' files.</div>';
   }
-  if (st.slVolMode === 'reuse' && vols.length) {
-    html += '<div class="srow"><label for="fm-sl-volume">Existing volume</label>' +
-      '<select id="fm-sl-volume" onchange="svOnVolumeSelectChange()">';
-    for (var i = 0; i < vols.length; i++) {
-      var v = vols[i];
-      html += '<option value="' + esc(v.id) + '"' + (v.id === st.slVolumeId ? ' selected' : '') + '>' +
-        esc((v.name || v.id) + ' — ' + v.size + ' GB — ' + (v.dataCenter || '—')) + '</option>';
-    }
-    html += '</select><span class="muted">the file downloads here first (blocking)</span></div>';
-  } else {
-    var auto = Math.max(20, Math.round(p.file.size_gb * 1.2) + 10);
-    var caps = dwCapableDcs(), dcOk = false;
-    for (var j = 0; j < caps.length; j++) if (caps[j].id === st.dcId) dcOk = true;
-    if (!dcOk) st.dcId = caps.length ? caps[0].id : '';
-    html += '<div class="srow"><label for="fm-sl-volsize">Volume size (GB)</label>' +
-      '<input id="fm-sl-volsize" type="number" min="1" value="' + (st.slVolSizeGb || '') +
-      '" placeholder="auto" oninput="svOnVolSizeInput()">' +
-      '<span class="muted">blank = auto (~' + esc(String(auto)) + ' GB)</span></div>';
-    html += '<div class="srow"><label for="fm-dc">Data center</label>' +
-      '<select id="fm-dc" onchange="fmOnDcChange()">' + fmDcOptions() + '</select></div>';
-  }
-  return html;
+  return '<div class="srow"><label>Model storage</label><span><b>Hugging Face download</b></span>' +
+    '<span class="muted">the worker downloads ' + esc(p.file.name) +
+    ' from Hugging Face when it cold-starts — no volume, no helper pod</span></div>';
 }
 
 function svVolumeLabel(volumeId) {
@@ -2118,10 +2072,9 @@ function svDeployable() {
   if (!p) return false;
   if (p.mmproj) return false; // v1: serverless env carries no mmproj
   if (p.upload) return !!p.volumeId;
+  if (p.source !== 'hf') return false; // worker downloads from HF only
   var g = _fmState.gpuId ? dwFindGpu(_fmState.gpuId) : null;
-  if (!g || !g.pool || !_fmPlan || !_fmPlan.fits || !_fmState.ctxKey) return false;
-  if (_fmState.slVolMode === 'reuse') return !!_fmState.slVolumeId;
-  return !!_fmState.dcId; // create mode: a capable data center is required
+  return !!(g && g.pool && _fmPlan && _fmPlan.fits && _fmState.ctxKey);
 }
 
 function svBuildPayload() {
@@ -2146,12 +2099,6 @@ function svBuildPayload() {
   };
   if (p.upload) {
     body.volume_id = p.volumeId || '';
-  } else if (st.slVolMode === 'reuse') {
-    body.volume_id = st.slVolumeId || '';
-  } else {
-    body.volume_mode = 'create';
-    body.volume_size_gb = st.slVolSizeGb || 0;
-    body.data_center_id = st.dcId || '';
   }
   return body;
 }
@@ -2164,13 +2111,11 @@ function svDeploy() {
     (_fmState.gpuId || 'cheapest fitting pool GPU') + ' · max ' +
     Math.max(1, _fmState.slWorkers || 1) + ' worker(s) · idle ' +
     Math.max(1, _fmState.slIdleMin || 5) + ' min\n' +
-    (p.upload ? '' : 'The file downloads to a network volume first — this can take a few minutes.\n') +
+    (p.upload ? '' : 'The worker downloads the model from Hugging Face when it cold-starts.\n') +
     'The endpoint scales to zero; requests use model "' + alias + '".';
   if (!confirm(msg)) return;
   var btn = document.getElementById('fm-deploy-btn');
-  var busy = p.upload ? 'Creating endpoint…'
-    : 'Preparing volume — downloading ~' + p.file.size_gb + ' GB (this can take a few minutes)…';
-  if (btn) { btn.disabled = true; btn.textContent = busy; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Creating endpoint…'; }
   var headers = {'Content-Type': 'application/json'};
   if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
   fetch('/admin/models/deploy-serverless', {method: 'POST', headers: headers,
@@ -2221,22 +2166,6 @@ function svFocusPanel() {
 // ----- serverless config panel event handlers -----
 function svOnWorkersInput() { _fmState.slWorkers = parseInt(document.getElementById('fm-sl-workers').value, 10) || 1; }
 function svOnIdleInput() { _fmState.slIdleMin = parseInt(document.getElementById('fm-sl-idle').value, 10) || 5; }
-function svOnVolSizeInput() { _fmState.slVolSizeGb = parseInt(document.getElementById('fm-sl-volsize').value, 10) || 0; }
-function svOnVolumeSelectChange() {
-  _fmState.slVolumeId = document.getElementById('fm-sl-volume').value || null;
-}
-function svOnVolModeChange(mode) {
-  _fmState.slVolMode = mode === 'create' ? 'create' : 'reuse';
-  if (_fmState.slVolMode === 'create') {
-    var caps = dwCapableDcs(), dcOk = false;
-    for (var i = 0; i < caps.length; i++) if (caps[i].id === _fmState.dcId) dcOk = true;
-    if (!dcOk) _fmState.dcId = caps.length ? caps[0].id : '';
-  } else if (!_fmState.slVolumeId) {
-    var vols = (_dwCatalog && _dwCatalog.volumes) || [];
-    if (vols.length) _fmState.slVolumeId = vols[0].id;
-  }
-  fmRenderConfig();
-}
 
 // ----- Serverless panel (Cloud tab, next to Pod lifecycle) -----
 var _svData = null; // last /admin/serverless response

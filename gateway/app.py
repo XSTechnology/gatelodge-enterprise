@@ -852,8 +852,14 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
             "base_url": runpod.serverless_base_url(m["endpoint_id"]),
             "api_key_env": backend.get("api_key_env") or "RUNPOD_API_KEY",
         }
+    # v4.5: per-model timeout covers serverless cold starts — the openai
+    # SDK would otherwise cap at the queue timeout (×3 retries with its
+    # default retry policy = 362s, E2E-measured)
+    client_timeout = (float(m.get("timeout_s") or 0)
+                      if btype == "runpod" else 0.0) \
+        or cfg.queue["timeout_s"]
     client = cloud.get_cloud_client(client_name, cloud_backend,
-                                    timeout=cfg.queue["timeout_s"])
+                                    timeout=client_timeout)
     kwargs: dict[str, Any] = {
         "model": remote_id,  # remote model id
         "messages": body.messages,
@@ -1656,8 +1662,12 @@ async def legacy_completions(body: CompletionRequest) -> Response:
                 "base_url": runpod.serverless_base_url(m["endpoint_id"]),
                 "api_key_env": backend.get("api_key_env") or "RUNPOD_API_KEY",
             }
+        # v4.5: per-model timeout covers serverless cold starts
+        client_timeout = (float(m.get("timeout_s") or 0)
+                          if btype == "runpod" else 0.0) \
+            or cfg.queue["timeout_s"]
         client = cloud.get_cloud_client(client_name, cloud_backend,
-                                        timeout=cfg.queue["timeout_s"])
+                                        timeout=client_timeout)
         kwargs: dict[str, Any] = {"model": remote_id, "prompt": body.prompt}
         if body.temperature is not None:
             kwargs["temperature"] = body.temperature
@@ -3660,10 +3670,11 @@ async def admin_upload_cleanup(payload: UploadCleanupPayload) -> Response:
 
 class ServerlessDeployPayload(BaseModel):
     """Deploy a model as a RunPod SERVERLESS endpoint: scale-to-zero,
-    no pod lifecycle. Model file must end up on a NETWORK VOLUME —
-    repo sources bootstrap-download it there; source=upload expects the
-    file already on the given volume (the upload receiver writes to
-    /workspace/uploads on volumes it mounts)."""
+    no pod lifecycle, no helper pods. source=hf: the worker downloads
+    the GGUF from Hugging Face at cold start (llama-server
+    --hf-repo/--hf-file, straight into container disk). source=upload:
+    the file must already be on a network volume (serverless workers
+    mount volumes at /runpod-volume — NOT the pod-view /workspace)."""
     model_config = ConfigDict(extra="ignore")
 
     backend: str = ""
@@ -3687,12 +3698,13 @@ class ServerlessDeployPayload(BaseModel):
 @app.post("/admin/models/deploy-serverless")
 async def admin_deploy_serverless(
         payload: ServerlessDeployPayload) -> Response:
-    """Volume → (repo: bootstrap download | upload: already there) →
-    endpoint create (scale-to-zero) → config persist. Request routing
+    """Endpoint create (scale-to-zero) → config persist. HF sources:
+    the worker downloads the GGUF from Hugging Face at cold start
+    (LLAMA_ARG_HF_REPO/LLAMA_ARG_HF_FILE — no volume, no helper pod);
+    upload sources: the file must already be on a network volume
+    (mounted at /runpod-volume by serverless workers). Request routing
     needs NO new code — endpoint_id models already go through the
-    OpenAI-compat URL. Single-GPU only in v1 (422 otherwise). The
-    bootstrap download runs INSIDE this request (blocking — large
-    models take minutes; documented)."""
+    OpenAI-compat URL. Single-GPU only in v1 (422 otherwise)."""
     filename = upload.safe_filename(payload.file_name or "")
     if not filename:
         return _error(400, "file_name required (letters/digits/dots/"
@@ -3701,11 +3713,21 @@ async def admin_deploy_serverless(
         return _error(400, "file_name must be a .gguf file")
     if payload.size_gb <= 0:
         return _error(400, "size_gb required")
-    if payload.source not in (*modelsearch.SOURCES, "upload"):
-        return _error(400, f"source must be one of "
-                           f"{modelsearch.SOURCES + ('upload',)}")
-    if payload.source != "upload" and not payload.file_url:
-        return _error(400, "file_url required for repo sources")
+    # No pod storage for serverless (user directive 2026-09-21): HF
+    # sources cold-start-download straight from Hugging Face into the
+    # worker's container disk (llama-server --hf-repo/--hf-file); the
+    # only volume path left is source=upload — a local file has no
+    # other way onto RunPod. ModelScope/Ollama URLs can't be fetched
+    # by the worker → rejected.
+    if payload.source not in ("hf", "upload"):
+        return _error(400, "serverless deploy supports source=hf (the "
+                           "worker downloads the GGUF from Hugging "
+                           "Face when it cold-starts) or source=upload "
+                           "(the file is already on one of your "
+                           "volumes)")
+    if payload.source == "hf" and not payload.repo_id:
+        return _error(400, "repo_id required for source=hf (the "
+                           "Hugging Face repo to download from)")
     if payload.source == "upload" and not payload.volume_id:
         return _error(400, "volume_id required for source=upload (the "
                            "file must already be on that volume)")
@@ -3757,59 +3779,38 @@ async def admin_deploy_serverless(
                 "this model — multi-GPU serverless is not supported "
                 "yet"]}})
 
-    # volume: reuse an existing one or create (uploads must reuse —
-    # their file is already on that volume)
-    volumes = opts.get("volumes") or []
-    if payload.volume_id:
-        vol = next((v for v in volumes
+    # Volume: ONLY source=upload — a local file must already sit on a
+    # network volume (serverless workers mount it at /runpod-volume).
+    # HF sources need no volume: the worker downloads at cold start.
+    volume_id = ""
+    dc = payload.data_center_id or ""
+    if payload.source == "upload":
+        vol = next((v for v in (opts.get("volumes") or [])
                     if v.get("id") == payload.volume_id), None)
         if vol is None:
             return _error(400, f"unknown volume {payload.volume_id!r}")
         volume_id = payload.volume_id
-        dc = str(vol.get("dataCenter") or payload.data_center_id or "")
-    elif payload.volume_mode == "create":
-        dc = payload.data_center_id or next(
-            (d.get("id") for d in opts.get("datacenters") or []
-             if d.get("networkVolumeTypes")), "")
-        if not dc:
-            return _error(400, "no data center with network volumes")
-        vol_gb = payload.volume_size_gb or max(
-            20, int(payload.size_gb * 1.2) + 10)
-        try:
-            vol = await runpod.create_volume(
-                f"gw-sl-{payload.alias or 'model'}-{dc}".lower()[:60],
-                dc, vol_gb, "STANDARD", api_key_env)
-        except runpod.RunPodError as e:
-            return _error(502, f"volume create failed: {e}",
-                          code="runpod_error")
-        if not isinstance(vol, dict) or not vol.get("id"):
-            return _error(502, "volume create returned no id",
-                          code="runpod_error")
-        volume_id = str(vol["id"])
-    else:
-        return _error(400, "volume_id (reuse) or volume_mode=create "
-                           "required")
-
-    # repo sources: bootstrap-download the file onto the volume
-    if payload.source != "upload":
-        try:
-            await upload.bootstrap_download(
-                cfg, backend, payload.file_url, filename,
-                int(payload.size_gb * 1e9), volume_id)
-        except upload.UploadError as e:
-            return _error(502, str(e), code="upload_error")
-        except runpod.RunPodError as e:
-            return _error(502, str(e), code="runpod_error")
+        dc = str(vol.get("dataCenter") or "")
 
     alias = (payload.alias or filename.removesuffix(".gguf"))[:40]
-    env = {"LLAMA_ARG_MODEL": f"/workspace/uploads/{filename}",
-           "LLAMA_ARG_CTX_SIZE": str(int(payload.ctx_total or 32768))}
+    if payload.source == "hf":
+        # worker-native download: llama-server --hf-repo --hf-file
+        env = {"LLAMA_ARG_HF_REPO": payload.repo_id,
+               "LLAMA_ARG_HF_FILE": filename,
+               "LLAMA_ARG_CTX_SIZE": str(int(payload.ctx_total or 32768))}
+    else:
+        env = {"LLAMA_ARG_MODEL": f"/runpod-volume/uploads/{filename}",
+               "LLAMA_ARG_CTX_SIZE": str(int(payload.ctx_total or 32768))}
+    # container disk must fit the cold-start HF download (+ runtime);
+    # upload sources read from the volume but keep the same floor
+    disk_gb = max(20, int(payload.size_gb * 1.2) + 10)
     ep_payload = runpod.serverless_endpoint_payload(
         name=f"gw-sl-{alias}".lower()[:60], pool=pool, env=env,
         workers_max=max(1, payload.workers_max),
         idle_timeout=max(1, payload.idle_timeout),
         queue_delay=max(1, payload.queue_delay),
-        network_volume_id=volume_id, data_center_id=dc)
+        network_volume_id=volume_id, data_center_id=dc,
+        disk_gb=disk_gb)
     try:
         ep = await runpod.create_endpoint(ep_payload, api_key_env)
     except runpod.RunPodError as e:

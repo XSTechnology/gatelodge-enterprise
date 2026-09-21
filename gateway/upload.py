@@ -205,10 +205,12 @@ def receiver_spec(gpu_id: str, size_bytes: int,
 
 
 def bootstrap_spec(gpu_id: str, file_url: str, filename: str,
-                   volume_id: str) -> dict[str, Any]:
+                   volume_id: str, data_center_id: str = "") -> dict[str, Any]:
     """Receiver + background-download pod writing onto the VOLUME (the
-    file must persist after this pod dies — container disk would not)."""
-    return {
+    file must persist after this pod dies — container disk would not).
+    DC-pinned to the volume's data center (network volumes are
+    DC-bound; a helper pod in another DC cannot mount it)."""
+    spec: dict[str, Any] = {
         "image": RECEIVER_IMAGE,
         "gpu_type_ids": [gpu_id], "gpu_count": 1,
         "docker_entrypoint": ["sh", "-c"],
@@ -220,6 +222,9 @@ def bootstrap_spec(gpu_id: str, file_url: str, filename: str,
         "source_file": "serverless-bootstrap",
         "volume_id": volume_id,
     }
+    if data_center_id:
+        spec["data_center_ids"] = [data_center_id]
+    return spec
 
 
 async def probe_receiver(pod_id: str) -> bool:
@@ -378,13 +383,46 @@ async def bootstrap_download(cfg, backend: str, file_url: str,
     """Download a repo file ONTO THE VOLUME via a temporary bootstrap
     pod (receiver in the background + curl in the foreground). The
     receiver's /list is the done-signal; the pod is terminated on
-    success AND failure. Returns {filename, size_bytes, volume_id}."""
+    success AND failure. Returns {filename, size_bytes, volume_id}.
+    GPU: price-ascending retry — the globally cheapest GPU often has
+    no instances in the volume's DC (E2E-proven), so walk the list."""
     env = ((cfg.backends.get(backend) or {}).get("api_key_env")
            or "RUNPOD_API_KEY")
+    # volume's DC (network volumes are DC-bound)
+    try:
+        vols = await runpod.list_volumes(env)
+    except Exception:  # noqa: BLE001 — fall back to unpinned placement
+        vols = []
+    vol_dc = ""
+    for v in vols if isinstance(vols, list) else []:
+        if isinstance(v, dict) and v.get("id") == volume_id:
+            vol_dc = str(v.get("dataCenter") or "")
+            break
+
     opts = await catalog.live_options(env)
-    gpu = _cheapest_gpu(opts)
-    spec = bootstrap_spec(gpu["id"], file_url, filename, volume_id)
-    pod_id = await _deploy_helper(cfg, backend, BOOTSTRAP_MODEL, spec)
+    priced = sorted(
+        (float((g.get("price") or {}).get("secure") or 0), g.get("id", ""))
+        for g in opts.get("gpus", [])
+        if (g.get("price") or {}).get("secure"))
+    if not priced:
+        raise UploadError("no GPU available for the bootstrap pod")
+    pod_id = ""
+    last_err = ""
+    for _, gpu_id in priced:
+        spec = bootstrap_spec(gpu_id, file_url, filename, volume_id,
+                              vol_dc)
+        try:
+            pod_id = await _deploy_helper(cfg, backend, BOOTSTRAP_MODEL,
+                                          spec)
+            break
+        except runpod.RunPodError as e:
+            last_err = str(e)
+            logger.info("bootstrap deploy with %s failed: %s", gpu_id,
+                        last_err[:160])
+            continue
+    if not pod_id:
+        raise UploadError(f"bootstrap pod deploy failed in every GPU "
+                          f"tier (last: {last_err[:200]})")
     try:
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout_s:

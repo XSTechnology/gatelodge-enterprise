@@ -78,17 +78,21 @@ def test_serverless_endpoint_payload():
         name="gw-sl-m", pool="ADA_24",
         env={"LLAMA_ARG_MODEL": "/workspace/uploads/m.gguf"},
         workers_max=3, idle_timeout=10, queue_delay=5,
-        network_volume_id="vol-1", data_center_id="EUR-IS-1")
+        network_volume_id="vol-1", data_center_id="EUR-IS-1",
+        disk_gb=46)
     assert p["type"] == "QUEUE"
-    assert p["gpu"] == {"pools": ["ADA_24"], "count": 1}
+    assert p["gpu"] == {"pools": ["ADA_24"], "count": 1,
+                        "minCudaVersion": "12.8"}
     assert p["workers"] == {"min": 0, "max": 3, "idleTimeout": 10}
     assert p["scaling"] == {"type": "QUEUE_DELAY", "queueDelay": 5}
     assert p["networkVolumes"] == ["vol-1"]
     assert p["dataCenterIds"] == ["EUR-IS-1"]
+    assert p["disk"] == 46
     assert p["env"]["LLAMA_ARG_MODEL"] == "/workspace/uploads/m.gguf"
     # optional attachments omitted when not given
     p2 = rp.serverless_endpoint_payload(name="n", pool="P", env={})
     assert "networkVolumes" not in p2 and "dataCenterIds" not in p2
+    assert "disk" not in p2
 
 
 async def test_create_patch_get_endpoint_wrappers(monkeypatch):
@@ -143,10 +147,59 @@ def test_bootstrap_script():
 
 
 def test_bootstrap_spec_mounts_volume():
-    spec = up.bootstrap_spec("g", "https://x/m.gguf", "m.gguf", "vol-1")
+    spec = up.bootstrap_spec("g", "https://x/m.gguf", "m.gguf", "vol-1",
+                             "EUR-IS-1")
     assert spec["volume_id"] == "vol-1"
+    assert spec["data_center_ids"] == ["EUR-IS-1"]   # volume DC-pinned
     assert spec["alias"] == up.BOOTSTRAP_MODEL
     assert spec["ports"] == "8081/http"
+
+
+async def test_bootstrap_download_retries_gpu_tiers(monkeypatch, tmp_path):
+    """The globally cheapest GPU often has no instances in the volume's
+    DC — the bootstrap walks the price list until a deploy lands."""
+    cfgfile = tmp_path / "gateway_config.json"
+    cfgfile.write_text(json.dumps({
+        "backends": {"rp": {"type": "runpod", "api_key_env": "E",
+                            "models": {}}}}), encoding="utf-8")
+    import gateway.config as gw_config
+
+    cfg = gw_config.GatewayConfig(cfgfile)
+
+    async def fake_vols(env):
+        return [{"id": "vol-1", "dataCenter": "EUR-IS-1"}]
+
+    async def fake_live(env):
+        return {"gpus": [
+            {"id": "cheap", "price": {"secure": 0.1}},
+            {"id": "next", "price": {"secure": 0.3}}]}
+
+    deploys = []
+
+    async def fake_deploy(payload, env):
+        deploys.append(payload)
+        if len(deploys) == 1:
+            raise rp.RunPodError("no instances in DC")
+        return {"id": "pod-bs"}
+
+    async def fake_list(pod_id):
+        return [{"name": "m.gguf", "size": 10}]
+
+    async def fake_term(cfg, backend, key):
+        return {"ok": True}
+
+    monkeypatch.setattr(rp, "list_volumes", fake_vols)
+    monkeypatch.setattr(gw_app.catalog, "live_options", fake_live)
+    monkeypatch.setattr(rp, "deploy_pod", fake_deploy)
+    monkeypatch.setattr(up, "receiver_list", fake_list)
+    monkeypatch.setattr(up, "_terminate_helper", fake_term)
+    out = await up.bootstrap_download(cfg, "rp", "https://x/m.gguf",
+                                      "m.gguf", 10, "vol-1")
+    assert out["volume_id"] == "vol-1"
+    assert len(deploys) == 2                       # cheap failed, next OK
+    # the successful deploy is DC-pinned to the volume's DC
+    assert deploys[1].get("dataCenterIds") == ["EUR-IS-1"] or \
+        "EUR-IS-1" in str(deploys[1])
 
 
 # ── POST /admin/models/deploy-serverless ───────────────────────────────────
@@ -177,8 +230,9 @@ def _patch_deploy(monkeypatch, volume_id="vol-new"):
     return created, boot
 
 
-def test_deploy_serverless_repo_creates_volume_and_endpoint(
-        wired, monkeypatch):
+def test_deploy_serverless_hf_native_download(wired, monkeypatch):
+    """source=hf: NO volume, NO bootstrap pod — the worker downloads
+    from Hugging Face at cold start (no pod storage for serverless)."""
     cfgfile, _ = wired()
     _patch_live(monkeypatch)
     created, boot = _patch_deploy(monkeypatch)
@@ -186,31 +240,33 @@ def test_deploy_serverless_repo_creates_volume_and_endpoint(
         r = client.post("/admin/models/deploy-serverless", json={
             "source": "hf", "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
             "file_name": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-            "file_url": "https://huggingface.co/x/resolve/main/m.gguf",
             "size_gb": 0.49, "gpu_id": "NVIDIA GeForce RTX 4090",
-            "alias": "slm", "workers_max": 2, "idle_timeout": 10,
-            "volume_mode": "create", "data_center_id": "EUR-IS-1"})
+            "alias": "slm", "workers_max": 2, "idle_timeout": 10})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["endpoint_id"] == "ep-sl1" and body["pool"] == "ADA_24"
-    # bootstrap downloaded onto the CREATED volume
-    assert boot[0][1] == "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-    assert boot[0][3] == "vol-new"
-    # endpoint payload: pool, scale-to-zero, model-on-volume env
+    assert body["volume_id"] == ""             # no volume for hf
+    assert boot == []                          # no bootstrap pod ran
+    assert "volume" not in created             # no volume created
     ep = created["endpoint"]
     assert ep["gpu"]["pools"] == ["ADA_24"]
     assert ep["workers"] == {"min": 0, "max": 2, "idleTimeout": 10}
-    assert ep["env"]["LLAMA_ARG_MODEL"] == \
-        "/workspace/uploads/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-    assert ep["networkVolumes"] == ["vol-new"]
-    assert ep["dataCenterIds"] == ["EUR-IS-1"]
+    # worker-native HF download env (llama-server --hf-repo/--hf-file)
+    assert ep["env"]["LLAMA_ARG_HF_REPO"] == \
+        "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+    assert ep["env"]["LLAMA_ARG_HF_FILE"] == \
+        "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    assert "LLAMA_ARG_MODEL" not in ep["env"]
+    assert "networkVolumes" not in ep           # no volume attached
+    assert "dataCenterIds" not in ep            # no DC constraint
+    assert ep["disk"] == 20                     # cold-start download fits
     # config persisted: routing works with zero new code
     raw = json.loads(cfgfile.read_text(encoding="utf-8"))
     spec = raw["backends"]["rp"]["models"]["slm"]
     assert spec["endpoint_id"] == "ep-sl1"
     assert spec["remote_id"] == "slm" and spec["timeout_s"] == 600
     assert spec["serverless"]["pool"] == "ADA_24"
-    assert spec["serverless"]["volume_id"] == "vol-new"
+    assert spec["serverless"]["volume_id"] == ""
 
 
 def test_deploy_serverless_upload_skips_bootstrap(wired, monkeypatch):
@@ -228,6 +284,11 @@ def test_deploy_serverless_upload_skips_bootstrap(wired, monkeypatch):
     ep = created["endpoint"]
     assert ep["networkVolumes"] == ["vol-sl"]
     assert ep["dataCenterIds"] == ["EUR-IS-1"]   # from the volume's DC
+    # serverless workers mount network volumes at /runpod-volume (NOT
+    # the pod-view /workspace)
+    assert ep["env"]["LLAMA_ARG_MODEL"] == \
+        "/runpod-volume/uploads/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    assert "LLAMA_ARG_HF_REPO" not in ep["env"]
 
 
 def test_deploy_serverless_validation(wired, monkeypatch):
@@ -237,25 +298,34 @@ def test_deploy_serverless_validation(wired, monkeypatch):
     with TestClient(gw_app.app) as client:
         # GPU without a serverless pool -> 422
         r = client.post("/admin/models/deploy-serverless", json={
-            "source": "hf", "file_name": "m.gguf",
-            "file_url": "u", "size_gb": 5,
-            "gpu_id": "AMD Instinct MI300X OAM", "volume_id": "vol-sl"})
+            "source": "hf", "repo_id": "o/r",
+            "file_name": "m.gguf", "size_gb": 5,
+            "gpu_id": "AMD Instinct MI300X OAM"})
         assert r.status_code == 422
         # model too big for the single picked GPU -> 422
         r = client.post("/admin/models/deploy-serverless", json={
-            "source": "hf", "file_name": "m.gguf",
-            "file_url": "u", "size_gb": 50,
-            "gpu_id": "NVIDIA GeForce RTX 4090", "volume_id": "vol-sl"})
+            "source": "hf", "repo_id": "o/r",
+            "file_name": "m.gguf", "size_gb": 50,
+            "gpu_id": "NVIDIA GeForce RTX 4090"})
         assert r.status_code == 422
         # no gpu given + nothing single-GPU fits -> 422
         r = client.post("/admin/models/deploy-serverless", json={
-            "source": "hf", "file_name": "m.gguf",
-            "file_url": "u", "size_gb": 500, "volume_id": "vol-sl"})
+            "source": "hf", "repo_id": "o/r",
+            "file_name": "m.gguf", "size_gb": 500})
         assert r.status_code == 422
         # unsafe filename -> 400
         r = client.post("/admin/models/deploy-serverless", json={
-            "source": "hf", "file_name": "a b.gguf",
-            "file_url": "u", "size_gb": 5, "volume_id": "vol-sl"})
+            "source": "hf", "repo_id": "o/r",
+            "file_name": "a b.gguf", "size_gb": 5})
+        assert r.status_code == 400
+        # modelscope/ollama: worker can only fetch from HF -> 400
+        r = client.post("/admin/models/deploy-serverless", json={
+            "source": "modelscope", "file_name": "m.gguf",
+            "size_gb": 5})
+        assert r.status_code == 400
+        # hf without a repo to download from -> 400
+        r = client.post("/admin/models/deploy-serverless", json={
+            "source": "hf", "file_name": "m.gguf", "size_gb": 5})
         assert r.status_code == 400
         # upload source without a volume -> 400
         r = client.post("/admin/models/deploy-serverless", json={

@@ -219,30 +219,39 @@ async def get_endpoint(endpoint_id: str,
 
 # Community standard GGUF worker: llama.cpp server-cuda base + the
 # RunPod job handler; llama-server reads LLAMA_ARG_* env prefixes.
-# Community-maintained — the v4.5 E2E proves it live.
-SERVERLESS_WORKER_IMAGE = "eniewold/llama-cpp-runpod:latest"
+# Community-maintained — the v4.5 E2E proves it live. GHCR image, NOT
+# the bare Docker Hub name: RunPod pulls hit Docker Hub anonymous rate
+# limits → IMAGE_AUTH_ERROR:unauthorized (E2E-proven 2026-09-20).
+SERVERLESS_WORKER_IMAGE = "ghcr.io/eniewold/llama-cpp-runpod:latest"
 
 
 def serverless_endpoint_payload(*, name: str, pool: str, env: dict,
                                 workers_max: int = 1, idle_timeout: int = 5,
                                 queue_delay: int = 4,
                                 network_volume_id: str = "",
-                                data_center_id: str = ""
+                                data_center_id: str = "",
+                                disk_gb: int = 0
                                 ) -> dict[str, Any]:
     """POST /v2/serverless body (shape verified live 2026-09-20).
-    workers.min=0 = scale-to-zero; the endpoint's DC must match the
-    network volume's DC when one is attached."""
+    workers.min=0 = scale-to-zero; disk_gb sizes the workers' container
+    disk (must fit the cold-start HF model download); the endpoint's DC
+    must match the network volume's DC when one is attached. The worker
+    image builds on llama.cpp server-cuda and requires CUDA 12.8+
+    hosts — pinned via gpu.minCudaVersion (README-documented, live in
+    the v4.5 E2E endpoint)."""
     payload: dict[str, Any] = {
         "name": name,
         "image": SERVERLESS_WORKER_IMAGE,
         "type": "QUEUE",
-        "gpu": {"pools": [pool], "count": 1},
+        "gpu": {"pools": [pool], "count": 1, "minCudaVersion": "12.8"},
         "workers": {"min": 0, "max": int(workers_max),
                     "idleTimeout": int(idle_timeout)},
         "scaling": {"type": "QUEUE_DELAY", "queueDelay": int(queue_delay)},
         "env": dict(env),
         "timeout": 300000,
     }
+    if disk_gb:
+        payload["disk"] = int(disk_gb)
     if network_volume_id:
         payload["networkVolumes"] = [network_volume_id]
     if data_center_id:
