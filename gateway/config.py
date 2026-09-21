@@ -288,6 +288,8 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         # docs: policy {executionTimeout, ttl, lowPriority}
                         # merged into every job submission for this model
                         "policy": dict(m["policy"]) if isinstance(m.get("policy"), dict) else {},
+                        # v4.5: deploy provenance (console serverless panel)
+                        "serverless": dict(m["serverless"]) if isinstance(m.get("serverless"), dict) else {},
                     }
                 else:
                     # pod lifecycle — numbers coerced, deploy dict kept raw

@@ -181,6 +181,75 @@ async def delete_endpoint(endpoint_id: str, api_key_env: str) -> Any:
     return await _rest("DELETE", f"/serverless/{endpoint_id}", api_key_env)
 
 
+async def create_endpoint(payload: dict[str, Any],
+                          api_key_env: str) -> dict[str, Any]:
+    """POST /v2/serverless (shape verified live 2026-09-20): {name,
+    image, type: "QUEUE", gpu: {pools: [<pool name>], count: N},
+    workers: {min, max, idleTimeout}, scaling: {type: "QUEUE_DELAY",
+    queueDelay}, env, networkVolumes: [id], dataCenterIds: [dc],
+    timeout} -> 201 endpoint object (id, requestUrls, workers...).
+    Pool names come from the v2 GPU catalog's per-GPU 'pool' field
+    (ADA_24 = 4090, AMPERE_80 = A100-80, HOPPER_141 = H200...;
+    pool null = the GPU has no serverless pool)."""
+    out = await _rest("POST", "/serverless", api_key_env, payload)
+    ep = out if isinstance(out, dict) else {}
+    if not ep.get("id"):
+        raise RunPodError("runpod serverless create returned no id: "
+                          f"{str(out)[:300]}")
+    return ep
+
+
+async def patch_endpoint(endpoint_id: str, payload: dict[str, Any],
+                         api_key_env: str) -> Any:
+    """PATCH /v2/serverless/{id} — editable post-deploy: workers
+    {min, max, idleTimeout}, scaling, env (shape verified live)."""
+    return await _rest("PATCH", f"/serverless/{endpoint_id}",
+                       api_key_env, payload)
+
+
+async def get_endpoint(endpoint_id: str,
+                       api_key_env: str) -> dict[str, Any]:
+    """GET /v2/serverless/{id} — live endpoint state incl. worker
+    counts (ready/running/queued)."""
+    out = await _rest("GET", f"/serverless/{endpoint_id}", api_key_env)
+    return out if isinstance(out, dict) else {}
+
+
+# ── Serverless deploy builder ───────────────────────────────────────────────
+
+# Community standard GGUF worker: llama.cpp server-cuda base + the
+# RunPod job handler; llama-server reads LLAMA_ARG_* env prefixes.
+# Community-maintained — the v4.5 E2E proves it live.
+SERVERLESS_WORKER_IMAGE = "eniewold/llama-cpp-runpod:latest"
+
+
+def serverless_endpoint_payload(*, name: str, pool: str, env: dict,
+                                workers_max: int = 1, idle_timeout: int = 5,
+                                queue_delay: int = 4,
+                                network_volume_id: str = "",
+                                data_center_id: str = ""
+                                ) -> dict[str, Any]:
+    """POST /v2/serverless body (shape verified live 2026-09-20).
+    workers.min=0 = scale-to-zero; the endpoint's DC must match the
+    network volume's DC when one is attached."""
+    payload: dict[str, Any] = {
+        "name": name,
+        "image": SERVERLESS_WORKER_IMAGE,
+        "type": "QUEUE",
+        "gpu": {"pools": [pool], "count": 1},
+        "workers": {"min": 0, "max": int(workers_max),
+                    "idleTimeout": int(idle_timeout)},
+        "scaling": {"type": "QUEUE_DELAY", "queueDelay": int(queue_delay)},
+        "env": dict(env),
+        "timeout": 300000,
+    }
+    if network_volume_id:
+        payload["networkVolumes"] = [network_volume_id]
+    if data_center_id:
+        payload["dataCenterIds"] = [data_center_id]
+    return payload
+
+
 # ── Catalog / volume REST (live option surface for the deploy wizard) ──────
 
 def _first_list(out: Any, *keys: str) -> list[dict[str, Any]]:

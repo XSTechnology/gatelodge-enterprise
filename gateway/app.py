@@ -1264,6 +1264,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 remote_id = backend["models"][model_key]
                 client_name = backend_name
                 cloud_backend = backend
+                stream_timeout = cfg.queue["timeout_s"]
                 if backend.get("type") == "runpod":
                     m = backend["models"][model_key]
                     remote_id = m["remote_id"]
@@ -1272,8 +1273,11 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         "base_url": runpod.serverless_base_url(m["endpoint_id"]),
                         "api_key_env": backend.get("api_key_env") or "RUNPOD_API_KEY",
                     }
+                    # per-model timeout covers serverless cold starts
+                    stream_timeout = (float(m.get("timeout_s") or 0)
+                                      or cfg.queue["timeout_s"])
                 client = cloud.get_cloud_client(client_name, cloud_backend,
-                                                timeout=cfg.queue["timeout_s"])
+                                                timeout=stream_timeout)
                 kwargs: dict[str, Any] = {
                     "model": remote_id,
                     "messages": body.messages, "stream": True,
@@ -3650,6 +3654,302 @@ async def admin_upload_cleanup(payload: UploadCleanupPayload) -> Response:
     cfg.maybe_reload()
     backend = payload.backend or _runpod_api_key_env(cfg)[0]
     return await upload.cleanup_receiver(cfg, backend)
+
+
+# ── Serverless deployment (v4.5) ────────────────────────────────────────────
+
+class ServerlessDeployPayload(BaseModel):
+    """Deploy a model as a RunPod SERVERLESS endpoint: scale-to-zero,
+    no pod lifecycle. Model file must end up on a NETWORK VOLUME —
+    repo sources bootstrap-download it there; source=upload expects the
+    file already on the given volume (the upload receiver writes to
+    /workspace/uploads on volumes it mounts)."""
+    model_config = ConfigDict(extra="ignore")
+
+    backend: str = ""
+    source: str = ""              # hf | modelscope | ollama | upload
+    repo_id: str = ""
+    file_name: str = ""
+    file_url: str = ""            # required unless source=upload
+    size_gb: float = 0
+    gpu_id: str = ""              # catalog GPU with a serverless pool
+    alias: str = ""
+    workers_max: int = 1
+    idle_timeout: int = 5         # minutes
+    queue_delay: int = 4
+    ctx_total: int = 32768
+    volume_mode: str = "reuse"    # reuse | create
+    volume_id: str = ""
+    volume_size_gb: int = 0
+    data_center_id: str = ""
+
+
+@app.post("/admin/models/deploy-serverless")
+async def admin_deploy_serverless(
+        payload: ServerlessDeployPayload) -> Response:
+    """Volume → (repo: bootstrap download | upload: already there) →
+    endpoint create (scale-to-zero) → config persist. Request routing
+    needs NO new code — endpoint_id models already go through the
+    OpenAI-compat URL. Single-GPU only in v1 (422 otherwise). The
+    bootstrap download runs INSIDE this request (blocking — large
+    models take minutes; documented)."""
+    filename = upload.safe_filename(payload.file_name or "")
+    if not filename:
+        return _error(400, "file_name required (letters/digits/dots/"
+                           "dashes/underscores only)")
+    if not filename.lower().endswith(".gguf"):
+        return _error(400, "file_name must be a .gguf file")
+    if payload.size_gb <= 0:
+        return _error(400, "size_gb required")
+    if payload.source not in (*modelsearch.SOURCES, "upload"):
+        return _error(400, f"source must be one of "
+                           f"{modelsearch.SOURCES + ('upload',)}")
+    if payload.source != "upload" and not payload.file_url:
+        return _error(400, "file_url required for repo sources")
+    if payload.source == "upload" and not payload.volume_id:
+        return _error(400, "volume_id required for source=upload (the "
+                           "file must already be on that volume)")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if backend not in rp_backends:
+        return _error(400, f"backend {backend!r} is not a runpod backend")
+    api_key_env = rp_backends[backend].get("api_key_env", "RUNPOD_API_KEY")
+    try:
+        opts = await catalog.live_options(api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+
+    # GPU: must carry a serverless pool (v2 catalog 'pool' field);
+    # single-GPU sizing only in v1
+    gpus = opts.get("gpus") or []
+    if payload.gpu_id:
+        gpu = next((g for g in gpus if g.get("id") == payload.gpu_id), None)
+        if gpu is None:
+            return _error(400, f"unknown GPU {payload.gpu_id!r}")
+        pool = gpu.get("pool")
+        if not pool:
+            return JSONResponse(status_code=422, content={
+                "detail": {"code": "invalid_selection", "errors": [
+                    f"{payload.gpu_id} has no serverless pool — pick a "
+                    "pool-backed GPU (e.g. RTX 4090 / L40S / A100-80)"]}})
+    else:
+        fitting = [g for g in gpus if g.get("pool")
+                   and catalog.custom_ctx_options(
+                       payload.size_gb, float(g.get("memory") or 0))]
+        if not fitting:
+            return JSONResponse(status_code=422, content={
+                "detail": {"code": "invalid_selection", "errors": [
+                    "no single serverless GPU fits this model (~"
+                    f"{catalog.weights_vram_gb(payload.size_gb):.0f} GB "
+                    "VRAM for weights alone; multi-GPU serverless is "
+                    "not supported yet)"]}})
+        gpu = min(fitting, key=lambda g: float(
+            (g.get("price") or {}).get("secure") or 0))
+        pool = gpu["pool"]
+    if not catalog.custom_ctx_options(payload.size_gb,
+                                      float(gpu.get("memory") or 0)):
+        return JSONResponse(status_code=422, content={
+            "detail": {"code": "invalid_selection", "errors": [
+                f"{gpu.get('id')} ({gpu.get('memory')}GB) cannot serve "
+                "this model — multi-GPU serverless is not supported "
+                "yet"]}})
+
+    # volume: reuse an existing one or create (uploads must reuse —
+    # their file is already on that volume)
+    volumes = opts.get("volumes") or []
+    if payload.volume_id:
+        vol = next((v for v in volumes
+                    if v.get("id") == payload.volume_id), None)
+        if vol is None:
+            return _error(400, f"unknown volume {payload.volume_id!r}")
+        volume_id = payload.volume_id
+        dc = str(vol.get("dataCenter") or payload.data_center_id or "")
+    elif payload.volume_mode == "create":
+        dc = payload.data_center_id or next(
+            (d.get("id") for d in opts.get("datacenters") or []
+             if d.get("networkVolumeTypes")), "")
+        if not dc:
+            return _error(400, "no data center with network volumes")
+        vol_gb = payload.volume_size_gb or max(
+            20, int(payload.size_gb * 1.2) + 10)
+        try:
+            vol = await runpod.create_volume(
+                f"gw-sl-{payload.alias or 'model'}-{dc}".lower()[:60],
+                dc, vol_gb, "STANDARD", api_key_env)
+        except runpod.RunPodError as e:
+            return _error(502, f"volume create failed: {e}",
+                          code="runpod_error")
+        if not isinstance(vol, dict) or not vol.get("id"):
+            return _error(502, "volume create returned no id",
+                          code="runpod_error")
+        volume_id = str(vol["id"])
+    else:
+        return _error(400, "volume_id (reuse) or volume_mode=create "
+                           "required")
+
+    # repo sources: bootstrap-download the file onto the volume
+    if payload.source != "upload":
+        try:
+            await upload.bootstrap_download(
+                cfg, backend, payload.file_url, filename,
+                int(payload.size_gb * 1e9), volume_id)
+        except upload.UploadError as e:
+            return _error(502, str(e), code="upload_error")
+        except runpod.RunPodError as e:
+            return _error(502, str(e), code="runpod_error")
+
+    alias = (payload.alias or filename.removesuffix(".gguf"))[:40]
+    env = {"LLAMA_ARG_MODEL": f"/workspace/uploads/{filename}",
+           "LLAMA_ARG_CTX_SIZE": str(int(payload.ctx_total or 32768))}
+    ep_payload = runpod.serverless_endpoint_payload(
+        name=f"gw-sl-{alias}".lower()[:60], pool=pool, env=env,
+        workers_max=max(1, payload.workers_max),
+        idle_timeout=max(1, payload.idle_timeout),
+        queue_delay=max(1, payload.queue_delay),
+        network_volume_id=volume_id, data_center_id=dc)
+    try:
+        ep = await runpod.create_endpoint(ep_payload, api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+
+    def mutator(raw: dict):
+        models = raw.setdefault("backends", {}).setdefault(
+            backend, {}).setdefault("models", {})
+        models[alias] = {
+            "endpoint_id": ep["id"],
+            "remote_id": alias,
+            "alias": alias,
+            # cold starts (worker boot + volume read + load) routinely
+            # exceed the global queue timeout — per-model 600s
+            "timeout_s": 600,
+            "serverless": {
+                "source": payload.source,
+                "repo_id": payload.repo_id,
+                "file_name": filename,
+                "size_gb": payload.size_gb,
+                "gpu_id": gpu.get("id"),
+                "pool": pool,
+                "volume_id": volume_id,
+                "workers_max": max(1, payload.workers_max),
+                "idle_timeout": max(1, payload.idle_timeout),
+            },
+        }
+
+    _mutate_config(mutator)
+    return {"ok": True, "endpoint_id": ep["id"], "model": alias,
+            "backend": backend, "gpu_id": gpu.get("id"), "pool": pool,
+            "volume_id": volume_id,
+            "workers_max": max(1, payload.workers_max),
+            "idle_timeout": max(1, payload.idle_timeout),
+            "request_urls": ep.get("requestUrls") or {}}
+
+
+@app.get("/admin/serverless")
+async def admin_serverless() -> Response:
+    """Serverless panel: configured endpoint models (with deploy
+    provenance) merged with LIVE endpoint state (workers, scaling);
+    account endpoints the gateway doesn't track are listed too."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    entries = []
+    for name, b in cfg.backends.items():
+        if b.get("type") != "runpod":
+            continue
+        for mkey, m in (b.get("models") or {}).items():
+            if isinstance(m, dict) and m.get("endpoint_id"):
+                entries.append({
+                    "backend": name, "model": mkey,
+                    "alias": m.get("alias", mkey),
+                    "endpoint_id": m["endpoint_id"],
+                    "timeout_s": m.get("timeout_s", 0),
+                    **(m.get("serverless") or {})})
+    live: dict[str, dict] = {}
+    for name, b in cfg.backends.items():
+        if b.get("type") == "runpod":
+            env = b.get("api_key_env", "RUNPOD_API_KEY")
+            try:
+                for ep in await runpod.list_endpoints(env):
+                    if isinstance(ep, dict) and ep.get("id"):
+                        live[ep["id"]] = ep
+            except runpod.RunPodError as e:
+                return _error(502, str(e), code="runpod_error")
+            break
+    for e in entries:
+        ep = live.get(e["endpoint_id"])
+        e["exists"] = ep is not None
+        e["live"] = ({k: ep.get(k) for k in
+                      ("name", "workers", "scaling", "gpu", "flashboot")}
+                     if ep else None)
+    tracked = {e["endpoint_id"] for e in entries}
+    others = [{"endpoint_id": ep.get("id"), "name": ep.get("name"),
+               "workers": ep.get("workers")}
+              for eid, ep in live.items() if eid not in tracked]
+    return {"endpoints": entries, "untracked": others}
+
+
+class ServerlessSettingsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    backend: str = ""
+    model: str = ""
+    workers_max: int | None = None
+    idle_timeout: int | None = None    # minutes
+    queue_delay: int | None = None
+
+
+@app.post("/admin/serverless/settings")
+async def admin_serverless_settings(
+        payload: ServerlessSettingsPayload) -> Response:
+    """Edit scaler settings on a deployed endpoint: PATCH /v2/
+    serverless/{id} with the CURRENT workers/scaling objects merged
+    with the requested changes (PATCH replaces whole objects — the
+    get-first-then-merge avoids clobbering unspecified fields)."""
+    if not payload.model:
+        return _error(400, "model required")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    b = cfg.backends.get(backend) or {}
+    m = (b.get("models") or {}).get(payload.model) or {}
+    ep_id = str(m.get("endpoint_id") or "").strip()
+    if not ep_id:
+        return _error(400, f"model {payload.model!r} is not a serverless "
+                           "endpoint model")
+    env = b.get("api_key_env", "RUNPOD_API_KEY")
+    try:
+        cur = await runpod.get_endpoint(ep_id, env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    workers = dict(cur.get("workers") or {})
+    scaling = dict(cur.get("scaling") or {})
+    if payload.workers_max is not None:
+        workers["max"] = max(1, payload.workers_max)
+    if payload.idle_timeout is not None:
+        workers["idleTimeout"] = max(1, payload.idle_timeout)
+    if payload.queue_delay is not None:
+        scaling["queueDelay"] = max(1, payload.queue_delay)
+    try:
+        await runpod.patch_endpoint(ep_id, {"workers": workers,
+                                            "scaling": scaling}, env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    sl = dict(m.get("serverless") or {})
+    if payload.workers_max is not None:
+        sl["workers_max"] = max(1, payload.workers_max)
+    if payload.idle_timeout is not None:
+        sl["idle_timeout"] = max(1, payload.idle_timeout)
+    if sl:
+        def mutator(raw: dict):
+            mspec = (raw.get("backends", {}).get(backend, {})
+                     .get("models", {}).get(payload.model))
+            if isinstance(mspec, dict):
+                mspec["serverless"] = sl
+        _mutate_config(mutator)
+    return {"ok": True, "endpoint_id": ep_id, "workers": workers,
+            "scaling": scaling}
 
 
 # ── Provider registry + RunPod account panel ───────────────────────────────
