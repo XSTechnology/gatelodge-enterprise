@@ -166,6 +166,30 @@ label.dw-radio { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto
 .lc-in:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-soft); }
 select.lc-in { width:auto; padding-right:4px; }
 .lc-budgetbar { margin:6px 0 2px; max-width:340px; }
+/* v4 model finder */
+.fm-chips { display:flex; flex-wrap:wrap; gap:6px; margin:4px 0 10px; }
+.fm-chip { border:1px solid var(--border); border-radius:999px; padding:4px 14px; font-size:.78rem;
+  background:var(--card); color:var(--text-dim); cursor:pointer; font-family:inherit; transition:var(--transition); }
+.fm-chip:hover { border-color:var(--primary); color:var(--primary); }
+.fm-chip.active { background:var(--primary); border-color:var(--primary); color:#fff; }
+.fm-chip.active:hover { color:#fff; filter:brightness(1.08); }
+.fm-group { font-size:.72rem; font-weight:600; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--text-faint); margin:10px 0 6px; }
+.fm-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:7px 10px;
+  border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--card);
+  margin-bottom:6px; cursor:pointer; transition:var(--transition); font-family:inherit;
+  font-size:.85rem; color:var(--text); text-align:left; width:100%; }
+.fm-row:hover { border-color:var(--primary); background:var(--primary-soft); }
+.fm-row:focus-visible { outline:2px solid var(--primary); outline-offset:1px; }
+.fm-name { font-weight:600; overflow-wrap:anywhere; }
+.fm-src { font-size:.64rem; font-weight:700; padding:2px 6px; border-radius:5px; flex:0 0 auto; }
+.fm-src.hf { background:#ffd21e; color:#111; }
+.fm-src.ms { background:#1667d9; color:#fff; }
+.fm-src.oll { background:#3a3f4b; color:#fff; }
+.fm-cap { display:inline-block; font-size:.66rem; font-weight:600; padding:1px 7px; border-radius:5px; }
+.fm-cap.solid { background:var(--primary-soft); color:var(--primary); }
+.fm-cap.dim { border:1px solid var(--border); color:var(--text-faint); }
+.fm-expert-box { border-top:1px dashed var(--border); margin-top:12px; padding-top:10px; }
 @media (max-width:600px){ body{padding:12px} .settings-grid{grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
   .cat-btn{padding:12px 6px;font-size:.75rem} .modal{padding:16px}
   .bw-panel{padding:14px} .bw-logs{height:240px} }
@@ -1210,6 +1234,858 @@ function addServerless() {
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
+// ---------- Find a model (v4: task chips → repo search → file pick →
+// custom deploy or local-file upload). Reuses the deploy wizard's
+// catalog cache (_dwCatalog) and its boot-watch / tried-list renderers. ----------
+var _fmTasks = [
+  {key: 'chat', label: 'Chat', full: ''},
+  {key: 'vision', label: 'Vision', full: ''},
+  {key: 'deep_think', label: 'Deep think', full: ''},
+  {key: 'coding', label: 'Coding', full: ''},
+  {key: 'business', label: 'Business', full: ''}];
+var _fmTask = '';     // active task key ('' = all)
+var _fmLast = null;   // last /admin/models/search response
+var _fmFiles = null;  // last /admin/models/files response
+var _fmPick = null;   // chosen file: {source, repoId, upload, podId,
+                      //  file: {name, quant, size_gb, url}, mmproj|null}
+var _fmPlan = null;   // last /admin/models/plan response
+var _fmState = {gpuId: null, gpuCount: 1, cloud: 'secure', ctxKey: null,
+                dcId: '', volumeMode: 'none', volumeSizeGb: 0,
+                volumeType: 'STANDARD', diskGb: 0, idleS: 1800,
+                alias: '', expert: false};
+var _fmMsg = null;    // {type:'ok'|'err', html} — custom-deploy banner
+var _fmUp = null;     // upload session {podId, reused, filename, sizeBytes,
+                      //  file, xhr, timer, got, done}
+var _fmCleaned = false; // receiver pod cleaned up
+
+function buildModelFinder() {
+  return '<div class="widget"><h3>🔎 Find a model</h3>' +
+    '<div class="fm-chips" id="fm-chips">' + fmChipsHtml() + '</div>' +
+    '<div class="srow"><label for="fm-q">Search GGUF repos</label>' +
+    '<input id="fm-q" placeholder="e.g. qwen3, glm, unsloth/Qwen3-8B-GGUF" ' +
+    'style="flex:1;min-width:220px" onkeydown="fmOnQKey(event)">' +
+    '<select id="fm-source" onchange="fmSearch()">' +
+    '<option value="all">All sources</option>' +
+    '<option value="hf">HuggingFace</option>' +
+    '<option value="modelscope">ModelScope</option>' +
+    '<option value="ollama">Ollama</option></select>' +
+    '<button class="btn" onclick="fmSearch()">Search</button></div>' +
+    '<div id="fm-results"><div class="muted" style="margin:8px 0 0">Pick a task above or type a query — recommended recipes and repo results appear here.</div></div>' +
+    '<div id="fm-files"></div>' +
+    '<div id="fm-config"></div>' +
+    fmUploadCard() +
+    '</div>';
+}
+function fmInit() {}
+function fmRestore() { // re-render persisted state after a tab switch
+  if (_fmLast) fmRenderResults();
+  if (_fmFiles) fmRenderFiles();
+  if (_fmPick) fmRenderConfig();
+  var up = _fmUp;
+  if (up && !up.done) {
+    var btn = document.getElementById('fm-up-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Uploading…'; }
+    fmUpTick(up.got);
+  }
+}
+
+// ----- task chips -----
+function fmChipsHtml() {
+  var html = '';
+  for (var i = 0; i < _fmTasks.length; i++) {
+    var t = _fmTasks[i];
+    html += '<button type="button" class="fm-chip' + (_fmTask === t.key ? ' active' : '') +
+      '" onclick="fmSetTask(\'' + esc(t.key) + '\')" title="' +
+      esc(t.full || t.label) + '">' + esc(t.label) + '</button>';
+  }
+  return html;
+}
+function fmSetTask(key) {
+  _fmTask = (_fmTask === key) ? '' : key; // click the active chip again to clear
+  var box = document.getElementById('fm-chips');
+  if (box) box.innerHTML = fmChipsHtml();
+  fmSearch();
+}
+// fold the backend's long labels in as chip tooltips
+function fmMergeTaskTitles(tasks) {
+  if (!tasks || !tasks.length) return;
+  for (var i = 0; i < tasks.length; i++) {
+    var t = tasks[i] || {};
+    for (var j = 0; j < _fmTasks.length; j++)
+      if (_fmTasks[j].key === t.key) { _fmTasks[j].full = String(t.label || ''); break; }
+  }
+  var box = document.getElementById('fm-chips');
+  if (box) box.innerHTML = fmChipsHtml();
+}
+
+// ----- search -----
+function fmOnQKey(e) {
+  if (e && (e.key === 'Enter' || e.keyCode === 13)) fmSearch();
+}
+function fmSearch() {
+  var qEl = document.getElementById('fm-q');
+  var sEl = document.getElementById('fm-source');
+  var q = qEl ? qEl.value.trim() : '';
+  var source = sEl ? sEl.value : 'all';
+  if (!q && !_fmTask) {
+    _fmLast = null;
+    fmRenderResults('<div class="muted" style="margin:8px 0 0">Pick a task above or type a query.</div>');
+    return;
+  }
+  // a new search invalidates any file pick / config below
+  if (_fmPick || _fmFiles) { _fmPick = null; _fmFiles = null; _fmPlan = null; _fmMsg = null;
+    fmRenderFiles(); fmRenderConfig(); }
+  var box = document.getElementById('fm-results');
+  if (box) box.innerHTML = '<div class="muted" style="margin:8px 0 0">searching…</div>';
+  api('/admin/models/search?q=' + encodeURIComponent(q) + '&source=' +
+      encodeURIComponent(source) + '&task=' + encodeURIComponent(_fmTask) + '&limit=10')
+    .then(function (d) {
+      _fmLast = d;
+      fmMergeTaskTitles(d.tasks);
+      fmRenderResults();
+    })
+    .catch(function (e) { _fmLast = null; fmRenderResults(errBox(e)); });
+}
+function fmRenderResults(preHtml) {
+  var box = document.getElementById('fm-results');
+  if (!box) return;
+  if (preHtml != null) { box.innerHTML = preHtml; return; }
+  var d = _fmLast;
+  if (!d) { box.innerHTML = ''; return; }
+  var recipes = d.recipes || [], results = d.results || [], html = '';
+  if (recipes.length) {
+    html += '<div class="fm-group">Recommended — tested recipes (loads the deploy wizard below)</div>';
+    for (var i = 0; i < recipes.length; i++) {
+      var r = recipes[i] || {};
+      html += '<div class="fm-row" role="button" tabindex="0" onclick="fmLoadRecipe(\'' +
+        esc(r.id) + '\')" onkeydown="fmRowKey(event)" title="Load ' + esc(r.model) +
+        ' into the deploy wizard below">' +
+        '<span class="fm-name">' + esc(r.model) + '</span>' +
+        (r.quant ? '<span class="fm-cap solid">' + esc(r.quant) + '</span>' : '') +
+        '<span class="fm-sub">' + esc(r.size_gb) + ' GB</span>' +
+        fmCapBadges(r.capabilities, null) +
+        (r.tagline ? '<span class="fm-sub" style="margin-left:auto">' + esc(r.tagline) + '</span>' : '') +
+        '</div>';
+    }
+  }
+  if (results.length) {
+    html += '<div class="fm-group">Repo results — click to pick a file</div>';
+    for (var k = 0; k < results.length; k++) {
+      var it = results[k] || {};
+      var cls = it.source === 'hf' ? 'hf' : it.source === 'modelscope' ? 'ms' : 'oll';
+      var lbl = it.source === 'hf' ? 'HF' : it.source === 'modelscope' ? 'MS' : 'OLL';
+      html += '<div class="fm-row" role="button" tabindex="0" onclick="fmPickRepo(\'' +
+        esc(it.source) + '\',\'' + esc(it.repo_id) + '\')" onkeydown="fmRowKey(event)">' +
+        '<span class="fm-src ' + cls + '">' + lbl + '</span>' +
+        '<span class="fm-name">' + esc(it.name || it.repo_id) + '</span>' +
+        fmCapBadges(it.capabilities, it.evidence) +
+        '<span class="fm-sub" style="margin-left:auto">' +
+        (it.downloads != null && it.downloads !== '' ? fmFmtNum(it.downloads) + ' ↓&nbsp; ' : '') +
+        (it.url ? '<a href="' + esc(it.url) + '" target="_blank" rel="noopener" ' +
+          'title="open repo page" onclick="fmStop(event)">↗</a>' : '') +
+        '</span></div>';
+    }
+  }
+  if (!html) html = '<div class="muted" style="margin:8px 0 0">No matches — try a shorter query or another source.</div>';
+  box.innerHTML = html;
+}
+function fmRowKey(e) { // keyboard support for the clickable rows
+  if (e && (e.key === 'Enter' || e.key === ' ' || e.keyCode === 13 || e.keyCode === 32)) {
+    if (e.preventDefault) e.preventDefault();
+    var el = e.currentTarget || e.target;
+    if (el && el.click) el.click();
+  }
+}
+function fmStop(e) { if (e && e.stopPropagation) e.stopPropagation(); }
+// curated evidence → solid badge; anything else → dimmed with a tooltip
+function fmCapBadges(caps, evidence) {
+  var html = '', cs = caps || [];
+  for (var i = 0; i < cs.length; i++) {
+    var c = String(cs[i] || '');
+    var ev = evidence ? String(evidence[c] || '') : '';
+    var solid = ev.indexOf('curated:') === 0;
+    html += '<span class="fm-cap ' + (solid ? 'solid' : 'dim') + '"' +
+      (ev ? ' title="' + esc(ev) + '"' : '') + '>' + esc(c) + '</span>';
+  }
+  return html;
+}
+function fmFmtNum(n) {
+  n = Number(n);
+  if (isNaN(n)) return '';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function fmFmtGb(bytes) {
+  var gb = (Number(bytes) || 0) / 1e9;
+  return (gb >= 10 ? gb.toFixed(1) : gb.toFixed(2)) + ' GB';
+}
+
+// ----- recipe → existing deploy wizard (same path as its dropdown) -----
+function fmLoadRecipe(id) {
+  _dwMsg = null;
+  _dwState.recipeId = id;
+  if (!dwRecipe()) { _dwState.recipeId = null; notify('✗ recipe not in catalogue', true); return; }
+  dwApplyRecipeDefaults();
+  dwRenderAll();
+  notify('✓ loaded ' + id + ' into the deploy wizard below');
+  var el = document.getElementById('dw-body');
+  if (el && el.scrollIntoView) el.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+// ----- repo → file picker -----
+function fmPickRepo(source, repoId) {
+  var box = document.getElementById('fm-files');
+  if (box) box.innerHTML = '<div class="muted">listing files…</div>';
+  api('/admin/models/files?source=' + encodeURIComponent(source) +
+      '&repo=' + encodeURIComponent(repoId))
+    .then(function (d) { _fmFiles = d; fmRenderFiles(); })
+    .catch(function (e) { _fmFiles = null; if (box) box.innerHTML = errBox(e); });
+}
+function fmRenderFiles() {
+  var box = document.getElementById('fm-files');
+  if (!box) return;
+  var d = _fmFiles;
+  if (!d) { box.innerHTML = ''; return; }
+  var files = d.files || [], mm = d.mmproj || [];
+  var html = '<div class="fm-group" style="margin-top:10px">Pick a file from <code>' +
+    esc(d.repo_id || '') + '</code></div>';
+  if (mm.length) {
+    var m0 = mm[0] || {};
+    html += '<div class="muted" style="margin:4px 0">👁 vision model — mmproj file <code>' +
+      esc(m0.name || '') + '</code> (' + esc(fmFmtGb(m0.size_bytes)) +
+      ') is included automatically.</div>';
+  }
+  if (!files.length) html += '<div class="muted">No pickable GGUF files in this repo.</div>';
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i] || {};
+    html += '<div class="fm-row" role="button" tabindex="0" onclick="fmPickFile(' + i +
+      ')" onkeydown="fmRowKey(event)" title="' + esc(f.name || '') + '">' +
+      '<span class="fm-name">' + esc(f.name || '') + '</span>' +
+      (f.quant ? '<span class="fm-cap solid">' + esc(f.quant) + '</span>' : '') +
+      '<span class="fm-sub" style="margin-left:auto">' + esc(fmFmtGb(f.size_bytes)) + '</span></div>';
+  }
+  html += '<div style="margin-top:4px"><button class="btn btn-sm" onclick="fmBackToResults()">← back to results</button></div>';
+  box.innerHTML = html;
+}
+function fmBackToResults() {
+  _fmFiles = null; _fmPick = null; _fmPlan = null; _fmMsg = null;
+  fmRenderFiles(); fmRenderConfig();
+}
+function fmPickFile(idx) {
+  if (!_fmFiles) return;
+  var f = (_fmFiles.files || [])[idx];
+  if (!f) return;
+  var mm = (_fmFiles.mmproj || [])[0] || null;
+  _fmPick = {source: _fmFiles.source || 'hf', repoId: _fmFiles.repo_id || '',
+             upload: false, podId: '',
+             file: {name: f.name || '', quant: f.quant || '',
+                    size_gb: Math.round((Number(f.size_bytes) || 0) / 1e9 * 100) / 100,
+                    url: f.url || ''},
+             mmproj: mm ? {name: mm.name || '',
+                           size_gb: Math.round((Number(mm.size_bytes) || 0) / 1e9 * 100) / 100,
+                           url: mm.url || ''} : null};
+  fmConfigFromPick();
+}
+
+// ----- custom-model config panel (SIMPLE + EXPERT) -----
+function fmConfigFromPick() {
+  _fmMsg = null;
+  _fmState.gpuId = null;
+  _fmState.ctxKey = null;
+  _fmState.diskGb = 0;
+  _fmState.alias = '';
+  fmEnsureCatalog(function () { fmAutoPlan(); });
+}
+function fmEnsureCatalog(cb) {
+  if (_dwCatalog) { cb(); return; }
+  api('/admin/catalog').then(function (d) {
+    _dwCatalog = d;
+    dwValidateState();
+    dwRenderAll();
+    cb();
+  }).catch(function (e) { fmRenderConfig(errBox(e)); });
+}
+// available GPUs on the active cloud, cheapest first — the auto default
+function fmGpuCandidates() {
+  var gs = (_dwCatalog && _dwCatalog.gpus) || [], out = [];
+  for (var i = 0; i < gs.length; i++)
+    if (dwGpuAvailable(gs[i], _fmState.cloud)) out.push(gs[i]);
+  out.sort(function (a, b) {
+    var pa = (a.price || {})[_fmState.cloud] || 0, pb = (b.price || {})[_fmState.cloud] || 0;
+    if (pa !== pb) return pa - pb;
+    return a.memory - b.memory;
+  });
+  return out;
+}
+// auto default: cheapest GPU the model fits on (server-side KV math decides)
+function fmAutoPlan() {
+  var p = _fmPick;
+  if (!p) return;
+  var cands = fmGpuCandidates();
+  if (!cands.length) {
+    _fmPlan = null;
+    _fmState.gpuId = null;
+    fmRenderConfig('<div class="dw-msg err" style="margin-top:12px">✗ no live GPU offers on the ' +
+      esc(_fmState.cloud) + ' cloud right now</div>');
+    return;
+  }
+  fmPlanTry(cands, 0);
+}
+function fmPlanTry(cands, idx) {
+  var p = _fmPick;
+  if (!p) return;
+  if (idx >= cands.length) { // nothing fits — keep the form up, deploy stays blocked
+    _fmPlan = null;
+    fmRenderConfig();
+    return;
+  }
+  var g = cands[idx];
+  _fmState.gpuId = g.id;
+  _fmState.gpuCount = 1;
+  var box = document.getElementById('fm-config');
+  if (box) box.innerHTML = '<div class="muted" style="margin-top:12px">checking fit on ' +
+    esc(g.id) + '…</div>';
+  api('/admin/models/plan?size_gb=' + encodeURIComponent(p.file.size_gb) +
+      '&mmproj_gb=' + encodeURIComponent(p.mmproj ? p.mmproj.size_gb : 0) +
+      '&gpu_id=' + encodeURIComponent(g.id) + '&gpu_count=1&cloud=' + _fmState.cloud)
+    .then(function (pl) {
+      if (!_fmPick) return;
+      if (pl && pl.fits) {
+        _fmPlan = pl;
+        _fmState.ctxKey = pl.ctx_default || (pl.ctx_options[0] && pl.ctx_options[0].key) || null;
+        fmRenderConfig();
+      } else {
+        fmPlanTry(cands, idx + 1);
+      }
+    })
+    .catch(function () { if (_fmPick) fmPlanTry(cands, idx + 1); });
+}
+// manual re-plan for the currently selected GPU + count + cloud
+function fmPlanCurrent() {
+  var p = _fmPick;
+  if (!p || !_fmState.gpuId) return;
+  api('/admin/models/plan?size_gb=' + encodeURIComponent(p.file.size_gb) +
+      '&mmproj_gb=' + encodeURIComponent(p.mmproj ? p.mmproj.size_gb : 0) +
+      '&gpu_id=' + encodeURIComponent(_fmState.gpuId) +
+      '&gpu_count=' + _fmState.gpuCount + '&cloud=' + _fmState.cloud)
+    .then(function (pl) {
+      if (!_fmPick) return;
+      _fmPlan = pl;
+      var co = (pl && pl.ctx_options) || [], found = false;
+      for (var i = 0; i < co.length; i++) if (co[i].key === _fmState.ctxKey) found = true;
+      if (!found) _fmState.ctxKey = (pl && pl.ctx_default) || (co[0] && co[0].key) || null;
+      fmRenderConfig();
+    })
+    .catch(function (e) {
+      _fmPlan = null;
+      _fmMsg = {type: 'err', html: '<b>✗ fit check failed</b> — ' + esc(e.message)};
+      fmRenderConfig();
+    });
+}
+function fmRenderConfig(preHtml) {
+  var box = document.getElementById('fm-config');
+  if (!box) return;
+  box.innerHTML = (preHtml != null) ? preHtml : fmConfigHtml();
+}
+function fmConfigHtml() {
+  var p = _fmPick;
+  if (!p) return '';
+  var g = _fmState.gpuId ? dwFindGpu(_fmState.gpuId) : null;
+  var avail = dwGpuAvailable(g, _fmState.cloud);
+  var co = (_fmPlan && _fmPlan.ctx_options) || [];
+  var html = '<div class="fm-expert-box">';
+  html += '<div class="kv"><b>Deploy custom model</b> — <code>' + esc(p.file.name) +
+    '</code> (' + esc(String(p.file.size_gb)) + ' GB' +
+    (p.repoId ? ' · from ' + esc(p.repoId) : '') + ')' +
+    (p.mmproj ? ' · 👁 +mmproj ' + esc(String(p.mmproj.size_gb)) + ' GB' : '') + '</div>';
+  if (p.upload)
+    html += '<div class="muted">from local upload — receiver pod <code>' + esc(p.podId) +
+      '</code> · ' + fmCleanBtnHtml() + '</div>';
+  // GPU (SIMPLE)
+  html += '<div class="srow"><label for="fm-gpu">GPU type</label>' +
+    '<select id="fm-gpu" onchange="fmOnGpuChange()">' + fmGpuOptions() + '</select>' +
+    (g && avail ? '<span class="muted">' + esc(String(g.memory)) + ' GB per GPU</span>' : '') + '</div>';
+  // Context preset (same dropdown in SIMPLE and EXPERT)
+  html += '<div class="srow"><label for="fm-ctx">Context preset</label>';
+  if (co.length) {
+    html += '<select id="fm-ctx" onchange="fmOnCtxChange()">';
+    for (var i = 0; i < co.length; i++) {
+      var c = co[i];
+      html += '<option value="' + esc(c.key) + '"' + (c.key === _fmState.ctxKey ? ' selected' : '') + '>' +
+        esc(c.label + (c.kv_est_gb ? ' (~' + c.kv_est_gb + ' GB KV)' : '')) + '</option>';
+    }
+    html += '</select>';
+  } else html += '<span class="muted">— no fitting preset for this GPU</span>';
+  html += '</div>';
+  // Idle auto-stop (same options as the wizard; default 30 min)
+  html += '<div class="srow"><label for="fm-idle">Idle auto-stop</label>' +
+    '<select id="fm-idle" onchange="fmOnIdleChange()">' + fmIdleOptions() + '</select>' +
+    '<span class="muted">watchdog stops the pod when idle — resumable, storage keeps billing</span></div>';
+  // EXPERT extras
+  if (_fmState.expert) {
+    html += '<div class="srow"><label for="fm-count">GPU count</label>' +
+      '<select id="fm-count" onchange="fmOnCountChange()">' + fmCountOptions() + '</select></div>';
+    html += '<div class="srow"><label for="fm-cloud">Cloud</label>' +
+      '<select id="fm-cloud" onchange="fmOnCloudChange()">' +
+      '<option value="secure"' + (_fmState.cloud === 'secure' ? ' selected' : '') + '>secure</option>' +
+      '<option value="community"' + (_fmState.cloud === 'community' ? ' selected' : '') +
+      '>community (spot — can be preempted)</option></select></div>';
+    html += fmVolumeRows();
+    html += '<div class="srow"><label for="fm-alias">Alias</label>' +
+      '<input id="fm-alias" placeholder="(from filename)" value="' + esc(_fmState.alias) +
+      '" oninput="fmOnAliasInput()"></div>';
+    html += '<div class="srow"><label for="fm-disk">Container disk (GB)</label>' +
+      '<input id="fm-disk" type="number" min="0" value="' + (_fmState.diskGb || '') +
+      '" placeholder="auto" oninput="fmOnDiskInput()">' +
+      '<span class="muted">blank = auto (~' +
+      esc(String((_fmPlan && _fmPlan.disk_min_gb) || 20)) + ' GB min)</span></div>';
+  }
+  html += '<div style="margin:2px 0 4px"><button type="button" class="btn btn-sm" onclick="fmOnExpertToggle()">' +
+    (_fmState.expert ? '▾ hide expert options' : '▸ expert options') + '</button></div>';
+  // cost + fit lines + deploy
+  html += '<div class="dw-cost" id="fm-cost">' + fmCostHtml() + '</div>';
+  html += '<div class="muted" id="fm-vram">' + fmVramHtml() + '</div>';
+  html += '<div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
+    '<button id="fm-deploy-btn" class="btn btn-primary"' + (fmDeployable() ? '' : ' disabled') +
+    ' onclick="fmDeploy()">Deploy</button>' +
+    '<span class="muted">downloads the file at boot, then serves it — billing starts immediately</span></div>';
+  if (_fmMsg) html += '<div class="dw-msg ' + _fmMsg.type + '" style="margin-top:10px">' + _fmMsg.html + '</div>';
+  html += '</div>';
+  return html;
+}
+function fmGpuOptions() {
+  if (!_dwCatalog) return '<option value="">loading GPU options…</option>';
+  var gs = _dwCatalog.gpus || [], avail = [], other = [];
+  for (var i = 0; i < gs.length; i++) {
+    if (dwGpuAvailable(gs[i], _fmState.cloud)) avail.push(gs[i]); else other.push(gs[i]);
+  }
+  avail.sort(function (a, b) {
+    var pa = (a.price || {})[_fmState.cloud] || 0, pb = (b.price || {})[_fmState.cloud] || 0;
+    if (pa !== pb) return pa - pb;
+    return a.memory - b.memory;
+  });
+  other.sort(function (a, b) { return a.id < b.id ? -1 : 1; });
+  var all = avail.concat(other), html = '';
+  for (var k = 0; k < all.length; k++) {
+    var g = all[k];
+    var price = (g.price || {})[_fmState.cloud];
+    var lbl = g.id + ' (' + g.memory + ' GB)';
+    if (price > 0) lbl += ' — $' + price + '/hr';
+    if (!dwGpuAvailable(g, _fmState.cloud)) lbl += ' (unavailable)';
+    html += '<option value="' + esc(g.id) + '"' + (g.id === _fmState.gpuId ? ' selected' : '') + '>' +
+      esc(lbl) + '</option>';
+  }
+  return html;
+}
+function fmCountOptions() {
+  var g = dwFindGpu(_fmState.gpuId);
+  var maxC = g ? Math.min((g.maxCount || {})[_fmState.cloud] || 0, 8) : 1;
+  if (maxC < 1) maxC = 1;
+  var html = '';
+  for (var i = 1; i <= maxC; i++)
+    html += '<option value="' + i + '"' + (i === _fmState.gpuCount ? ' selected' : '') + '>' + i + '</option>';
+  return html;
+}
+function fmIdleOptions() {
+  var s = _fmState.idleS;
+  var opts = [[0, 'Off — keep running until I stop it'], [900, 'after 15 min idle'],
+    [1800, 'after 30 min idle'], [3600, 'after 1 h idle'], [7200, 'after 2 h idle']];
+  var html = '';
+  for (var i = 0; i < opts.length; i++)
+    html += '<option value="' + opts[i][0] + '"' + (s === opts[i][0] ? ' selected' : '') + '>' +
+      opts[i][1] + '</option>';
+  return html;
+}
+// EXPERT storage: deploy-custom supports none | create (no existing-volume attach)
+function fmVolumeRows() {
+  var st = _fmState;
+  var html = '<div class="srow"><label>Storage volume</label>' +
+    '<label class="dw-radio" for="fm-vm-none"><input type="radio" name="fm-vmode" id="fm-vm-none" value="none"' +
+    (st.volumeMode !== 'create' ? ' checked' : '') + ' onchange="fmOnVolModeChange(\'none\')"> none — download at boot (ephemeral disk)</label>' +
+    '<label class="dw-radio" for="fm-vm-create"><input type="radio" name="fm-vmode" id="fm-vm-create" value="create"' +
+    (st.volumeMode === 'create' ? ' checked' : '') + ' onchange="fmOnVolModeChange(\'create\')"> create new — downloads persist</label></div>';
+  if (st.volumeMode === 'create') {
+    var caps = dwCapableDcs();
+    var dcOk = false;
+    for (var i = 0; i < caps.length; i++) if (caps[i].id === st.dcId) dcOk = true;
+    if (!dcOk) st.dcId = caps.length ? caps[0].id : '';
+    html += '<div class="srow"><label for="fm-volsize">Volume size (GB)</label>' +
+      '<input id="fm-volsize" type="number" min="1" value="' + (st.volumeSizeGb || '') +
+      '" placeholder="auto" oninput="fmOnVolSizeInput()"></div>';
+    html += '<div class="srow"><label for="fm-vtype">Volume type</label>' +
+      '<select id="fm-vtype" onchange="fmOnVTypeChange()">' + fmVTypeOptions() + '</select></div>';
+    html += '<div class="srow"><label for="fm-dc">Data center</label>' +
+      '<select id="fm-dc" onchange="fmOnDcChange()">' + fmDcOptions() + '</select></div>';
+  }
+  return html;
+}
+function fmDcOptions() {
+  var caps = dwCapableDcs(), html = '';
+  for (var i = 0; i < caps.length; i++)
+    html += '<option value="' + esc(caps[i].id) + '"' + (caps[i].id === _fmState.dcId ? ' selected' : '') + '>' +
+      esc(caps[i].id + ' (' + (caps[i].region || '—') + ')') + '</option>';
+  return html;
+}
+function fmVTypeOptions() {
+  var types = dwDcTypes(_fmState.dcId), html = '';
+  if (!types.length) return '<option value="STANDARD">STANDARD</option>';
+  for (var i = 0; i < types.length; i++)
+    html += '<option value="' + esc(types[i]) + '"' + (types[i] === _fmState.volumeType ? ' selected' : '') + '>' +
+      esc(types[i]) + '</option>';
+  return html;
+}
+function fmCostHtml() {
+  if (_fmPlan && _fmPlan.est_cost_per_hr != null)
+    return '$' + Number(_fmPlan.est_cost_per_hr).toFixed(2) + '/hr' +
+      (_fmState.cloud === 'community' ? ' <span class="muted">(spot)</span>' : '');
+  return '<span class="muted">—</span>';
+}
+function fmVramHtml() {
+  if (!_fmPlan) return 'pick a GPU to check the fit';
+  if (!_fmPlan.fits)
+    return '<span class="dw-vram-low">✗ this GPU combo does not fit — pick a bigger GPU or a smaller quant</span>';
+  var html = 'needs ~' + esc(String(_fmPlan.weights_vram_gb)) + ' GB VRAM (weights) · ' +
+    esc(String(_fmPlan.vram_total_gb)) + ' GB on ' + esc(_fmPlan.gpu_id) + ' × ' +
+    esc(String(_fmPlan.gpu_count));
+  var co = _fmPlan.ctx_options || [];
+  for (var i = 0; i < co.length; i++)
+    if (co[i].key === _fmState.ctxKey && co[i].vram_need_gb != null)
+      html += ' · preset needs ~' + esc(String(co[i].vram_need_gb)) + ' GB';
+  if (_fmPlan.disk_min_gb) html += ' · disk auto ≥ ' + esc(String(_fmPlan.disk_min_gb)) + ' GB';
+  return html;
+}
+function fmDeployable() {
+  return !!(_fmState.gpuId && _fmPlan && _fmPlan.fits && _fmState.ctxKey);
+}
+
+// ----- config event handlers -----
+function fmOnGpuChange() {
+  _fmState.gpuId = document.getElementById('fm-gpu').value || null;
+  _fmMsg = null;
+  var g = dwFindGpu(_fmState.gpuId);
+  if (g) {
+    var maxC = Math.min((g.maxCount || {})[_fmState.cloud] || 0, 8);
+    if (_fmState.gpuCount > maxC) _fmState.gpuCount = Math.max(1, maxC);
+  }
+  fmPlanCurrent();
+}
+function fmOnCountChange() {
+  _fmState.gpuCount = parseInt(document.getElementById('fm-count').value, 10) || 1;
+  _fmMsg = null;
+  fmPlanCurrent();
+}
+function fmOnCloudChange() {
+  _fmState.cloud = document.getElementById('fm-cloud').value === 'community' ? 'community' : 'secure';
+  _fmMsg = null;
+  fmAutoPlan(); // re-pick the cheapest fitting GPU on this cloud
+}
+function fmOnCtxChange() {
+  _fmState.ctxKey = document.getElementById('fm-ctx').value;
+  fmRenderConfig(); // the VRAM line reflects the chosen preset
+}
+function fmOnIdleChange() { _fmState.idleS = parseInt(document.getElementById('fm-idle').value, 10) || 0; }
+function fmOnDiskInput() { _fmState.diskGb = parseInt(document.getElementById('fm-disk').value, 10) || 0; }
+function fmOnAliasInput() { _fmState.alias = document.getElementById('fm-alias').value; }
+function fmOnVolModeChange(mode) {
+  _fmState.volumeMode = mode;
+  if (mode === 'create') {
+    var caps = dwCapableDcs(), dcOk = false;
+    for (var i = 0; i < caps.length; i++) if (caps[i].id === _fmState.dcId) dcOk = true;
+    if (!dcOk) _fmState.dcId = caps.length ? caps[0].id : '';
+    var types = dwDcTypes(_fmState.dcId);
+    if (types.length && types.indexOf(_fmState.volumeType) < 0) _fmState.volumeType = types[0];
+  }
+  fmRenderConfig();
+}
+function fmOnVolSizeInput() { _fmState.volumeSizeGb = parseInt(document.getElementById('fm-volsize').value, 10) || 0; }
+function fmOnVTypeChange() { _fmState.volumeType = document.getElementById('fm-vtype').value; }
+function fmOnDcChange() {
+  _fmState.dcId = document.getElementById('fm-dc').value;
+  var types = dwDcTypes(_fmState.dcId);
+  if (types.length && types.indexOf(_fmState.volumeType) < 0) _fmState.volumeType = types[0];
+  fmRenderConfig(); // volume types follow the data center
+}
+function fmOnExpertToggle() { _fmState.expert = !_fmState.expert; fmRenderConfig(); }
+
+// ----- custom deploy -----
+function fmBuildPayload() {
+  var p = _fmPick, st = _fmState;
+  return {
+    backend: '',
+    // deploy-custom validates source against (hf|modelscope|ollama) and only
+    // consumes file_url — receiver-hosted uploads therefore travel as "hf"
+    source: p.upload ? 'hf' : p.source,
+    repo_id: p.repoId || '',
+    file_name: p.file.name,
+    file_url: p.file.url,
+    size_gb: p.file.size_gb,
+    mmproj_name: p.mmproj ? p.mmproj.name : '',
+    mmproj_url: p.mmproj ? p.mmproj.url : '',
+    mmproj_size_gb: p.mmproj ? p.mmproj.size_gb : 0,
+    gpu_id: st.gpuId,
+    gpu_count: st.gpuCount,
+    cloud: st.cloud,
+    data_center_id: st.dcId || '',
+    volume_mode: st.volumeMode === 'create' ? 'create' : 'none',
+    volume_size_gb: st.volumeMode === 'create' ? (st.volumeSizeGb || 0) : 0,
+    volume_type: st.volumeType || 'STANDARD',
+    ctx_key: st.ctxKey || '',
+    container_disk_gb: st.diskGb || 0,
+    idle_stop_s: st.idleS,
+    alias: (st.alias || '').trim()
+  };
+}
+function fmDeploy() {
+  var p = _fmPick;
+  if (!p || !fmDeployable()) return;
+  var cost = (_fmPlan && _fmPlan.est_cost_per_hr != null)
+    ? ' · est $' + Number(_fmPlan.est_cost_per_hr).toFixed(2) + '/hr' : '';
+  var msg = 'Deploy ' + p.file.name + '?\n' +
+    _fmState.gpuCount + '× ' + _fmState.gpuId + ' (' + _fmState.cloud + ')' + cost + '\n' +
+    'The pod bills per hour until you stop it.';
+  if (!confirm(msg)) return;
+  var btn = document.getElementById('fm-deploy-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deploying…'; }
+  var headers = {'Content-Type': 'application/json'};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  fetch('/admin/models/deploy-custom', {method: 'POST', headers: headers,
+      body: JSON.stringify(fmBuildPayload())})
+    .then(function (r) {
+      return r.json().then(
+        function (d) { return {status: r.status, data: d}; },
+        function () { return {status: r.status, data: null}; });
+    })
+    .then(function (res) {
+      if (res.status === 200 && res.data && res.data.ok) {
+        _fmMsg = {type: 'ok', html: fmSuccessHtml(res.data)};
+        notify('✓ deploying ' + res.data.model);
+        bwOpenDeploy(res.data);
+        refreshRunpodPods();
+      } else {
+        _fmMsg = {type: 'err', html: fmDeployErrHtml(res)};
+      }
+      fmRenderConfig();
+    })
+    .catch(function (e) {
+      _fmMsg = {type: 'err', html: '<b>✗ Deploy failed</b> — ' + esc(e.message)};
+      fmRenderConfig();
+    });
+}
+function fmDeployErrHtml(res) {
+  var d = res.data || {};
+  var errs = d.detail && d.detail.errors; // 422 invalid_selection
+  if (errs && errs.length) {
+    var lis = '';
+    for (var i = 0; i < errs.length; i++) lis += '<li>' + esc(errs[i]) + '</li>';
+    return '<b>✗ This configuration cannot be deployed</b><ul>' + lis + '</ul>';
+  }
+  if (d.error && d.error.message && d.tried && d.tried.length) // 502 with tried list
+    return '<b>✗ Deploy failed</b> — ' + esc(d.error.message) + clTriedHtml(d.tried);
+  var m = (d.detail && (d.detail.message || d.detail.code)) ||
+    (d.error && d.error.message) || ('HTTP ' + res.status);
+  return '<b>✗ Deploy failed</b> — ' + esc(m);
+}
+function fmSuccessHtml(d) {
+  var url = location.origin + '/v1/chat/completions';
+  var html = '<b>✓ Deploying ' + esc(d.model) + '</b>' +
+    (d.name ? ' — <code>' + esc(d.name) + '</code>' : '') +
+    ' · pod <code>' + esc(d.pod_id) + '</code>' +
+    (d.est_cost_per_hr != null ? ' · est $' + Number(d.est_cost_per_hr).toFixed(2) + '/hr' : '');
+  var landed = d.landed || {};
+  if (landed.gpu_id && (landed.gpu_id !== _fmState.gpuId ||
+                        landed.gpu_count !== _fmState.gpuCount)) {
+    html += '<div style="margin-top:6px;color:var(--warning)">⚠ landed on ' +
+      esc(landed.gpu_id) + ' × ' + esc(landed.gpu_count) +
+      (landed.est_cost_per_hr != null ? ' ($' + Number(landed.est_cost_per_hr).toFixed(2) + '/hr)' : '') +
+      ' instead — your pick was too small or had no capacity</div>';
+  }
+  html += clTriedHtml(d.tried);
+  html += '<div style="margin-top:6px">Use model "' + esc(d.model) +
+    '" in any OpenAI- or Anthropic-compatible tool → <code>' + esc(url) + '</code></div>' +
+    '<div class="dw-hint">Boot takes a few minutes (weights download first) — a boot-watch popup is tracking it, and it appears in the RunPod servers widget.</div>';
+  if (_fmPick && _fmPick.upload) {
+    html += '<div style="margin-top:8px">' + fmCleanBtnHtml() +
+      ' <span class="muted">the model pod now has the file — the receiver is no longer needed</span></div>';
+  }
+  return html;
+}
+function fmCleanBtnHtml() {
+  if (_fmCleaned) return '<span class="muted">receiver cleaned up</span>';
+  return '<button class="btn btn-sm" onclick="fmCleanup()">clean up receiver pod</button>';
+}
+function fmCleanup() {
+  if (!confirm('Terminate the upload receiver pod? The uploaded file goes with it.')) return;
+  api('/admin/models/upload-cleanup', {method: 'POST', body: {}})
+    .then(function (d) {
+      _fmUp = null;
+      _fmCleaned = true;
+      notify(d && d.terminated ? '✓ receiver pod terminated' : '✓ receiver cleaned up');
+      fmRenderConfig();
+      fmUpSetProgress('<div class="muted">receiver pod cleaned up.</div>');
+      var btn = document.getElementById('fm-up-btn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Upload to a pod'; }
+    })
+    .catch(function (e) { notify('✗ cleanup failed — ' + e.message, true); });
+}
+
+// ----- local-file upload (receiver pod + gateway relay) -----
+function fmUploadCard() {
+  return '<div class="fm-expert-box" style="margin-top:12px">' +
+    '<div class="kv"><b>Local file</b> — upload a .gguf from this PC to a temporary ' +
+    'receiver pod, then deploy it like any searched model</div>' +
+    '<div class="srow"><label for="fm-up-file">GGUF file</label>' +
+    '<input type="file" id="fm-up-file" onchange="fmUpFileChosen()" style="width:auto;flex:1;min-width:220px"></div>' +
+    '<div id="fm-up-info" class="muted"></div>' +
+    '<div id="fm-up-progress"></div>' +
+    '<div style="margin-top:8px"><button class="btn" id="fm-up-btn" onclick="fmUploadStart()" disabled>Upload to a pod</button></div>' +
+    '<div class="muted" style="margin-top:6px">If you abandon an upload, the receiver pod auto-stops after 30 min idle — or clean it up with the button that appears after the transfer.</div>' +
+    '</div>';
+}
+function fmUpFileChosen() {
+  var inp = document.getElementById('fm-up-file');
+  var info = document.getElementById('fm-up-info');
+  var btn = document.getElementById('fm-up-btn');
+  var f = inp && inp.files && inp.files[0];
+  if (!f) { if (info) info.innerHTML = ''; if (btn) btn.disabled = true; return; }
+  var line = esc(f.name) + ' — ' + esc(fmFmtGb(f.size));
+  if (f.size > 20 * 1024 * 1024 * 1024)
+    line += ' · <span style="color:var(--warning)">over the ~20 GB upload limit — ' +
+      'the server will reject this and suggest hosting the file and pasting its URL instead</span>';
+  if (info) info.innerHTML = line;
+  if (btn) btn.disabled = !!_fmUp;
+}
+function fmUploadStart() {
+  var inp = document.getElementById('fm-up-file');
+  var f = inp && inp.files && inp.files[0];
+  if (!f) { notify('✗ choose a .gguf file first', true); return; }
+  if (_fmUp) { notify('✗ an upload is already in progress', true); return; }
+  var btn = document.getElementById('fm-up-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Preparing receiver…'; }
+  fmUpSetProgress('<div class="muted">asking for a receiver pod…</div>');
+  api('/admin/models/upload-init', {method: 'POST',
+      body: {filename: f.name, size_bytes: f.size, volume_id: ''}})
+    .then(function (d) {
+      _fmUp = {podId: d.pod_id, reused: !!d.reused, filename: d.filename || f.name,
+               sizeBytes: f.size, file: f, xhr: null, timer: null, got: -1, done: false};
+      _fmCleaned = false;
+      fmUpRelay();
+    })
+    .catch(function (e) {
+      _fmUp = null;
+      if (btn) { btn.disabled = false; btn.textContent = 'Upload to a pod'; }
+      fmUpSetProgress('<div class="dw-msg err">✗ ' + esc(e.message) + '</div>'); // 413 hint lands here
+      notify('✗ upload init failed — ' + e.message, true);
+    });
+}
+function fmUpRelay() {
+  var up = _fmUp;
+  var btn = document.getElementById('fm-up-btn');
+  if (btn) btn.textContent = 'Uploading…';
+  fmUpSetProgress('<div class="muted">relaying to receiver pod <code>' + esc(up.podId) + '</code>' +
+    (up.reused ? ' (reused)' : '') + '…</div>' + fmUpBarHtml(2));
+  fmUpPollStart();
+  var xhr = new XMLHttpRequest();
+  up.xhr = xhr;
+  xhr.open('PUT', '/admin/models/upload');
+  xhr.setRequestHeader('x-pod-id', up.podId);
+  xhr.setRequestHeader('x-filename', up.filename);
+  xhr.setRequestHeader('x-file-size', String(up.sizeBytes));
+  xhr.onload = function () {
+    if (up.done) return;
+    up.done = true;
+    fmUpPollStop();
+    if (xhr.status === 200) { fmFinalize(); return; }
+    var m = 'HTTP ' + xhr.status;
+    try {
+      var b = JSON.parse(xhr.responseText);
+      if (b && b.error && b.error.message) m = b.error.message;
+    } catch (err) {}
+    fmUpFail('✗ relay failed — ' + m);
+  };
+  xhr.onerror = function () {
+    if (!up.done) { up.done = true; fmUpPollStop(); fmUpFail('✗ relay failed — network error'); }
+  };
+  xhr.onabort = function () {
+    if (!up.done) { up.done = true; fmUpPollStop(); fmUpFail('✗ upload cancelled'); }
+  };
+  xhr.send(up.file);
+}
+// the gateway is localhost — browser progress is instant and useless;
+// the receiver's byte count is the REAL progress (polled every 3 s)
+function fmUpPollStart() {
+  fmUpPollStop();
+  _fmUp.timer = setInterval(fmUpPollTick, 3000);
+  fmUpPollTick();
+}
+function fmUpPollStop() {
+  if (_fmUp && _fmUp.timer) { clearInterval(_fmUp.timer); _fmUp.timer = null; }
+}
+function fmUpPollTick() {
+  var up = _fmUp;
+  if (!up || up.done) { fmUpPollStop(); return; }
+  api('/admin/models/upload-status?pod_id=' + encodeURIComponent(up.podId) +
+      '&filename=' + encodeURIComponent(up.filename))
+    .then(function (d) {
+      if (!_fmUp || _fmUp.done) return;
+      fmUpTick(Number(d.size));
+    })
+    .catch(function () { /* receiver not answering yet — keep polling */ });
+}
+function fmUpTick(bytes) {
+  var up = _fmUp;
+  if (!up) return;
+  if (bytes != null && bytes >= 0 && bytes > up.got) up.got = bytes;
+  if (up.got < 0) {
+    fmUpSetProgress('<div class="muted">relaying to receiver pod <code>' + esc(up.podId) + '</code>' +
+      (up.reused ? ' (reused)' : '') + '…</div>' + fmUpBarHtml(2) +
+      '<div class="muted">waiting for the receiver to accept bytes…</div>');
+    return;
+  }
+  var pct = up.sizeBytes ? Math.min(100, Math.round(up.got / up.sizeBytes * 100)) : 0;
+  fmUpSetProgress('<div class="muted">relaying to receiver pod <code>' + esc(up.podId) + '</code>' +
+    (up.reused ? ' (reused)' : '') + '…</div>' + fmUpBarHtml(pct) +
+    '<div class="muted">' + esc(fmtMB(Math.round(up.got / 1048576))) + ' of ' +
+    esc(fmtMB(Math.round(up.sizeBytes / 1048576))) + ' relayed — ' + pct + '%</div>');
+}
+function fmUpBarHtml(pct) {
+  return '<div class="bar" style="max-width:340px;margin:6px 0"><div class="bar-fill" style="width:' +
+    Math.max(2, pct) + '%"></div></div>';
+}
+function fmUpSetProgress(html) {
+  var box = document.getElementById('fm-up-progress');
+  if (box) box.innerHTML = html;
+}
+function fmUpFail(msg) {
+  _fmUp = null;
+  fmUpSetProgress('<div class="dw-msg err">' + esc(msg) + '</div>');
+  var btn = document.getElementById('fm-up-btn');
+  if (btn) { btn.disabled = false; btn.textContent = 'Upload to a pod'; }
+  notify(msg, true);
+}
+function fmFinalize() {
+  var up = _fmUp;
+  fmUpSetProgress('<div class="muted">finalizing…</div>');
+  api('/admin/models/upload-finalize', {method: 'POST',
+      body: {pod_id: up.podId, filename: up.filename, size_bytes: up.sizeBytes}})
+    .then(function (d) {
+      var name = d.filename || up.filename;
+      _fmPick = {source: 'upload', repoId: '', upload: true, podId: up.podId,
+                 file: {name: name, quant: '',
+                        size_gb: Number(d.size_gb) ||
+                          Math.round(up.sizeBytes / 1e9 * 100) / 100,
+                        url: d.file_url},
+                 mmproj: null};
+      _fmUp.done = true;
+      fmUpSetProgress('<div class="muted">✓ uploaded — configure the deploy below · ' +
+        fmCleanBtnHtml() + '</div>');
+      fmConfigFromPick();
+      notify('✓ upload complete — configure the deploy below');
+    })
+    .catch(function (e) { fmUpFail('✗ finalize failed — ' + e.message); });
+}
+
 // ---------- Deploy wizard (catalog recipes) ----------
 var _dwCatalog = null;
 var _dwState = { recipeId: null, cloud: 'secure', gpuId: null, gpuCount: 1,
@@ -1752,7 +2628,8 @@ function clShowProviderPanel(providerId) {
   var panel = document.getElementById('cl-provider-panel');
   if (!panel) return;
   if (providerId === 'runpod') {
-    panel.innerHTML = buildDeployWizard() +
+    panel.innerHTML = buildModelFinder() +
+      buildDeployWizard() +
       '<div class="widget"><h3>Network volumes ' +
       '<button class="btn btn-sm" onclick="clLoadAccount()">⟳ refresh</button></h3>' +
       '<div id="cl-vol-body"><div class="muted">loading…</div></div>' +
@@ -1767,6 +2644,7 @@ function clShowProviderPanel(providerId) {
       'Caps of 0 are off. Alerts land in the banner above.</div></div>' +
       buildRunpodServers();
     dwInit();
+    fmRestore();
     clLoadAccount();
     refreshRunpodPods();
   } else {
