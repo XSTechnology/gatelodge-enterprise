@@ -106,8 +106,10 @@ except ImportError:
 
 from . import cloud
 from . import catalog
+from . import capabilities
 from . import lifecycle
 from . import llamaserver
+from . import modelsearch
 from . import providers
 from . import runpod
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
@@ -3245,6 +3247,56 @@ async def admin_catalog_deploy(payload: CatalogDeployPayload) -> Response:
             "model": model_key, "name": pod.get("name"),
             "est_cost_per_hr": (landed or {}).get("est_cost_per_hr"),
             "landed": landed, "tried": tried}
+
+
+# ── Model finder: search + file listing (v4) ────────────────────────────────
+
+@app.get("/admin/models/search")
+async def admin_models_search(q: str = "", source: str = "all",
+                              task: str = "", limit: int = 10) -> Response:
+    """Find-a-model: task-matched catalogue recipes (shown first) +
+    repo search across HF / ModelScope / Ollama. Empty q → recipes
+    only. task filters BOTH lists by capability (the console's task
+    chooser — business = chat AND deep_think)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    if not q and not task:
+        return _error(400, "q or task required")
+    results: list[dict[str, Any]] = []
+    if q:
+        limit = 10 if not 1 <= limit <= 30 else limit
+        try:
+            results = await modelsearch.search(q, source=source,
+                                               limit=limit)
+        except Exception as e:  # noqa: BLE001 — one bad source ≠ failure
+            logger.warning("model search failed: %s", e)
+        if task:
+            results = [r for r in results if capabilities.task_match(
+                r.get("capabilities", []), task)]
+    ql = q.lower()
+    recipes = [r for r in catalog.public_recipes()
+               if (not task or capabilities.task_match(
+                   r.get("capabilities", []), task))
+               and (not ql or ql in (str(r.get("model", ""))
+                                     + r["id"]).lower())]
+    return {"recipes": recipes, "results": results,
+            "tasks": capabilities.TASKS}
+
+
+@app.get("/admin/models/files")
+async def admin_models_files(source: str = "",
+                             repo: str = "") -> Response:
+    """Pickable GGUF quants (+ mmproj files) for one search result —
+    real sizes and direct download URLs for the custom-model deploy."""
+    if not repo:
+        return _error(400, "repo required")
+    try:
+        return await modelsearch.list_files(source, repo)
+    except ValueError as e:
+        return _error(400, str(e))
+    except Exception as e:  # noqa: BLE001 — upstream errors → 502
+        return _error(502, f"listing {source}:{repo} failed: {e}",
+                      code="modelsource_error")
 
 
 # ── Provider registry + RunPod account panel ───────────────────────────────

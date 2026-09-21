@@ -38,6 +38,7 @@ CATALOG: list[dict[str, Any]] = [
         "model": "Qwen3-8B",
         "quant": "UD-Q4_K_XL",
         "tagline": "Starter — fast, cheap, surprisingly capable",
+        "capabilities": ["chat", "deep_think"],
         "build": "mainline",
         "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
         "repo_url": ("https://huggingface.co/unsloth/Qwen3-8B-GGUF/"
@@ -67,6 +68,7 @@ CATALOG: list[dict[str, Any]] = [
         "model": "Qwen3-30B-A3B",
         "quant": "UD-Q4_K_XL",
         "tagline": "Fast MoE — 30B class, 3B active, quick responses",
+        "capabilities": ["chat", "deep_think"],
         "build": "mainline",
         "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
         "repo_url": ("https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/"
@@ -96,6 +98,7 @@ CATALOG: list[dict[str, Any]] = [
         "model": "Qwen3-32B",
         "quant": "UD-Q4_K_XL",
         "tagline": "Dense 32B — strongest single-GPU generalist",
+        "capabilities": ["chat", "deep_think"],
         "build": "mainline",
         "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
         "repo_url": ("https://huggingface.co/unsloth/Qwen3-32B-GGUF/"
@@ -127,6 +130,7 @@ CATALOG: list[dict[str, Any]] = [
         "quant_glob": "IQ4_XS",
         "tagline": ("Workhorse — 321B MoE (18B active), proven recipe "
                     "(3× A100 EUR-IS-1)"),
+        "capabilities": ["chat", "deep_think"],
         "build": "glm5next",
         "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
         "repo": "unsloth/GLM-5.3-Flash-GGUF",
@@ -156,6 +160,7 @@ CATALOG: list[dict[str, Any]] = [
         "quant": "Q4_K_XL",
         "quant_glob": "Q4_K_XL",
         "tagline": "Workhorse+ — higher-quality quant of GLM-5.3-Flash",
+        "capabilities": ["chat", "deep_think"],
         "build": "glm5next",
         "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
         "repo": "unsloth/GLM-5.3-Flash-GGUF",
@@ -185,6 +190,7 @@ CATALOG: list[dict[str, Any]] = [
         "quant": "UD-IQ4_XS",
         "quant_glob": "IQ4_XS",
         "tagline": "Coder — DeepSeek V4 Flash MoE (sizes estimated)",
+        "capabilities": ["chat", "deep_think", "coding"],
         "build": "glm5next",
         "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
         "repo": "unsloth/DeepSeek-V4-Flash-GGUF",
@@ -213,6 +219,7 @@ CATALOG: list[dict[str, Any]] = [
         "quant_glob": "IQ4_XS",
         "tagline": ("Experimental — GLM-5.3-Flash on ONE AMD MI300X "
                     "(192GB, ROCm build); 32k ctx fits, 64k does not"),
+        "capabilities": ["chat", "deep_think"],
         "build": "glm5next",
         "image": "rocm/pytorch:latest",
         "repo": "unsloth/GLM-5.3-Flash-GGUF",
