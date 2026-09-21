@@ -271,6 +271,10 @@ async def cleanup_receiver(cfg, backend: str) -> dict[str, Any]:
     stopped = False
     if pod_id:
         try:
+            # pre-mark so the watchdog doesn't read our own termination
+            # of the receiver as an unexpected death (E2E-proven bug)
+            from . import lifecycle
+            lifecycle.mark_stopped(pod_id)
             await runpod.terminate_pod(pod_id, env)
             stopped = True
         except Exception:  # noqa: BLE001 — cleanup is best-effort

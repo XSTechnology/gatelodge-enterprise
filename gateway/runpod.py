@@ -1046,6 +1046,16 @@ async def refresh_status(cfg) -> list[dict[str, Any]]:
         for mkey, m in (b.get("models") or {}).items():
             if isinstance(m, dict) and not m.get("endpoint_id"):
                 get_manager(cfg, name, mkey)
+    # drop managers whose model left the config — removed models must
+    # not linger as ghosts (a ghost reads its own cleanup-termination
+    # as an unexpected death; v4 E2E finding 2026-09-20)
+    configured = {(name, mkey)
+                  for name, b in backends.items()
+                  for mkey, m in (b.get("models") or {}).items()
+                  if isinstance(m, dict) and not m.get("endpoint_id")}
+    for key in list(_MANAGERS):
+        if key not in configured:
+            del _MANAGERS[key]
     now = time.monotonic()
     if now - _STATUS_STATE["pods_at"] > _STATUS_TTL_S:
         for name, b in backends.items():

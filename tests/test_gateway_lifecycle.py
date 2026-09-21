@@ -487,3 +487,39 @@ def test_healthz_lifecycle_section(wired, monkeypatch):
     sec = r.json()["lifecycle"]
     assert sec["watchdog"] is False
     assert "budget_usd_month" in sec and "alerts" in sec
+
+
+# ── our-own-termination must not read as death (v4 E2E finding) ────────────
+
+async def test_mark_stopped_prevents_death_alert(monkeypatch):
+    lc.reset()
+    m = _mgr({"image": "x", "port": 8080, "alias": "big"})
+    cfg = _isolate(monkeypatch, [(("rp", "big"), m)])
+    await lc.tick(cfg)                       # RUNNING recorded
+    lc.mark_stopped("pod-x")                 # our own terminate
+    m.pod_status = "TERMINATED"              # what refresh_status sees
+    m.ready = False
+    await lc.tick(cfg)
+    assert "pod_died" not in [a["kind"] for a in lc.alerts()]
+
+
+def test_refresh_status_drops_removed_models(wired, monkeypatch):
+    cfgfile, cfg = wired(CONFIG)            # big in config, pod-live1
+    rp.get_manager(cfg, "rp", "big")        # manager materialized
+    assert ("rp", "big") in rp._MANAGERS
+
+    async def no_pods(env):
+        return []
+
+    monkeypatch.setattr(rp, "list_pods", no_pods)
+    rp.reset_status_cache()
+    # remove the model from config -> its manager must not linger
+    raw = json.loads(cfgfile.read_text(encoding="utf-8"))
+    raw["backends"]["rp"]["models"].pop("big", None)
+    cfgfile.write_text(json.dumps(raw), encoding="utf-8")
+    cfg.reload_now()
+    rp.reset_status_cache()
+    import asyncio
+    asyncio.get_event_loop_policy()
+    asyncio.run(rp.refresh_status(cfg))
+    assert ("rp", "big") not in rp._MANAGERS

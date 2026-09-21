@@ -501,6 +501,23 @@ def budget_snapshot() -> dict[str, Any] | None:
     return _BUDGET_STATE["snapshot"]
 
 
+def mark_stopped(pod_id: str) -> None:
+    """Our OWN termination of a pod must not read as an unexpected
+    death (admin terminate action, upload receiver cleanup): pre-mark
+    the manager + rule memory so the next tick's death detector sees
+    EXITED, not RUNNING -> TERMINATED. E2E-proven bug 2026-09-20."""
+    pid = str(pod_id or "").strip()
+    if not pid:
+        return
+    for (b, k), m in runpod.managers():
+        if str(m.pod_id) == pid:
+            m.pod_status = "EXITED"
+            _LAST_POD_STATE[(b, k)] = "EXITED"
+            logger.info("lifecycle marked %s (%s/%s) as intentionally "
+                        "stopped", pid, b, k)
+            return
+
+
 def reset_budget_cache() -> None:
     """Drop the cached month-to-date — settings changes want immediate
     effect, not a 60s TTL wait."""

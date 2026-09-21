@@ -2711,6 +2711,8 @@ async def admin_runpod_action(payload: RunPodActionPayload) -> Response:
         elif payload.action == "stop":
             await runpod.stop_pod(payload.pod_id, api_key_env)
         elif payload.action == "terminate":
+            # our own termination must not read as an unexpected death
+            lifecycle.mark_stopped(payload.pod_id)
             await runpod.terminate_pod(payload.pod_id, api_key_env)
         else:
             return _error(400, f"unknown action: {payload.action!r}. Use start/stop/terminate")
