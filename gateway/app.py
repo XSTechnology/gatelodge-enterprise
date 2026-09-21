@@ -4099,9 +4099,9 @@ class RunPodServerlessPayload(BaseModel):
 
 @app.post("/admin/runpod/serverless")
 async def admin_runpod_serverless(payload: RunPodServerlessPayload) -> Response:
-    """Add or remove a serverless endpoint model from config.
-    Does NOT create the endpoint on RunPod — that must be done in the
-    RunPod console or via their API directly."""
+    """Add or remove a serverless endpoint model from config (manual
+    registration — e.g. BYO endpoints; v4.5's deploy-serverless does
+    this automatically when IT creates the endpoint)."""
     if not payload.backend or not payload.model:
         return _error(400, "backend and model required")
     cfg = get_gateway_config()

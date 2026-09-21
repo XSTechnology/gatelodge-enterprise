@@ -1247,15 +1247,20 @@ var _fmTask = '';     // active task key ('' = all)
 var _fmLast = null;   // last /admin/models/search response
 var _fmFiles = null;  // last /admin/models/files response
 var _fmPick = null;   // chosen file: {source, repoId, upload, podId,
+                      //  volumeId (upload target volume, '' = pod disk),
                       //  file: {name, quant, size_gb, url}, mmproj|null}
 var _fmPlan = null;   // last /admin/models/plan response
 var _fmState = {gpuId: null, gpuCount: 1, cloud: 'secure', ctxKey: null,
                 dcId: '', volumeMode: 'none', volumeSizeGb: 0,
                 volumeType: 'STANDARD', diskGb: 0, idleS: 1800,
-                alias: '', expert: false};
+                alias: '', expert: false,
+                deployType: 'pod',           // 'pod' | 'serverless' (v4.5)
+                slWorkers: 1, slIdleMin: 5,  // serverless scaler
+                slVolMode: 'reuse', slVolumeId: null, slVolSizeGb: 0};
 var _fmMsg = null;    // {type:'ok'|'err', html} — custom-deploy banner
 var _fmUp = null;     // upload session {podId, reused, filename, sizeBytes,
                       //  file, xhr, timer, got, done}
+var _fmUpVolumeId = ''; // upload target volume ('' = receiver pod disk)
 var _fmCleaned = false; // receiver pod cleaned up
 
 function buildModelFinder() {
@@ -1281,6 +1286,7 @@ function fmRestore() { // re-render persisted state after a tab switch
   if (_fmLast) fmRenderResults();
   if (_fmFiles) fmRenderFiles();
   if (_fmPick) fmRenderConfig();
+  fmUpVolFill();
   var up = _fmUp;
   if (up && !up.done) {
     var btn = document.getElementById('fm-up-btn');
@@ -1496,7 +1502,12 @@ function fmConfigFromPick() {
   _fmState.ctxKey = null;
   _fmState.diskGb = 0;
   _fmState.alias = '';
-  fmEnsureCatalog(function () { fmAutoPlan(); });
+  _fmState.slVolumeId = null;
+  _fmState.slVolSizeGb = 0;
+  fmEnsureCatalog(function () {
+    if (_fmState.deployType === 'serverless') svSeedVolume();
+    fmAutoPlan();
+  });
 }
 function fmEnsureCatalog(cb) {
   if (_dwCatalog) { cb(); return; }
@@ -1508,10 +1519,14 @@ function fmEnsureCatalog(cb) {
   }).catch(function (e) { fmRenderConfig(errBox(e)); });
 }
 // available GPUs on the active cloud, cheapest first — the auto default
+// (serverless mode: pool-backed GPUs only)
 function fmGpuCandidates() {
   var gs = (_dwCatalog && _dwCatalog.gpus) || [], out = [];
-  for (var i = 0; i < gs.length; i++)
+  var sl = _fmState.deployType === 'serverless';
+  for (var i = 0; i < gs.length; i++) {
+    if (sl && !gs[i].pool) continue;
     if (dwGpuAvailable(gs[i], _fmState.cloud)) out.push(gs[i]);
+  }
   out.sort(function (a, b) {
     var pa = (a.price || {})[_fmState.cloud] || 0, pb = (b.price || {})[_fmState.cloud] || 0;
     if (pa !== pb) return pa - pb;
@@ -1595,6 +1610,7 @@ function fmConfigHtml() {
   var g = _fmState.gpuId ? dwFindGpu(_fmState.gpuId) : null;
   var avail = dwGpuAvailable(g, _fmState.cloud);
   var co = (_fmPlan && _fmPlan.ctx_options) || [];
+  var sl = _fmState.deployType === 'serverless';
   var html = '<div class="fm-expert-box">';
   html += '<div class="kv"><b>Deploy custom model</b> — <code>' + esc(p.file.name) +
     '</code> (' + esc(String(p.file.size_gb)) + ' GB' +
@@ -1603,54 +1619,74 @@ function fmConfigHtml() {
   if (p.upload)
     html += '<div class="muted">from local upload — receiver pod <code>' + esc(p.podId) +
       '</code> · ' + fmCleanBtnHtml() + '</div>';
-  // GPU (SIMPLE)
-  html += '<div class="srow"><label for="fm-gpu">GPU type</label>' +
-    '<select id="fm-gpu" onchange="fmOnGpuChange()">' + fmGpuOptions() + '</select>' +
-    (g && avail ? '<span class="muted">' + esc(String(g.memory)) + ' GB per GPU</span>' : '') + '</div>';
-  // Context preset (same dropdown in SIMPLE and EXPERT)
-  html += '<div class="srow"><label for="fm-ctx">Context preset</label>';
+  // deploy-type toggle (v4.5): dedicated pod vs serverless endpoint
+  html += '<div class="srow"><label>Deploy type</label>' +
+    '<label class="dw-radio" for="fm-dt-pod"><input type="radio" name="fm-dtype" id="fm-dt-pod" value="pod"' +
+    (sl ? '' : ' checked') + ' onchange="svOnTypeChange(\'pod\')"> Dedicated GPU pod</label>' +
+    '<label class="dw-radio" for="fm-dt-sl"><input type="radio" name="fm-dtype" id="fm-dt-sl" value="serverless"' +
+    (sl ? ' checked' : '') + ' onchange="svOnTypeChange(\'serverless\')"> Serverless (scale to zero)</label>' +
+    '<span class="muted">' + (sl ? 'no idle billing — first request after idle pays a ~1-3 min cold start'
+                                 : 'bills per hour while the pod runs') + '</span></div>';
+  // Context preset (same dropdown in SIMPLE and EXPERT, both deploy types —
+  // the preset's ctx_total is what a serverless endpoint gets)
+  var ctxRow = '<div class="srow"><label for="fm-ctx">Context preset</label>';
   if (co.length) {
-    html += '<select id="fm-ctx" onchange="fmOnCtxChange()">';
+    ctxRow += '<select id="fm-ctx" onchange="fmOnCtxChange()">';
     for (var i = 0; i < co.length; i++) {
       var c = co[i];
-      html += '<option value="' + esc(c.key) + '"' + (c.key === _fmState.ctxKey ? ' selected' : '') + '>' +
+      ctxRow += '<option value="' + esc(c.key) + '"' + (c.key === _fmState.ctxKey ? ' selected' : '') + '>' +
         esc(c.label + (c.kv_est_gb ? ' (~' + c.kv_est_gb + ' GB KV)' : '')) + '</option>';
     }
-    html += '</select>';
-  } else html += '<span class="muted">— no fitting preset for this GPU</span>';
-  html += '</div>';
-  // Idle auto-stop (same options as the wizard; default 30 min)
-  html += '<div class="srow"><label for="fm-idle">Idle auto-stop</label>' +
-    '<select id="fm-idle" onchange="fmOnIdleChange()">' + fmIdleOptions() + '</select>' +
-    '<span class="muted">watchdog stops the pod when idle — resumable, storage keeps billing</span></div>';
-  // EXPERT extras
-  if (_fmState.expert) {
-    html += '<div class="srow"><label for="fm-count">GPU count</label>' +
-      '<select id="fm-count" onchange="fmOnCountChange()">' + fmCountOptions() + '</select></div>';
-    html += '<div class="srow"><label for="fm-cloud">Cloud</label>' +
-      '<select id="fm-cloud" onchange="fmOnCloudChange()">' +
-      '<option value="secure"' + (_fmState.cloud === 'secure' ? ' selected' : '') + '>secure</option>' +
-      '<option value="community"' + (_fmState.cloud === 'community' ? ' selected' : '') +
-      '>community (spot — can be preempted)</option></select></div>';
-    html += fmVolumeRows();
-    html += '<div class="srow"><label for="fm-alias">Alias</label>' +
-      '<input id="fm-alias" placeholder="(from filename)" value="' + esc(_fmState.alias) +
-      '" oninput="fmOnAliasInput()"></div>';
-    html += '<div class="srow"><label for="fm-disk">Container disk (GB)</label>' +
-      '<input id="fm-disk" type="number" min="0" value="' + (_fmState.diskGb || '') +
-      '" placeholder="auto" oninput="fmOnDiskInput()">' +
-      '<span class="muted">blank = auto (~' +
-      esc(String((_fmPlan && _fmPlan.disk_min_gb) || 20)) + ' GB min)</span></div>';
+    ctxRow += '</select>';
+  } else ctxRow += '<span class="muted">— no fitting preset for this GPU</span>';
+  ctxRow += '</div>';
+  if (sl) {
+    html += svConfigRows(p, ctxRow);
+    if (_fmState.expert)
+      html += '<div class="srow"><label for="fm-alias">Alias</label>' +
+        '<input id="fm-alias" placeholder="(from filename)" value="' + esc(_fmState.alias) +
+        '" oninput="fmOnAliasInput()"></div>';
+  } else {
+    // GPU (SIMPLE)
+    html += '<div class="srow"><label for="fm-gpu">GPU type</label>' +
+      '<select id="fm-gpu" onchange="fmOnGpuChange()">' + fmGpuOptions() + '</select>' +
+      (g && avail ? '<span class="muted">' + esc(String(g.memory)) + ' GB per GPU</span>' : '') + '</div>';
+    html += ctxRow;
+    // Idle auto-stop (same options as the wizard; default 30 min)
+    html += '<div class="srow"><label for="fm-idle">Idle auto-stop</label>' +
+      '<select id="fm-idle" onchange="fmOnIdleChange()">' + fmIdleOptions() + '</select>' +
+      '<span class="muted">watchdog stops the pod when idle — resumable, storage keeps billing</span></div>';
+    // EXPERT extras
+    if (_fmState.expert) {
+      html += '<div class="srow"><label for="fm-count">GPU count</label>' +
+        '<select id="fm-count" onchange="fmOnCountChange()">' + fmCountOptions() + '</select></div>';
+      html += '<div class="srow"><label for="fm-cloud">Cloud</label>' +
+        '<select id="fm-cloud" onchange="fmOnCloudChange()">' +
+        '<option value="secure"' + (_fmState.cloud === 'secure' ? ' selected' : '') + '>secure</option>' +
+        '<option value="community"' + (_fmState.cloud === 'community' ? ' selected' : '') +
+        '>community (spot — can be preempted)</option></select></div>';
+      html += fmVolumeRows();
+      html += '<div class="srow"><label for="fm-alias">Alias</label>' +
+        '<input id="fm-alias" placeholder="(from filename)" value="' + esc(_fmState.alias) +
+        '" oninput="fmOnAliasInput()"></div>';
+      html += '<div class="srow"><label for="fm-disk">Container disk (GB)</label>' +
+        '<input id="fm-disk" type="number" min="0" value="' + (_fmState.diskGb || '') +
+        '" placeholder="auto" oninput="fmOnDiskInput()">' +
+        '<span class="muted">blank = auto (~' +
+        esc(String((_fmPlan && _fmPlan.disk_min_gb) || 20)) + ' GB min)</span></div>';
+    }
   }
   html += '<div style="margin:2px 0 4px"><button type="button" class="btn btn-sm" onclick="fmOnExpertToggle()">' +
     (_fmState.expert ? '▾ hide expert options' : '▸ expert options') + '</button></div>';
   // cost + fit lines + deploy
-  html += '<div class="dw-cost" id="fm-cost">' + fmCostHtml() + '</div>';
+  html += '<div class="dw-cost" id="fm-cost">' + (sl ? svCostHtml() : fmCostHtml()) + '</div>';
   html += '<div class="muted" id="fm-vram">' + fmVramHtml() + '</div>';
   html += '<div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
     '<button id="fm-deploy-btn" class="btn btn-primary"' + (fmDeployable() ? '' : ' disabled') +
     ' onclick="fmDeploy()">Deploy</button>' +
-    '<span class="muted">downloads the file at boot, then serves it — billing starts immediately</span></div>';
+    '<span class="muted">' + (sl
+      ? 'creates a scale-to-zero endpoint — the first deploy downloads the file to a network volume, which can take a few minutes'
+      : 'downloads the file at boot, then serves it — billing starts immediately') + '</span></div>';
   if (_fmMsg) html += '<div class="dw-msg ' + _fmMsg.type + '" style="margin-top:10px">' + _fmMsg.html + '</div>';
   html += '</div>';
   return html;
@@ -1757,6 +1793,7 @@ function fmVramHtml() {
   return html;
 }
 function fmDeployable() {
+  if (_fmState.deployType === 'serverless') return svDeployable();
   return !!(_fmState.gpuId && _fmPlan && _fmPlan.fits && _fmState.ctxKey);
 }
 
@@ -1838,6 +1875,7 @@ function fmBuildPayload() {
   };
 }
 function fmDeploy() {
+  if (_fmState.deployType === 'serverless') { svDeploy(); return; }
   var p = _fmPick;
   if (!p || !fmDeployable()) return;
   var cost = (_fmPlan && _fmPlan.est_cost_per_hr != null)
@@ -1930,6 +1968,402 @@ function fmCleanup() {
     .catch(function (e) { notify('✗ cleanup failed — ' + e.message, true); });
 }
 
+// ---------- Serverless (v4.5): deploy-type toggle + scale-to-zero ----------
+// Serverless endpoints ride the normal chat API with model = alias — no new
+// request routing. First request after idle pays a ~1-3 min cold start.
+
+// toggle handler for the fm config panel's Deploy type radios
+function svOnTypeChange(type) {
+  var v = type === 'serverless' ? 'serverless' : 'pod';
+  if (_fmState.deployType === v) return;
+  _fmState.deployType = v;
+  _fmMsg = null;
+  if (v === 'serverless') {
+    svSeedVolume();
+    // only pool-backed GPUs can serve serverless — re-pick when needed
+    var g = _fmState.gpuId ? dwFindGpu(_fmState.gpuId) : null;
+    if (!g || !g.pool) { _fmState.gpuId = null; _fmPlan = null; fmAutoPlan(); return; }
+  }
+  fmRenderConfig();
+}
+
+// pick a sensible serverless volume: an upload's own volume, else the first
+// existing one (reuse mode); create mode when there is nothing to reuse
+function svSeedVolume() {
+  if (_fmPick && _fmPick.upload && _fmPick.volumeId) {
+    _fmState.slVolMode = 'reuse';
+    _fmState.slVolumeId = _fmPick.volumeId;
+    return;
+  }
+  if (_fmState.slVolumeId) {
+    var keep = (_dwCatalog && _dwCatalog.volumes) || [];
+    for (var j = 0; j < keep.length; j++)
+      if (keep[j].id === _fmState.slVolumeId) return; // still valid
+  }
+  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+  _fmState.slVolMode = vols.length ? 'reuse' : 'create';
+  _fmState.slVolumeId = vols.length ? vols[0].id : null;
+}
+
+// serverless rows of the fm config panel: GPU (pool-only), ctx, workers,
+// idle, volume. p = _fmPick, ctxRow = shared context-preset markup.
+function svConfigRows(p, ctxRow) {
+  var st = _fmState;
+  var html = '<div class="srow"><label for="fm-gpu">GPU type</label>' +
+    '<select id="fm-gpu" onchange="fmOnGpuChange()">' + svGpuOptions() + '</select>' +
+    '<span class="muted">only GPUs with a serverless pool are listed</span></div>';
+  html += ctxRow;
+  html += '<div class="srow"><label for="fm-sl-workers">Workers max</label>' +
+    '<input id="fm-sl-workers" type="number" min="1" value="' + esc(String(st.slWorkers || 1)) +
+    '" oninput="svOnWorkersInput()">' +
+    '<span class="muted">requests beyond this wait in queue</span></div>';
+  html += '<div class="srow"><label for="fm-sl-idle">Idle timeout (min)</label>' +
+    '<input id="fm-sl-idle" type="number" min="1" value="' + esc(String(st.slIdleMin || 5)) +
+    '" oninput="svOnIdleInput()">' +
+    '<span class="muted">scale to zero after this many idle minutes</span></div>';
+  html += svVolumeRows(p);
+  return html;
+}
+
+// pool-bearing GPUs only, cheapest first
+function svGpuOptions() {
+  if (!_dwCatalog) return '<option value="">loading GPU options…</option>';
+  var gs = _dwCatalog.gpus || [], avail = [];
+  for (var i = 0; i < gs.length; i++)
+    if (gs[i].pool && dwGpuAvailable(gs[i], _fmState.cloud)) avail.push(gs[i]);
+  if (!avail.length)
+    return '<option value="">no pool-backed GPUs offered right now</option>';
+  avail.sort(function (a, b) {
+    var pa = (a.price || {})[_fmState.cloud] || 0, pb = (b.price || {})[_fmState.cloud] || 0;
+    if (pa !== pb) return pa - pb;
+    return a.memory - b.memory;
+  });
+  var html = '';
+  for (var k = 0; k < avail.length; k++) {
+    var g = avail[k];
+    var price = (g.price || {})[_fmState.cloud];
+    var lbl = g.id + ' (' + g.memory + ' GB · pool ' + g.pool + ')';
+    if (price > 0) lbl += ' — $' + price + '/hr';
+    html += '<option value="' + esc(g.id) + '"' + (g.id === _fmState.gpuId ? ' selected' : '') + '>' +
+      esc(lbl) + '</option>';
+  }
+  return html;
+}
+
+// serverless volume rows: reuse an existing volume or create one; uploads
+// MUST reuse (their file is already on the receiver's volume)
+function svVolumeRows(p) {
+  var st = _fmState;
+  if (p.upload) {
+    if (p.volumeId) {
+      return '<div class="srow"><label>Storage volume</label><span><b>' +
+        esc(svVolumeLabel(p.volumeId)) + '</b></span>' +
+        '<span class="muted">the uploaded file lives on this volume — the endpoint mounts it</span></div>';
+    }
+    return '<div class="dw-msg err" style="margin-top:8px"><b>Serverless needs the file on a network volume</b> — ' +
+      'this upload went to the receiver pod&#39;s ephemeral disk. Pick a network volume in the ' +
+      'Local file card above and upload again, then switch back to Serverless.</div>';
+  }
+  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+  var html = '<div class="srow"><label>Storage volume</label>';
+  if (vols.length) {
+    html += '<label class="dw-radio" for="fm-svm-reuse"><input type="radio" name="fm-svmode" id="fm-svm-reuse" value="reuse"' +
+      (st.slVolMode !== 'create' ? ' checked' : '') + ' onchange="svOnVolModeChange(\'reuse\')"> use existing</label>' +
+      '<label class="dw-radio" for="fm-svm-create"><input type="radio" name="fm-svmode" id="fm-svm-create" value="create"' +
+      (st.slVolMode === 'create' ? ' checked' : '') + ' onchange="svOnVolModeChange(\'create\')"> create new</label></div>';
+  } else {
+    html += '<span class="muted">create new (no existing volumes)</span></div>';
+    st.slVolMode = 'create';
+  }
+  if (st.slVolMode === 'reuse' && vols.length) {
+    html += '<div class="srow"><label for="fm-sl-volume">Existing volume</label>' +
+      '<select id="fm-sl-volume" onchange="svOnVolumeSelectChange()">';
+    for (var i = 0; i < vols.length; i++) {
+      var v = vols[i];
+      html += '<option value="' + esc(v.id) + '"' + (v.id === st.slVolumeId ? ' selected' : '') + '>' +
+        esc((v.name || v.id) + ' — ' + v.size + ' GB — ' + (v.dataCenter || '—')) + '</option>';
+    }
+    html += '</select><span class="muted">the file downloads here first (blocking)</span></div>';
+  } else {
+    var auto = Math.max(20, Math.round(p.file.size_gb * 1.2) + 10);
+    var caps = dwCapableDcs(), dcOk = false;
+    for (var j = 0; j < caps.length; j++) if (caps[j].id === st.dcId) dcOk = true;
+    if (!dcOk) st.dcId = caps.length ? caps[0].id : '';
+    html += '<div class="srow"><label for="fm-sl-volsize">Volume size (GB)</label>' +
+      '<input id="fm-sl-volsize" type="number" min="1" value="' + (st.slVolSizeGb || '') +
+      '" placeholder="auto" oninput="svOnVolSizeInput()">' +
+      '<span class="muted">blank = auto (~' + esc(String(auto)) + ' GB)</span></div>';
+    html += '<div class="srow"><label for="fm-dc">Data center</label>' +
+      '<select id="fm-dc" onchange="fmOnDcChange()">' + fmDcOptions() + '</select></div>';
+  }
+  return html;
+}
+
+function svVolumeLabel(volumeId) {
+  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+  for (var i = 0; i < vols.length; i++)
+    if (vols[i].id === volumeId) return (vols[i].name || vols[i].id) + ' — ' + vols[i].size + ' GB';
+  return volumeId;
+}
+
+function svCostHtml() {
+  var g = _fmState.gpuId ? dwFindGpu(_fmState.gpuId) : null;
+  var price = g ? Number((g.price || {})[_fmState.cloud] || 0) : 0;
+  if (!g || !price) return '<span class="muted">scales to zero — $0 while idle</span>';
+  return '$' + price.toFixed(2) + '/hr while a worker runs <span class="muted">— $0 when scaled to zero</span>';
+}
+
+function svDeployable() {
+  var p = _fmPick;
+  if (!p) return false;
+  if (p.mmproj) return false; // v1: serverless env carries no mmproj
+  if (p.upload) return !!p.volumeId;
+  var g = _fmState.gpuId ? dwFindGpu(_fmState.gpuId) : null;
+  if (!g || !g.pool || !_fmPlan || !_fmPlan.fits || !_fmState.ctxKey) return false;
+  if (_fmState.slVolMode === 'reuse') return !!_fmState.slVolumeId;
+  return !!_fmState.dcId; // create mode: a capable data center is required
+}
+
+function svBuildPayload() {
+  var p = _fmPick, st = _fmState;
+  var ctxTotal = 32768;
+  var co = (_fmPlan && _fmPlan.ctx_options) || [];
+  for (var i = 0; i < co.length; i++)
+    if (co[i].key === st.ctxKey && co[i].ctx_total) ctxTotal = co[i].ctx_total;
+  var body = {
+    backend: '',
+    source: p.upload ? 'upload' : p.source,
+    repo_id: p.repoId || '',
+    file_name: p.file.name,
+    file_url: p.upload ? '' : p.file.url,
+    size_gb: p.file.size_gb,
+    gpu_id: st.gpuId || '',
+    alias: (st.alias || '').trim(),
+    workers_max: Math.max(1, st.slWorkers || 1),
+    idle_timeout: Math.max(1, st.slIdleMin || 5),
+    queue_delay: 4,
+    ctx_total: ctxTotal
+  };
+  if (p.upload) {
+    body.volume_id = p.volumeId || '';
+  } else if (st.slVolMode === 'reuse') {
+    body.volume_id = st.slVolumeId || '';
+  } else {
+    body.volume_mode = 'create';
+    body.volume_size_gb = st.slVolSizeGb || 0;
+    body.data_center_id = st.dcId || '';
+  }
+  return body;
+}
+
+function svDeploy() {
+  var p = _fmPick;
+  if (!p || !svDeployable()) return;
+  var alias = (_fmState.alias || '').trim() || p.file.name.replace(/\.gguf$/i, '');
+  var msg = 'Deploy ' + p.file.name + ' serverless?\n' +
+    (_fmState.gpuId || 'cheapest fitting pool GPU') + ' · max ' +
+    Math.max(1, _fmState.slWorkers || 1) + ' worker(s) · idle ' +
+    Math.max(1, _fmState.slIdleMin || 5) + ' min\n' +
+    (p.upload ? '' : 'The file downloads to a network volume first — this can take a few minutes.\n') +
+    'The endpoint scales to zero; requests use model "' + alias + '".';
+  if (!confirm(msg)) return;
+  var btn = document.getElementById('fm-deploy-btn');
+  var busy = p.upload ? 'Creating endpoint…'
+    : 'Preparing volume — downloading ~' + p.file.size_gb + ' GB (this can take a few minutes)…';
+  if (btn) { btn.disabled = true; btn.textContent = busy; }
+  var headers = {'Content-Type': 'application/json'};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  fetch('/admin/models/deploy-serverless', {method: 'POST', headers: headers,
+      body: JSON.stringify(svBuildPayload())})
+    .then(function (r) {
+      return r.json().then(
+        function (d) { return {status: r.status, data: d}; },
+        function () { return {status: r.status, data: null}; });
+    })
+    .then(function (res) {
+      if (res.status === 200 && res.data && res.data.ok) {
+        _fmMsg = {type: 'ok', html: svSuccessHtml(res.data)};
+        notify('✓ endpoint ready — model "' + res.data.model + '"');
+        svLoad(); // refresh the panel below
+      } else {
+        _fmMsg = {type: 'err', html: fmDeployErrHtml(res)};
+      }
+      fmRenderConfig();
+    })
+    .catch(function (e) {
+      _fmMsg = {type: 'err', html: '<b>✗ Deploy failed</b> — ' + esc(e.message)};
+      fmRenderConfig();
+    });
+}
+
+function svSuccessHtml(d) {
+  var url = location.origin + '/v1/chat/completions';
+  var html = '<b>✓ Endpoint ready — model "' + esc(d.model) + '" is live</b>' +
+    ' · <code>' + esc(d.endpoint_id) + '</code>' +
+    (d.gpu_id ? ' · ' + esc(d.gpu_id) + (d.pool ? ' (pool ' + esc(d.pool) + ')' : '') : '') +
+    (d.volume_id ? ' · volume <code>' + esc(d.volume_id) + '</code>' : '');
+  html += '<div style="margin-top:6px">No boot to wait for — but the first request after idle pays a ' +
+    '~1-3 min cold start (worker boot + model load). Try it in Chat with model "' +
+    esc(d.model) + '" → <code>' + esc(url) + '</code></div>' +
+    '<div style="margin-top:8px"><button class="btn btn-sm" onclick="svFocusPanel()">' +
+    'manage in the Serverless panel ↓</button></div>';
+  return html;
+}
+
+function svFocusPanel() {
+  svLoad();
+  var el = document.getElementById('cl-serverless');
+  if (el && el.scrollIntoView) {
+    try { el.scrollIntoView({behavior: 'smooth', block: 'start'}); } catch (err) {}
+  }
+}
+
+// ----- serverless config panel event handlers -----
+function svOnWorkersInput() { _fmState.slWorkers = parseInt(document.getElementById('fm-sl-workers').value, 10) || 1; }
+function svOnIdleInput() { _fmState.slIdleMin = parseInt(document.getElementById('fm-sl-idle').value, 10) || 5; }
+function svOnVolSizeInput() { _fmState.slVolSizeGb = parseInt(document.getElementById('fm-sl-volsize').value, 10) || 0; }
+function svOnVolumeSelectChange() {
+  _fmState.slVolumeId = document.getElementById('fm-sl-volume').value || null;
+}
+function svOnVolModeChange(mode) {
+  _fmState.slVolMode = mode === 'create' ? 'create' : 'reuse';
+  if (_fmState.slVolMode === 'create') {
+    var caps = dwCapableDcs(), dcOk = false;
+    for (var i = 0; i < caps.length; i++) if (caps[i].id === _fmState.dcId) dcOk = true;
+    if (!dcOk) _fmState.dcId = caps.length ? caps[0].id : '';
+  } else if (!_fmState.slVolumeId) {
+    var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+    if (vols.length) _fmState.slVolumeId = vols[0].id;
+  }
+  fmRenderConfig();
+}
+
+// ----- Serverless panel (Cloud tab, next to Pod lifecycle) -----
+var _svData = null; // last /admin/serverless response
+
+function svLoad() {
+  var box = document.getElementById('cl-serverless-body');
+  if (!box) return;
+  api('/admin/serverless').then(function (d) {
+    _svData = d;
+    svRender();
+  }).catch(function (e) {
+    _svData = null;
+    box.innerHTML = errBox(e);
+  });
+}
+
+function svRender() {
+  var box = document.getElementById('cl-serverless-body');
+  if (!box) return;
+  if (!_svData) { box.innerHTML = '<div class="muted">loading…</div>'; return; }
+  var eps = _svData.endpoints || [], html = '';
+  if (!eps.length) {
+    html += '<div class="muted">No serverless endpoints yet. Deploy one from the model finder above — ' +
+      'pick a file, then flip Deploy type to &quot;Serverless (scale to zero)&quot;.</div>';
+  } else {
+    html += '<table><thead><tr><th>model</th><th>GPU / pool</th><th class="num">size</th>' +
+      '<th>live</th><th>workers max</th><th>idle min</th><th></th></tr></thead><tbody>';
+    for (var i = 0; i < eps.length; i++) html += svRowHtml(eps[i] || {}, i);
+    html += '</tbody></table>';
+  }
+  var un = _svData.untracked || [];
+  html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bg-deep)">' +
+    '<div class="kv"><b>Untracked endpoints</b> <span class="muted">— on the RunPod account but not ' +
+    'managed by the gateway (add one under Services)</span></div>';
+  if (!un.length) html += '<div class="muted">none</div>';
+  else {
+    html += '<table><thead><tr><th>endpoint id</th><th>name</th><th>workers</th></tr></thead><tbody>';
+    for (var j = 0; j < un.length; j++) {
+      var u = un[j] || {};
+      html += '<tr><td class="muted"><code>' + esc(u.endpoint_id || '?') + '</code></td>' +
+        '<td class="muted">' + esc(u.name || '—') + '</td>' +
+        '<td class="muted">' + esc(svWorkersBrief(u.workers || {})) + '</td></tr>';
+    }
+    html += '</tbody></table>';
+  }
+  html += '</div>';
+  box.innerHTML = html;
+}
+
+function svRowHtml(e, i) {
+  var w = (e.live && e.live.workers) || {};
+  var sc = (e.live && e.live.scaling) || {};
+  var wm = (e.workers_max != null ? e.workers_max : (w.max != null ? w.max : 1));
+  var it = (e.idle_timeout != null ? e.idle_timeout : (w.idleTimeout != null ? w.idleTimeout : 5));
+  var liveTxt;
+  if (!e.exists) liveTxt = '<span class="badge err">gone from account</span>';
+  else if (e.live) liveTxt = 'max ' + esc(String(w.max != null ? w.max : '?')) +
+    ' · idle ' + esc(String(w.idleTimeout != null ? w.idleTimeout : '?')) + ' min' +
+    (sc.queueDelay != null ? ' · queue ' + esc(String(sc.queueDelay)) + 's' : '') +
+    (e.live.flashboot === 'ON' ? ' · flashboot' : '');
+  else liveTxt = '<span class="muted">no live state</span>';
+  var gpuTxt = e.gpu_id ? esc(e.gpu_id) : '—';
+  if (e.pool) gpuTxt += ' <span class="muted">' + esc(e.pool) + '</span>';
+  return '<tr><td><b>' + esc(e.alias || e.model || '?') + '</b>' +
+    '<div class="muted"><code>' + esc(e.endpoint_id || '') + '</code>' +
+    (e.source ? ' · ' + esc(e.source) : '') + '</div></td>' +
+    '<td>' + gpuTxt + '</td>' +
+    '<td class="num muted">' + (e.size_gb != null ? esc(String(e.size_gb)) + ' GB' : '—') + '</td>' +
+    '<td class="muted">' + liveTxt + '</td>' +
+    '<td><input id="sv-wm-' + i + '" class="lc-in" type="number" min="1" value="' + esc(String(wm)) + '"></td>' +
+    '<td><input id="sv-it-' + i + '" class="lc-in" type="number" min="1" value="' + esc(String(it)) + '"></td>' +
+    '<td><button class="btn btn-sm" onclick="svSave(' + i + ')">save</button> ' +
+    '<button class="btn btn-sm btn-danger" onclick="svDelete(' + i + ')">delete</button></td></tr>';
+}
+
+function svWorkersBrief(w) {
+  var bits = [];
+  if (w.min != null) bits.push('min ' + w.min);
+  if (w.max != null) bits.push('max ' + w.max);
+  if (w.idleTimeout != null) bits.push('idle ' + w.idleTimeout + ' min');
+  return bits.length ? bits.join(' · ') : '—';
+}
+
+function svSave(i) {
+  var e = (_svData && (_svData.endpoints || [])[i]) || null;
+  if (!e) return;
+  var box = document.getElementById('cl-serverless-body');
+  var wmEl = document.getElementById('sv-wm-' + i), itEl = document.getElementById('sv-it-' + i);
+  if (!wmEl || !itEl) return;
+  var body = {backend: e.backend || '', model: e.model || e.alias || '',
+              workers_max: Math.max(1, parseInt(wmEl.value, 10) || 1),
+              idle_timeout: Math.max(1, parseInt(itEl.value, 10) || 5)};
+  if (box) box.innerHTML = '<div class="muted">saving…</div>';
+  api('/admin/serverless/settings', {method: 'POST', body: body})
+    .then(function () {
+      notify('✓ saved — workers max ' + body.workers_max + ', idle ' + body.idle_timeout + ' min');
+      svLoad();
+    })
+    .catch(function (err) {
+      notify('✗ save failed — ' + err.message, true);
+      svLoad();
+    });
+}
+
+function svDelete(i) {
+  var e = (_svData && (_svData.endpoints || [])[i]) || null;
+  if (!e || !e.endpoint_id) return;
+  var name = e.alias || e.model || e.endpoint_id;
+  if (!confirm('Permanently delete endpoint ' + name + ' (' + e.endpoint_id + ')? Workers and queued jobs go with it.')) return;
+  var box = document.getElementById('cl-serverless-body');
+  if (box) box.innerHTML = '<div class="muted">deleting…</div>';
+  api('/admin/runpod/action', {method: 'POST', body: {endpoint_id: e.endpoint_id, action: 'delete'}})
+    .then(function () {
+      notify('✓ endpoint deleted');
+      // drop the config entry too so the panel doesn't show a ghost row
+      if (e.backend && (e.model || e.alias))
+        return api('/admin/runpod/serverless', {method: 'POST',
+          body: {backend: e.backend, model: e.model || e.alias, delete: true}});
+      return null;
+    })
+    .then(function () { svLoad(); })
+    .catch(function (err) {
+      notify('✗ delete failed — ' + err.message, true);
+      svLoad();
+    });
+}
+
 // ----- local-file upload (receiver pod + gateway relay) -----
 function fmUploadCard() {
   return '<div class="fm-expert-box" style="margin-top:12px">' +
@@ -1937,11 +2371,35 @@ function fmUploadCard() {
     'receiver pod, then deploy it like any searched model</div>' +
     '<div class="srow"><label for="fm-up-file">GGUF file</label>' +
     '<input type="file" id="fm-up-file" onchange="fmUpFileChosen()" style="width:auto;flex:1;min-width:220px"></div>' +
+    '<div class="srow"><label for="fm-up-vol">Upload target</label>' +
+    '<select id="fm-up-vol" onchange="fmUpOnVolChange()">' + fmUpVolOptions() + '</select>' +
+    '<span class="muted">pick a network volume to keep the file — serverless deploys need it on a volume</span></div>' +
     '<div id="fm-up-info" class="muted"></div>' +
     '<div id="fm-up-progress"></div>' +
     '<div style="margin-top:8px"><button class="btn" id="fm-up-btn" onclick="fmUploadStart()" disabled>Upload to a pod</button></div>' +
     '<div class="muted" style="margin-top:6px">If you abandon an upload, the receiver pod auto-stops after 30 min idle — or clean it up with the button that appears after the transfer.</div>' +
     '</div>';
+}
+
+// volume options for the upload target select ('' = receiver pod disk)
+function fmUpVolOptions() {
+  var html = '<option value=""' + (_fmUpVolumeId ? '' : ' selected') + '>receiver pod disk (ephemeral)</option>';
+  var vols = (_dwCatalog && _dwCatalog.volumes) || [];
+  for (var i = 0; i < vols.length; i++) {
+    var v = vols[i];
+    html += '<option value="' + esc(v.id) + '"' + (v.id === _fmUpVolumeId ? ' selected' : '') + '>' +
+      esc((v.name || v.id) + ' — ' + v.size + ' GB — ' + (v.dataCenter || '—')) + '</option>';
+  }
+  if (!vols.length && !_dwCatalog) html += '<option value="" disabled>loading volumes…</option>';
+  return html;
+}
+// re-fill the select once the deploy wizard's catalog has landed
+function fmUpVolFill() {
+  var sel = document.getElementById('fm-up-vol');
+  if (sel && _dwCatalog) sel.innerHTML = fmUpVolOptions();
+}
+function fmUpOnVolChange() {
+  _fmUpVolumeId = document.getElementById('fm-up-vol').value || '';
 }
 function fmUpFileChosen() {
   var inp = document.getElementById('fm-up-file');
@@ -1965,11 +2423,17 @@ function fmUploadStart() {
   if (btn) { btn.disabled = true; btn.textContent = 'Preparing receiver…'; }
   fmUpSetProgress('<div class="muted">asking for a receiver pod…</div>');
   api('/admin/models/upload-init', {method: 'POST',
-      body: {filename: f.name, size_bytes: f.size, volume_id: ''}})
+      body: {filename: f.name, size_bytes: f.size, volume_id: _fmUpVolumeId}})
     .then(function (d) {
       _fmUp = {podId: d.pod_id, reused: !!d.reused, filename: d.filename || f.name,
-               sizeBytes: f.size, file: f, xhr: null, timer: null, got: -1, done: false};
+               sizeBytes: f.size, file: f, xhr: null, timer: null, got: -1, done: false,
+               volumeId: _fmUpVolumeId || ''};
       _fmCleaned = false;
+      if (_fmUp.reused && _fmUp.volumeId)
+        fmUpSetProgress('<div class="muted" style="color:var(--warning)">⚠ reused a healthy receiver pod — ' +
+          'it may not have volume <code>' + esc(_fmUp.volumeId) + '</code> mounted. If the serverless deploy ' +
+          'later can&#39;t find the file, clean up the receiver and upload again.</div>' +
+          '<div class="muted">relaying…</div>');
       fmUpRelay();
     })
     .catch(function (e) {
@@ -2072,6 +2536,7 @@ function fmFinalize() {
     .then(function (d) {
       var name = d.filename || up.filename;
       _fmPick = {source: 'upload', repoId: '', upload: true, podId: up.podId,
+                 volumeId: up.volumeId || '',
                  file: {name: name, quant: '',
                         size_gb: Number(d.size_gb) ||
                           Math.round(up.sizeBytes / 1e9 * 100) / 100,
@@ -2107,6 +2572,7 @@ function dwLoadCatalog(force) {
     _dwCatalog = d;
     dwValidateState();
     dwRenderAll();
+    fmUpVolFill(); // the upload card's target-volume select uses the same catalog
     if (force) notify('✓ deploy options refreshed');
   }).catch(function (e) {
     var box = document.getElementById('dw-body');
@@ -2642,11 +3108,18 @@ function clShowProviderPanel(providerId) {
       '<div id="cl-lifecycle-body"><div class="muted">loading…</div></div>' +
       '<div class="muted" style="margin-top:6px">The watchdog enforces idle auto-stop, monthly spend caps and auto-recover. ' +
       'Caps of 0 are off. Alerts land in the banner above.</div></div>' +
+      '<div class="widget" id="cl-serverless"><h3>⚡ Serverless ' +
+      '<button class="btn btn-sm" onclick="svLoad()">⟳ refresh</button></h3>' +
+      '<div class="muted" style="margin-bottom:6px">Serverless scales to zero — no idle billing; first request ' +
+      'after idle pays a ~1-3 min cold start. Deploy from the model finder above: pick a file, then flip ' +
+      'Deploy type to &quot;Serverless (scale to zero)&quot;.</div>' +
+      '<div id="cl-serverless-body"><div class="muted">loading…</div></div></div>' +
       buildRunpodServers();
     dwInit();
     fmRestore();
     clLoadAccount();
     refreshRunpodPods();
+    svLoad();
   } else {
     panel.innerHTML = '<div class="muted">No panel for this provider yet.</div>';
   }
