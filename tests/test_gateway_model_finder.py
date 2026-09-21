@@ -300,7 +300,7 @@ def wired(tmp_path, monkeypatch):
                             gw_models.EmbeddedEngine(cfg))
         monkeypatch.setattr(gw_app, "_LOG_PATH",
                             tmp_path / "gateway_log.jsonl")
-        return cfg
+        return cfgfile
 
     yield _wire
 
@@ -349,4 +349,193 @@ def test_endpoint_search_task_and_files(wired, monkeypatch):
         monkeypatch.setattr(ms, "list_files", real_list_files)
         r = client.get("/admin/models/files",
                        params={"source": "nope", "repo": "x"})
+        assert r.status_code == 400
+
+
+# ── custom deploy: sizing, spec builder, endpoints (mf-3) ──────────────────
+
+LIVE = {
+    "gpus": [
+        {"id": "NVIDIA RTX 4090", "memory": 24,
+         "price": {"community": 0.34, "secure": 0.74},
+         "maxCount": {"community": 8, "secure": 8}},
+        {"id": "NVIDIA A100-SXM4-80GB", "memory": 80,
+         "price": {"community": 1.39, "secure": 1.59},
+         "maxCount": {"community": 8, "secure": 8}},
+    ],
+    "datacenters": [{"id": "EUR-IS-1", "region": "EUROPE",
+                     "networkVolumeTypes": ["STANDARD"]}],
+    "volumes": [],
+}
+
+
+def _patch_live(monkeypatch):
+    async def fake_live(env):
+        return LIVE
+
+    monkeypatch.setattr(gw_app.catalog, "live_options", fake_live)
+
+
+def test_kv_and_ctx_options():
+    # calibrated on the proven glm53 recipe (157GB → ~45GB KV @128k)
+    assert catalog.kv_est_gb(157, 131072) == pytest.approx(45.5, abs=0.5)
+    presets = catalog.custom_ctx_options(6, 24)
+    assert [p["key"] for p in presets] == \
+        ["2x32k", "1x64k", "2x64k", "1x128k"]
+    # KV pressure drops the big presets on a tight card
+    tight = catalog.custom_ctx_options(16, 24)
+    assert [p["key"] for p in tight] == ["2x32k", "1x64k"]
+    # model bigger than the card → nothing fits
+    assert catalog.custom_ctx_options(200, 80) == []
+
+
+def test_build_custom_spec_shapes():
+    spec = catalog.build_custom_spec(
+        file_name="Qwen/Qwen3-VL-8B-GGUF/Qwen3-VL-8B-Q4_K_M.gguf",
+        file_url=("https://huggingface.co/Qwen/Qwen3-VL-8B-GGUF/"
+                  "resolve/main/Qwen3-VL-8B-Q4_K_M.gguf"),
+        size_gb=6.0, mmproj_url="https://x/mmproj.gguf",
+        mmproj_size_gb=0.8, gpu_id="NVIDIA RTX 4090", gpu_count=1,
+        cloud="secure", ctx_key="2x64k", container_disk_gb=25,
+        alias="my-vl")
+    s = spec["docker_script"]
+    assert "curl -fsSL" in s and "--mmproj /models/mmproj.gguf" in s
+    assert "--parallel 2 --ctx-size 131072" in s
+    assert spec["alias"] == "my-vl" and spec["custom"] is True
+    assert spec["source_size_gb"] == 6.0
+    # no mmproj → no flag; volume → persistent dir; community → spot
+    spec2 = catalog.build_custom_spec(
+        file_name="m.gguf", file_url="https://x/m.gguf", size_gb=5,
+        gpu_id="g", gpu_count=2, cloud="community", volume_id="vol-1",
+        ctx_key="1x64k")
+    assert "--mmproj" not in spec2["docker_script"]
+    assert "/workspace/models" in spec2["docker_script"]
+    assert spec2["spot"] is True and spec2["gpu_count"] == 2
+    # alias defaults to the filename stem (last path component)
+    spec3 = catalog.build_custom_spec(
+        file_name="a/b/Cool-Model-Q4.gguf", file_url="u", size_gb=5,
+        gpu_id="g", gpu_count=1, cloud="secure")
+    assert spec3["alias"] == "Cool-Model-Q4"
+
+
+def test_plan_endpoint(wired, monkeypatch):
+    wired()
+    _patch_live(monkeypatch)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/models/plan", params={
+            "size_gb": 6, "gpu_id": "NVIDIA RTX 4090", "gpu_count": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fits"] is True
+    assert body["ctx_default"] == "1x128k"      # auto: largest fitting
+    assert body["est_cost_per_hr"] == 0.74
+    assert body["disk_min_gb"] == 20            # floor is 20 GB
+    r = client.get("/admin/models/plan", params={"size_gb": 0})
+    assert r.status_code == 400
+
+
+def test_deploy_custom_success_persists(wired, monkeypatch):
+    cfgfile = wired()
+    _patch_live(monkeypatch)
+    deploys = []
+
+    async def fake_deploy(payload, env):
+        deploys.append(payload)
+        return {"id": "pod-custom1", "name": "gw-rp-myvl"}
+
+    monkeypatch.setattr(gw_app.runpod, "deploy_pod", fake_deploy)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/models/deploy-custom", json={
+            "source": "hf", "repo_id": "Qwen/Qwen3-VL-8B-GGUF",
+            "file_name": "Qwen3-VL-8B-Q4_K_M.gguf",
+            "file_url": ("https://huggingface.co/Qwen/Qwen3-VL-8B-GGUF/"
+                         "resolve/main/Qwen3-VL-8B-Q4_K_M.gguf"),
+            "size_gb": 6.0, "mmproj_url": "https://x/mmproj.gguf",
+            "mmproj_size_gb": 0.8,
+            "gpu_id": "NVIDIA RTX 4090", "gpu_count": 1,
+            "cloud": "secure", "ctx_key": "2x64k",
+            "idle_stop_s": 900, "alias": "myvl"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pod_id"] == "pod-custom1"
+    assert body["landed"]["gpu_id"] == "NVIDIA RTX 4090"
+    assert body["est_cost_per_hr"] == 0.74
+    assert "gw-rp-myvl" in str(deploys[0])
+    # spec persisted with custom provenance + v3 lifecycle fields
+    raw = json.loads(cfgfile.read_text(encoding="utf-8"))
+    spec = raw["backends"]["rp"]["models"]["myvl"]
+    assert spec["pod_id"] == "pod-custom1"
+    assert spec["custom"] is True
+    assert spec["est_cost_per_hr"] == 0.74
+    assert spec["idle_stop_s"] == 900
+    assert spec["mmproj_url"] == "https://x/mmproj.gguf"
+    assert "--mmproj" in spec["docker_script"]
+
+
+def test_deploy_custom_fallback_and_422(wired, monkeypatch):
+    wired()
+    _patch_live(monkeypatch)
+
+    async def fake_deploy(payload, env):
+        return {"id": "pod-fb", "name": "n"}
+
+    monkeypatch.setattr(gw_app.runpod, "deploy_pod", fake_deploy)
+    with TestClient(gw_app.app) as client:
+        # user picks a 4090 for a 50GB model → auto-lands the A100
+        r = client.post("/admin/models/deploy-custom", json={
+            "source": "hf", "file_name": "big-Q4.gguf",
+            "file_url": "https://x/big.gguf", "size_gb": 50,
+            "gpu_id": "NVIDIA RTX 4090", "gpu_count": 1,
+            "cloud": "secure", "alias": "bigm"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["landed"]["gpu_id"] == "NVIDIA A100-SXM4-80GB"
+        assert any("does not fit" in (t.get("error") or "")
+                   for t in body["tried"])
+        # 50GB on an 80GB A100: weights 56.5 + KV 14.5 = 71 ≤ 73.6 —
+        # the full 128k preset fits, so the auto default lands there
+        assert body["ctx_key"] == "1x128k"
+        # nothing fits anywhere → 422
+        r = client.post("/admin/models/deploy-custom", json={
+            "source": "hf", "file_name": "huge.gguf",
+            "file_url": "https://x/huge.gguf", "size_gb": 500,
+            "gpu_id": "NVIDIA A100-SXM4-80GB", "gpu_count": 1,
+            "cloud": "secure"})
+        assert r.status_code == 422
+        assert "no live GPU fits" in r.text
+
+
+def test_deploy_custom_volume_create(wired, monkeypatch):
+    cfgfile = wired()
+    _patch_live(monkeypatch)
+    vols = []
+
+    async def fake_vol(name, dc, size, vtype, env):
+        vols.append((name, dc, size, vtype))
+        return {"id": "vol-new"}
+
+    async def fake_deploy(payload, env):
+        return {"id": "p2", "name": "n"}
+
+    monkeypatch.setattr(gw_app.runpod, "create_volume", fake_vol)
+    monkeypatch.setattr(gw_app.runpod, "deploy_pod", fake_deploy)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/models/deploy-custom", json={
+            "source": "hf", "file_name": "m.gguf",
+            "file_url": "https://x/m.gguf", "size_gb": 5,
+            "gpu_id": "NVIDIA RTX 4090", "gpu_count": 1,
+            "cloud": "secure", "volume_mode": "create",
+            "data_center_id": "EUR-IS-1", "volume_size_gb": 100,
+            "alias": "volm"})
+        assert r.status_code == 200
+        assert vols[0][1] == "EUR-IS-1" and vols[0][2] == 100
+        raw = json.loads(cfgfile.read_text(encoding="utf-8"))
+        spec = raw["backends"]["rp"]["models"]["volm"]
+        assert spec["volume_id"] == "vol-new"
+        assert "/workspace/models" in spec["docker_script"]
+        # volume without a DC → 400
+        r = client.post("/admin/models/deploy-custom", json={
+            "source": "hf", "file_name": "m.gguf",
+            "file_url": "https://x/m.gguf", "size_gb": 5,
+            "volume_mode": "create"})
         assert r.status_code == 400

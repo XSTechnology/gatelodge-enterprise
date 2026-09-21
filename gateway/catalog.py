@@ -363,6 +363,124 @@ def public_recipes() -> list[dict[str, Any]]:
     return out
 
 
+# ── Custom models (v4 model finder, D3) ─────────────────────────────────────
+
+# KV-cache heuristic for an UNKNOWN architecture: calibrated on the
+# proven glm53 recipe (157 GB weights -> ~45 GB KV at 128k total ctx)
+# => ~0.29 GB of KV per GB of weights per 131072 total ctx. Dense
+# small models over-estimate slightly (errs toward rejecting a too-
+# small GPU — the safe direction).
+_KV_PER_GB_PER_128K = 0.29
+
+
+def kv_est_gb(model_gb: float, ctx_total: int) -> float:
+    return model_gb * (ctx_total / 131072.0) * _KV_PER_GB_PER_128K
+
+
+_CUSTOM_CTX: dict[str, tuple[int, int]] = {
+    "2x32k": (2, 65536),    # 2 slots × 32k
+    "1x64k": (1, 65536),    # 1 slot × 64k
+    "2x64k": (2, 131072),   # 2 slots × 64k
+    "1x128k": (1, 131072),  # 1 slot × 128k
+}
+
+
+def weights_vram_gb(model_gb: float, mmproj_gb: float = 0.0) -> float:
+    """Weights + runtime overhead (not KV)."""
+    return (model_gb + mmproj_gb) * 1.1 + 1.5
+
+
+def custom_ctx_options(model_gb: float,
+                       vram_total_gb: float) -> list[dict[str, Any]]:
+    """Ctx presets that FIT the given total VRAM (largest last).
+    Empty list = the model doesn't fit this GPU combo at all."""
+    out: list[dict[str, Any]] = []
+    for key, (parallel, ctx_total) in _CUSTOM_CTX.items():
+        need = weights_vram_gb(model_gb) + kv_est_gb(model_gb, ctx_total)
+        if need <= vram_total_gb * 0.92:
+            out.append({"key": key, "parallel": parallel,
+                        "ctx_total": ctx_total,
+                        "label": (f"{parallel} slot" +
+                                  ("s" if parallel > 1 else "") +
+                                  f" × {ctx_total // 2 // 1024}k"),
+                        "kv_est_gb": round(kv_est_gb(model_gb, ctx_total), 1),
+                        "vram_need_gb": round(need, 1)})
+    return out
+
+
+def _custom_script(file_url: str, mmproj_url: str, model_dir: str,
+                   parallel: int, ctx_total: int) -> str:
+    """Generic download-and-serve: curl the picked GGUF (+mmproj for
+    vision models) and serve with the image's llama-server. curl -L
+    follows the HF/ModelScope/Ollama CDN redirects; when a network
+    volume is mounted the download persists across stops (container
+    disk is ephemeral)."""
+    parts = [
+        "set -e; mkdir -p " + model_dir + "; ",
+        f"if [ ! -f {model_dir}/model.gguf ]; then "
+        "echo '[boot] downloading model'; "
+        f"curl -fsSL --retry 3 --max-time 5400 "
+        f"-o {model_dir}/model.gguf '{file_url}'; "
+        "echo '[boot] model download done'; fi; ",
+    ]
+    if mmproj_url:
+        parts.append(
+            f"if [ ! -f {model_dir}/mmproj.gguf ]; then "
+            f"curl -fsSL --retry 3 --max-time 900 "
+            f"-o {model_dir}/mmproj.gguf '{mmproj_url}'; fi; ")
+    parts.append("df -h " + model_dir + " | tail -1; ")
+    parts.append("SRV=/app/llama-server; [ -x \"$SRV\" ] || "
+                 "SRV=$(command -v llama-server || echo /llama-server); ")
+    parts.append("echo '[boot] serving'; ")
+    mm = f"--mmproj {model_dir}/mmproj.gguf " if mmproj_url else ""
+    parts.append(f"exec \"$SRV\" -m {model_dir}/model.gguf {mm}"
+                 f"--host 0.0.0.0 --port 8080 -ngl 99 --jinja "
+                 f"--parallel {parallel} --ctx-size {ctx_total}")
+    return "".join(parts)
+
+
+def build_custom_spec(*, file_name: str, file_url: str, size_gb: float,
+                      mmproj_url: str = "", mmproj_size_gb: float = 0.0,
+                      gpu_id: str, gpu_count: int, cloud: str,
+                      data_center_id: str = "", volume_id: str = "",
+                      ctx_key: str = "2x32k", container_disk_gb: int = 0,
+                      idle_stop_s: float = 1800.0,
+                      alias: str = "") -> dict[str, Any]:
+    """A searched model + chosen options -> a deployable pod spec
+    (same shape build_spec emits; deploy_payload consumes it)."""
+    parallel, ctx_total = _CUSTOM_CTX.get(
+        ctx_key, _CUSTOM_CTX["2x32k"])
+    model_dir = "/workspace/models" if volume_id else "/models"
+    spec: dict[str, Any] = {
+        "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+        "gpu_type_ids": [gpu_id],
+        "gpu_count": int(gpu_count),
+        "docker_entrypoint": ["sh", "-c"],
+        "docker_script": _custom_script(file_url, mmproj_url, model_dir,
+                                        parallel, ctx_total),
+        "ports": "8080/http", "port": 8080,
+        "container_disk_gb": int(container_disk_gb or 20),
+        "start_timeout_s": 3600 if size_gb > 20 else 1800,
+        "idle_stop_s": float(idle_stop_s or 1800),
+        "idle_terminate_s": 0,
+        "alias": alias or file_name.split("/")[-1].removesuffix(".gguf"),
+        "custom": True,
+        "source_file": file_name,
+        "source_url": file_url,
+        "source_size_gb": round(float(size_gb), 2),
+    }
+    if mmproj_url:
+        spec["mmproj_url"] = mmproj_url
+        spec["mmproj_size_gb"] = round(float(mmproj_size_gb), 2)
+    if volume_id:
+        spec["volume_id"] = volume_id
+    if data_center_id:
+        spec["data_center_ids"] = [data_center_id]
+    if cloud == "community":
+        spec["spot"] = True
+    return spec
+
+
 # ── Live RunPod options (short cache) ───────────────────────────────────────
 
 _CACHE: dict[str, tuple[float, Any]] = {}

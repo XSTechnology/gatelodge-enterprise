@@ -3299,6 +3299,219 @@ async def admin_models_files(source: str = "",
                       code="modelsource_error")
 
 
+@app.get("/admin/models/plan")
+async def admin_models_plan(size_gb: float = 0, mmproj_gb: float = 0,
+                            gpu_id: str = "", gpu_count: int = 1,
+                            cloud: str = "secure") -> Response:
+    """Simple-mode brain: given the picked file(s) + GPU combo, the
+    fitting ctx presets (KV math), the auto default, disk minimum and
+    estimated price."""
+    if size_gb <= 0:
+        return _error(400, "size_gb required")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend, api_key_env = _runpod_api_key_env(cfg)
+    if not backend:
+        return _error(400, "no runpod backend configured")
+    try:
+        opts = await catalog.live_options(api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    g = next((g for g in opts["gpus"] if g.get("id") == gpu_id), None)
+    if g is None:
+        return _error(400, f"unknown GPU {gpu_id!r}")
+    cloud_key = "community" if cloud == "community" else "secure"
+    price = (g.get("price") or {}).get(cloud_key)
+    count = max(1, gpu_count)
+    vram = float(g.get("memory") or 0) * count
+    total_gb = size_gb + mmproj_gb
+    presets = catalog.custom_ctx_options(total_gb, vram)
+    return {"gpu_id": gpu_id, "gpu_count": count,
+            "vram_total_gb": vram,
+            "weights_vram_gb": round(catalog.weights_vram_gb(total_gb), 1),
+            "ctx_options": presets,
+            "ctx_default": presets[-1]["key"] if presets else None,
+            "disk_min_gb": max(20, int(total_gb * 1.2) + 10),
+            "est_cost_per_hr": (round(float(price) * count, 2)
+                                if price else None),
+            "fits": bool(presets)}
+
+
+class CustomDeployPayload(BaseModel):
+    """Deploy an arbitrary searched model. file_url/mmproj_url come
+    from GET /admin/models/files (trusted-admin surface: the pod curls
+    them as sent — same trust level as docker_cmd)."""
+    model_config = ConfigDict(extra="ignore")
+
+    backend: str = ""
+    source: str = ""                 # hf | modelscope | ollama
+    repo_id: str = ""
+    file_name: str = ""
+    file_url: str = ""
+    size_gb: float = 0
+    mmproj_name: str = ""
+    mmproj_url: str = ""
+    mmproj_size_gb: float = 0
+    gpu_id: str = ""
+    gpu_count: int = 1
+    cloud: str = "secure"
+    data_center_id: str = ""
+    volume_mode: str = "none"        # none | create
+    volume_size_gb: int = 0
+    volume_type: str = "STANDARD"
+    ctx_key: str = ""
+    container_disk_gb: int = 0
+    idle_stop_s: float = 1800
+    alias: str = ""
+
+
+@app.post("/admin/models/deploy-custom")
+async def admin_models_deploy_custom(
+        payload: CustomDeployPayload) -> Response:
+    """Deploy a searched model (v4 D3/D4): size-validated GPU choice
+    with price-ascending capacity fallback (auto-lands the cheapest
+    FITTING combo when the user's pick is dry or too small), generic
+    download-and-serve script (mmproj-aware for vision), optional
+    persistent volume, full v3 lifecycle (idle-stop, budget caps,
+    auto-recover, boot-watch)."""
+    if not (payload.file_name and payload.file_url and payload.size_gb > 0):
+        return _error(400, "file_name, file_url and size_gb are required")
+    if payload.source not in modelsearch.SOURCES:
+        return _error(400, f"source must be one of {modelsearch.SOURCES}")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if backend not in rp_backends:
+        return _error(400, f"backend {backend!r} is not a runpod backend")
+    api_key_env = rp_backends[backend].get("api_key_env", "RUNPOD_API_KEY")
+    try:
+        opts = await catalog.live_options(api_key_env)
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+
+    total_gb = payload.size_gb + payload.mmproj_size_gb
+    cloud_key = "community" if payload.cloud == "community" else "secure"
+
+    def _combo(gpu_id: str, count: int) -> dict | None:
+        g = next((g for g in opts["gpus"] if g.get("id") == gpu_id), None)
+        if g is None:
+            return None
+        price = (g.get("price") or {}).get(cloud_key)
+        if not price:
+            return None
+        return {"gpu_id": gpu_id, "gpu_count": count,
+                "est_cost_per_hr": round(float(price) * count, 2),
+                "vram_total_gb": float(g.get("memory") or 0) * count,
+                "max_count": int((g.get("maxCount") or {}).get(cloud_key)
+                                 or 0)}
+
+    # user combo first, then every FITTING combo price-ascending
+    candidates: list[dict] = []
+    if payload.gpu_id:
+        user = _combo(payload.gpu_id, payload.gpu_count or 1)
+        if user is None:
+            return _error(400, f"unknown GPU {payload.gpu_id!r} for the "
+                               f"{cloud_key} cloud")
+        if user["gpu_count"] > user["max_count"]:
+            return _error(400, f"{payload.gpu_id} allows at most "
+                               f"{user['max_count']}× on {cloud_key}")
+        candidates.append(user)
+    pool = sorted((c for g in opts["gpus"] for c in (
+        _combo(g.get("id", ""), n) for n in (1, 2, 3, 4))
+        if c and c["gpu_count"] <= c["max_count"]
+        and catalog.custom_ctx_options(total_gb, c["vram_total_gb"])),
+        key=lambda c: c["est_cost_per_hr"])
+    candidates += [c for c in pool if c not in candidates]
+    if not any(catalog.custom_ctx_options(total_gb, c["vram_total_gb"])
+               for c in candidates):
+        return JSONResponse(status_code=422, content={
+            "detail": {"code": "invalid_selection", "errors": [
+                f"no live GPU fits this model (~"
+                f"{catalog.weights_vram_gb(total_gb):.0f} GB VRAM for "
+                "weights alone; try a smaller quant)"]}})
+
+    # optional persistent volume (downloads survive pod stops)
+    volume_id = ""
+    if payload.volume_mode == "create":
+        if not payload.data_center_id:
+            return _error(400, "data_center_id required to create a volume")
+        dc = next((d for d in opts["datacenters"]
+                   if d.get("id") == payload.data_center_id), None)
+        if not dc or not (dc.get("networkVolumeTypes") or []):
+            return _error(400, f"{payload.data_center_id} does not "
+                               "support network volumes")
+        vol_gb = payload.volume_size_gb or max(
+            20, int(total_gb * 1.2) + 10)
+        try:
+            vol = await runpod.create_volume(
+                f"gw-custom-{payload.alias or 'model'}-"
+                f"{payload.data_center_id}".lower()[:60],
+                payload.data_center_id, vol_gb,
+                payload.volume_type, api_key_env)
+        except runpod.RunPodError as e:
+            return _error(502, f"volume create failed: {e}",
+                          code="runpod_error")
+        if not isinstance(vol, dict) or not vol.get("id"):
+            return _error(502, "volume create returned no id",
+                          code="runpod_error")
+        volume_id = str(vol["id"])
+
+    disk = payload.container_disk_gb or (
+        20 if volume_id else max(20, int(total_gb * 1.2) + 10))
+    alias = (payload.alias or
+             payload.file_name.split("/")[-1].removesuffix(".gguf"))[:40]
+    tried: list[dict[str, Any]] = []
+    pod: dict[str, Any] | None = None
+    landed: dict[str, Any] | None = None
+    used_ctx = ""
+    for cand in candidates:
+        presets = catalog.custom_ctx_options(total_gb, cand["vram_total_gb"])
+        if not presets:      # user's combo too small — fall through
+            tried.append({**cand, "error": "model does not fit this GPU"})
+            continue
+        ctx_key = payload.ctx_key if any(
+            p["key"] == payload.ctx_key for p in presets
+        ) else presets[-1]["key"]
+        spec = catalog.build_custom_spec(
+            file_name=payload.file_name, file_url=payload.file_url,
+            size_gb=payload.size_gb, mmproj_url=payload.mmproj_url,
+            mmproj_size_gb=payload.mmproj_size_gb,
+            gpu_id=cand["gpu_id"], gpu_count=cand["gpu_count"],
+            cloud=payload.cloud, data_center_id=payload.data_center_id,
+            volume_id=volume_id, ctx_key=ctx_key,
+            container_disk_gb=disk, idle_stop_s=payload.idle_stop_s,
+            alias=alias)
+        deploy_payload = runpod.deploy_payload(backend, alias, spec)
+        try:
+            pod = await runpod.deploy_pod(deploy_payload, api_key_env)
+            landed, used_ctx = cand, ctx_key
+            break
+        except runpod.RunPodError as e:
+            tried.append({**cand, "error": str(e)[:250]})
+    if pod is None:
+        return JSONResponse(status_code=502, content={
+            "error": {"message": "deploy failed for every GPU combination "
+                                 f"({len(tried)} tried); see 'tried'",
+                      "code": "runpod_deploy_failed"},
+            "tried": tried})
+    spec["pod_id"] = pod.get("id")
+    if landed and landed.get("est_cost_per_hr"):
+        spec["est_cost_per_hr"] = float(landed["est_cost_per_hr"])
+
+    def mutator(raw: dict):
+        models = raw.setdefault("backends", {}).setdefault(
+            backend, {}).setdefault("models", {})
+        models[alias] = spec
+
+    _mutate_config(mutator)
+    return {"ok": True, "pod_id": pod.get("id"), "backend": backend,
+            "model": alias, "name": pod.get("name"),
+            "est_cost_per_hr": (landed or {}).get("est_cost_per_hr"),
+            "ctx_key": used_ctx, "landed": landed, "tried": tried}
+
+
 # ── Provider registry + RunPod account panel ───────────────────────────────
 
 @app.get("/admin/providers")

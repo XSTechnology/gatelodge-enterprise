@@ -345,6 +345,13 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                             m.get("auto_recover") or "").strip() == "redeploy"
                             else "alert"),
                         "est_cost_per_hr": _num("est_cost_per_hr", 0),
+                        # v4 model finder: custom-model provenance
+                        "custom": bool(m.get("custom")),
+                        "source_file": str(m.get("source_file") or "").strip(),
+                        "source_url": str(m.get("source_url") or "").strip(),
+                        "source_size_gb": _num("source_size_gb", 0),
+                        "mmproj_url": str(m.get("mmproj_url") or "").strip(),
+                        "mmproj_size_gb": _num("mmproj_size_gb", 0),
                         "deploy": m.get("deploy") if isinstance(m.get("deploy"), dict) else {},
                     }
                     if not pod["image"] and not pod["pod_id"]:
