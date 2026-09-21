@@ -88,6 +88,8 @@ import struct
 import threading
 import time
 import uuid
+
+import httpx
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -112,6 +114,7 @@ from . import llamaserver
 from . import modelsearch
 from . import providers
 from . import runpod
+from . import upload
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
@@ -3510,6 +3513,140 @@ async def admin_models_deploy_custom(
             "model": alias, "name": pod.get("name"),
             "est_cost_per_hr": (landed or {}).get("est_cost_per_hr"),
             "ctx_key": used_ctx, "landed": landed, "tried": tried}
+
+
+# ── Model upload: receiver pod + gateway relay (v4 D5) ──────────────────────
+
+class UploadInitPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    backend: str = ""
+    filename: str = ""
+    size_bytes: int = 0
+    volume_id: str = ""      # optional: uploads persist on the volume
+
+
+@app.post("/admin/models/upload-init")
+async def admin_upload_init(payload: UploadInitPayload) -> Response:
+    """Reuse a HEALTHY receiver pod or deploy one on the cheapest GPU.
+    The receiver is a config model (upload-receiver): idle-stop 1800 +
+    the never-healthy reaper own its lifecycle, and it shows in the
+    servers widget."""
+    import os
+
+    filename = os.path.basename((payload.filename or "").strip())
+    if not filename or filename in (".", ".."):
+        return _error(400, "filename required")
+    if payload.size_bytes <= 0:
+        return _error(400, "size_bytes required")
+    if payload.size_bytes > 20 * 1024 ** 3:
+        return _error(413, "uploads over ~20 GB are impractical over a "
+                           "home uplink — host the file and paste its "
+                           "URL into the custom deploy instead")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    rp_backends = {n: b for n, b in cfg.backends.items()
+                   if b.get("type") == "runpod"}
+    if backend not in rp_backends:
+        return _error(400, f"backend {backend!r} is not a runpod backend")
+    try:
+        info = await upload.init_receiver(cfg, backend, payload.size_bytes,
+                                          payload.volume_id)
+    except upload.UploadError as e:
+        return _error(502, str(e), code="upload_error")
+    except runpod.RunPodError as e:
+        return _error(502, str(e), code="runpod_error")
+    return {"ok": True, **info, "filename": filename,
+            "size_bytes": payload.size_bytes}
+
+
+@app.put("/admin/models/upload")
+async def admin_models_upload(request: Request) -> Response:
+    """Gateway relay: stream the browser upload to the receiver pod's
+    proxy URL. Content-Length is forwarded explicitly — the receiver
+    rejects chunked bodies (411)."""
+    import os
+    from urllib.parse import quote
+
+    pod_id = (request.headers.get("x-pod-id") or "").strip()
+    filename = os.path.basename(
+        (request.headers.get("x-filename") or "").strip())
+    size_raw = (request.headers.get("x-file-size") or "").strip()
+    if not (pod_id and filename and size_raw.isdigit()):
+        return _error(400, "x-pod-id, x-filename and x-file-size headers "
+                           "are required")
+    url = upload.receiver_url(pod_id, quote(filename))
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(600.0, connect=30.0)) as c:
+            r = await c.put(url, content=request.stream(),
+                            headers={"Content-Length": size_raw})
+    except httpx.HTTPError as e:
+        return _error(502, f"relay to receiver failed: {e}",
+                      code="upload_error")
+    if r.status_code != 200:
+        return _error(502, f"receiver rejected upload: {r.text[:200]}",
+                      code="upload_error")
+    try:
+        detail = r.json()
+    except ValueError:
+        detail = {}
+    return {"ok": True, "pod_id": pod_id, "filename": filename,
+            "detail": detail}
+
+
+@app.get("/admin/models/upload-status")
+async def admin_upload_status(pod_id: str = "",
+                              filename: str = "") -> Response:
+    """Bytes the receiver has so far (the console polls this during the
+    relay — browser-side progress is localhost-instant and useless)."""
+    if not (pod_id and filename):
+        return _error(400, "pod_id and filename required")
+    try:
+        return await upload.receiver_status(pod_id, filename)
+    except Exception as e:  # noqa: BLE001 — receiver unreachable
+        return _error(502, f"receiver status failed: {e}",
+                      code="upload_error")
+
+
+class UploadFinalizePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    pod_id: str = ""
+    filename: str = ""
+    size_bytes: int = 0
+
+
+@app.post("/admin/models/upload-finalize")
+async def admin_upload_finalize(payload: UploadFinalizePayload) -> Response:
+    """Verify the uploaded size; returns the receiver's PUBLIC file URL
+    — deploy-custom accepts it as file_url (the model pod curls it)."""
+    if not (payload.pod_id and payload.filename and payload.size_bytes > 0):
+        return _error(400, "pod_id, filename and size_bytes required")
+    try:
+        return await upload.finalize(payload.pod_id, payload.filename,
+                                     payload.size_bytes)
+    except upload.UploadError as e:
+        return _error(502, str(e), code="upload_error")
+    except Exception as e:  # noqa: BLE001
+        return _error(502, f"finalize failed: {e}", code="upload_error")
+
+
+class UploadCleanupPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    backend: str = ""
+
+
+@app.post("/admin/models/upload-cleanup")
+async def admin_upload_cleanup(payload: UploadCleanupPayload) -> Response:
+    """Terminate the receiver pod + drop it from config (call after the
+    model pod finished downloading, or anytime to abort)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = payload.backend or _runpod_api_key_env(cfg)[0]
+    return await upload.cleanup_receiver(cfg, backend)
 
 
 # ── Provider registry + RunPod account panel ───────────────────────────────

@@ -21,6 +21,7 @@ import gateway.catalog as catalog  # noqa: E402
 import gateway.config as gw_config  # noqa: E402
 import gateway.modelsearch as ms  # noqa: E402
 import gateway.models as gw_models  # noqa: E402
+import gateway.upload as up  # noqa: E402
 
 
 # ── capability inference (D1) ───────────────────────────────────────────────
@@ -539,3 +540,163 @@ def test_deploy_custom_volume_create(wired, monkeypatch):
             "file_url": "https://x/m.gguf", "size_gb": 5,
             "volume_mode": "create"})
         assert r.status_code == 400
+
+
+# ── upload path (mf-4) ──────────────────────────────────────────────────────
+
+def test_receiver_script_valid():
+    s = up.receiver_script()
+    assert "printf '%s' '" in s
+    assert "exec python3 /root/receiver.py" in s
+    inner = s.split("printf '%s' '", 1)[1].rsplit(
+        "' > /root/receiver.py", 1)[0]
+    assert "'" not in inner              # sh-safe single-quote embedding
+    compile(inner, "receiver.py", "exec")  # and it is valid python
+    for needle in ("/health", "/status/", "/file/", "ThreadingHTTPServer",
+                   "os.replace", "Content-Length required"):
+        assert needle in inner
+
+
+def test_receiver_spec():
+    spec = up.receiver_spec("NVIDIA RTX 4090", 10 * 1024 ** 3,
+                            volume_id="vol-1")
+    assert spec["ports"] == "8081/http" and spec["port"] == 8081
+    assert spec["idle_stop_s"] == 1800
+    assert spec["volume_id"] == "vol-1"
+    assert spec["container_disk_gb"] == 22        # 10GB*1.2 + 10
+    spec2 = up.receiver_spec("g", 0)
+    assert "volume_id" not in spec2
+    assert spec2["container_disk_gb"] == 20       # floor
+
+
+async def test_init_receiver_reuse(wired, monkeypatch):
+    cfgfile = wired()
+    cfg = gw_config.get_gateway_config()
+    cfgdata = json.loads(cfgfile.read_text(encoding="utf-8"))
+    cfgdata["backends"]["rp"]["models"][up.RECEIVER_MODEL] = {
+        "image": "x", "pod_id": "pod-live1"}
+    cfgfile.write_text(json.dumps(cfgdata), encoding="utf-8")
+    cfg.reload_now()
+
+    async def healthy(pid):
+        return pid == "pod-live1"
+
+    async def boom(*a, **k):
+        raise AssertionError("healthy receiver must be reused, not redeployed")
+
+    monkeypatch.setattr(up, "probe_receiver", healthy)
+    monkeypatch.setattr(gw_app.runpod, "deploy_pod", boom)
+    info = await up.init_receiver(cfg, "rp", 1024)
+    assert info == {"pod_id": "pod-live1", "reused": True}
+
+
+async def test_init_receiver_deploy(wired, monkeypatch):
+    cfgfile = wired()
+    cfg = gw_config.get_gateway_config()
+    _patch_live(monkeypatch)                       # cheapest GPU = 4090
+
+    async def probe(pid):
+        return pid == "pod-rx"
+
+    deploys = []
+
+    async def fake_deploy(payload, env):
+        deploys.append(payload)
+        return {"id": "pod-rx", "name": "gw-rp-upload-receiver"}
+
+    monkeypatch.setattr(up, "probe_receiver", probe)
+    monkeypatch.setattr(gw_app.runpod, "deploy_pod", fake_deploy)
+    info = await up.init_receiver(cfg, "rp", 5 * 1024 ** 3,
+                                  volume_id="vol-1")
+    assert info == {"pod_id": "pod-rx", "reused": False}
+    assert "gw-rp-upload-receiver" in str(deploys[0])
+    # persisted as a config model → watchdog owns its lifecycle
+    raw = json.loads(cfgfile.read_text(encoding="utf-8"))
+    spec = raw["backends"]["rp"]["models"][up.RECEIVER_MODEL]
+    assert spec["pod_id"] == "pod-rx"
+    assert spec["volume_id"] == "vol-1"
+    assert spec["idle_stop_s"] == 1800
+
+
+def test_upload_endpoints(wired, monkeypatch):
+    wired()
+
+    async def fake_init(cfg, backend, size, vol=""):
+        return {"pod_id": "pod-rx", "reused": False}
+
+    monkeypatch.setattr(gw_app.upload, "init_receiver", fake_init)
+    with TestClient(gw_app.app) as client:
+        # init: filename is basename'd; >20GB → 413
+        r = client.post("/admin/models/upload-init", json={
+            "filename": "../evil/../mymodel.gguf", "size_bytes": 1234})
+        assert r.status_code == 200
+        assert r.json()["filename"] == "mymodel.gguf"
+        r = client.post("/admin/models/upload-init", json={
+            "filename": "x.gguf", "size_bytes": 21 * 1024 ** 3})
+        assert r.status_code == 413
+
+        # relay: fake httpx captures the forwarded PUT
+        captured = {}
+
+        class _RelayResp:
+            status_code = 200
+            content = b"{}"
+            text = "{}"
+
+            def json(self):
+                return {"ok": True, "bytes": 8}
+
+        class _RelayClient:
+            def __init__(self, timeout=None):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def put(self, url, content=None, headers=None):
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["body"] = b"".join([c async for c in content])
+                return _RelayResp()
+
+        monkeypatch.setattr(httpx, "AsyncClient", _RelayClient)
+        r = client.put("/admin/models/upload", content=b"MODELDATA",
+                       headers={"x-pod-id": "pod-rx",
+                                "x-filename": "mymodel.gguf",
+                                "x-file-size": "8"})
+        assert r.status_code == 200, r.text
+        assert captured["url"] == up.receiver_url("pod-rx", "mymodel.gguf")
+        assert captured["headers"]["Content-Length"] == "8"
+        assert captured["body"] == b"MODELDATA"
+        r = client.put("/admin/models/upload", content=b"x")
+        assert r.status_code == 400
+
+        # status / finalize (real finalize, patched receiver status)
+        async def fake_status(pid, fn):
+            return {"name": fn, "size": 8}
+
+        monkeypatch.setattr(gw_app.upload, "receiver_status", fake_status)
+        r = client.get("/admin/models/upload-status",
+                       params={"pod_id": "pod-rx", "filename": "m.gguf"})
+        assert r.json()["size"] == 8
+        r = client.post("/admin/models/upload-finalize", json={
+            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 8})
+        body = r.json()
+        assert body["file_url"] == up.receiver_url("pod-rx", "file/m.gguf")
+        assert body["source"] == "upload"
+        assert body["size_gb"] == 0.0
+        # size mismatch → 502
+        r = client.post("/admin/models/upload-finalize", json={
+            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 99})
+        assert r.status_code == 502
+
+        # cleanup (patched)
+        async def fake_clean(cfg, backend):
+            return {"ok": True, "terminated": True, "pod_id": "pod-rx"}
+
+        monkeypatch.setattr(gw_app.upload, "cleanup_receiver", fake_clean)
+        r = client.post("/admin/models/upload-cleanup", json={})
+        assert r.json()["terminated"] is True
