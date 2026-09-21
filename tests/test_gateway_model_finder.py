@@ -447,7 +447,7 @@ def test_deploy_custom_success_persists(wired, monkeypatch):
     monkeypatch.setattr(gw_app.runpod, "deploy_pod", fake_deploy)
     with TestClient(gw_app.app) as client:
         r = client.post("/admin/models/deploy-custom", json={
-            "source": "hf", "repo_id": "Qwen/Qwen3-VL-8B-GGUF",
+            "source": "upload", "repo_id": "Qwen/Qwen3-VL-8B-GGUF",
             "file_name": "Qwen3-VL-8B-Q4_K_M.gguf",
             "file_url": ("https://huggingface.co/Qwen/Qwen3-VL-8B-GGUF/"
                          "resolve/main/Qwen3-VL-8B-Q4_K_M.gguf"),

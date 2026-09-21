@@ -3381,8 +3381,9 @@ async def admin_models_deploy_custom(
     auto-recover, boot-watch)."""
     if not (payload.file_name and payload.file_url and payload.size_gb > 0):
         return _error(400, "file_name, file_url and size_gb are required")
-    if payload.source not in modelsearch.SOURCES:
-        return _error(400, f"source must be one of {modelsearch.SOURCES}")
+    if payload.source not in (*modelsearch.SOURCES, "upload"):
+        return _error(400, f"source must be one of "
+                           f"{modelsearch.SOURCES + ('upload',)}")
     cfg = get_gateway_config()
     cfg.maybe_reload()
     backend = payload.backend or _runpod_api_key_env(cfg)[0]
