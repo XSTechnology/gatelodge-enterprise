@@ -304,6 +304,31 @@ def _error(status: int, message: str, err_type: str = "invalid_request_error",
     )
 
 
+def _exec_error_response(e: BaseException, requested: str,
+                         stream: bool, t0: float) -> JSONResponse:
+    """Classify-aware failure propagation — NO engine switching.
+
+    Policy: when an external provider fails, the requestor gets an
+    OpenAI-shaped error describing WHAT failed; the gateway never
+    substitutes a local model (the box may not have the VRAM for it, and
+    the caller asked for a specific model). Upstream rate limits map to
+    429 + Retry-After (OpenAI clients back off natively); timeouts map
+    to 504; every other class is 502 with code=<class>."""
+    kind = cloud.classify_error(e)
+    ms = int((time.perf_counter() - t0) * 1000)
+    logger.warning("gateway execution failed (%s, %s): %s", requested, kind, e)
+    status, err_type, code = 502, "server_error", kind or "execution_error"
+    headers: dict[str, str] | None = None
+    if kind == "rate_limit":
+        status, err_type, code = 429, "rate_limit_error", "rate_limited"
+        headers = {"Retry-After": "1"}
+    elif kind == "timeout":
+        status = 504
+    _log_request(requested, "", stream, ms, {}, status, err=kind)
+    return _error(status, str(e), err_type=err_type, code=code,
+                  headers=headers)
+
+
 # ── Bearer auth (gateway_keys; empty list = open, localhost trust) ─────────
 
 @app.middleware("http")
@@ -1139,12 +1164,7 @@ async def chat_completions(body: ChatRequest) -> Response:
             return _error(503, str(e), err_type="overloaded_error",
                           code="budget_exceeded")
         except Exception as e:
-            ms = int((time.perf_counter() - t0) * 1000)
-            logger.warning("gateway chat failed (%s): %s", requested, e)
-            _log_request(requested, "", body.stream, ms, {}, 502,
-                         err=cloud.classify_error(e))
-            return _error(502, str(e), err_type="server_error",
-                          code="execution_error")
+            return _exec_error_response(e, requested, body.stream, t0)
         ms = int((time.perf_counter() - t0) * 1000)
         resp.setdefault("served_by", {"backend": winner, "model": model_key,
                                       "ms": ms})
@@ -1440,13 +1460,16 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             _log_request(requested, backend_name, True, ms, {}, 200)
         except Exception as e:
             ms = int((time.perf_counter() - t0) * 1000)
-            logger.warning("gateway stream failed (%s / %s): %s",
-                           backend_name, model_key, e)
+            kind = cloud.classify_error(e)
+            logger.warning("gateway stream failed (%s / %s, %s): %s",
+                           backend_name, model_key, kind, e)
+            # Mid-flight errors: SSE has no status code to change — the
+            # error event carries the class so clients can react.
             yield "data: " + json.dumps(
                 {"error": {"message": str(e), "type": "server_error",
-                           "code": "execution_error"}}) + "\n\n"
+                           "code": kind or "execution_error"}}) + "\n\n"
             yield "data: [DONE]\n\n"
-            _log_request(requested, backend_name, True, ms, {}, 502)
+            _log_request(requested, backend_name, True, ms, {}, 502, err=kind)
         finally:
             _release_chat_slot(slot)
 
@@ -1816,12 +1839,7 @@ async def legacy_completions(body: CompletionRequest) -> Response:
                      d.get("usage") or {}, 200)
         return JSONResponse(d)
     except Exception as e:
-        ms = int((time.perf_counter() - t0) * 1000)
-        logger.warning("gateway completion failed (%s): %s", requested, e)
-        _log_request(requested, "", body.stream, ms, {}, 502,
-                     err=cloud.classify_error(e))
-        return _error(502, str(e), err_type="server_error",
-                      code="execution_error")
+        return _exec_error_response(e, requested, body.stream, t0)
     finally:
         _release_chat_slot(slot)
 
@@ -2361,6 +2379,15 @@ async def anthropic_messages(request: Request) -> Response:
             kwargs["tools"] = tools
         resp = await client.chat.completions.create(**kwargs)
     except Exception as e:  # noqa: BLE001 — surface upstream failure
+        # classify (walks causes: the gateway's own 429/504 arrive as
+        # openai APIStatusError) — the requestor gets the class, never a
+        # substituted model.
+        kind = cloud.classify_error(e)
+        if kind == "rate_limit":
+            return _anthropic_error(429, f"Upstream rate limited: {e}",
+                                    "rate_limit_error")
+        if kind == "timeout":
+            return _anthropic_error(504, f"Upstream timeout: {e}", "api_error")
         return _anthropic_error(502, f"Upstream error: {e}", "api_error")
     finally:
         aw = _close_quietly(client)

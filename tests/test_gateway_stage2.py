@@ -294,10 +294,13 @@ def test_stream_engine_error_yields_error_event(wired, gguf):
     assert done
     assert lines[-1] == "data: [DONE]"
     # exactly one event, and it is an OpenAI-shaped error object
+    # (code carries the classified failure kind — "unknown" for a
+    # missing-GGUF error; classified kinds like server/timeout when the
+    # backend said so)
     assert len(events) == 1
     err = events[0].get("error") or {}
     assert err.get("type") == "server_error"
-    assert err.get("code") == "execution_error"
+    assert err.get("code") == "unknown"
     assert "not found" in err.get("message", "")
 
 

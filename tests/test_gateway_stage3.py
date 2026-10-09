@@ -948,3 +948,99 @@ def test_admin_verify_reports_failures(wired, gguf, monkeypatch):
             assert data["summary"]["fail"] == 1
 
     _with_fake_llama(fn)
+
+
+# ── classify-aware error propagation (NO engine switching) ─────────────────
+
+def _failing_cloud(monkeypatch, exc):
+    fake = _FakeCloud()
+
+    async def _boom(**kwargs):
+        raise exc
+
+    fake.chat.completions.create = _boom
+    return _patch_cloud(monkeypatch, fake)
+
+
+def test_upstream_rate_limit_maps_429_with_retry_after(wired, gguf, monkeypatch):
+    """Upstream 429 → our 429 + Retry-After: OpenAI clients back off
+    natively instead of hammering a rate-limited provider."""
+    wired(_config(gguf))
+    e = RuntimeError("Too many requests")
+    e.status_code = 429
+    _failing_cloud(monkeypatch, e)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "rate limited request"}]})
+    assert r.status_code == 429
+    assert r.headers["retry-after"] == "1"
+    body = r.json()["error"]
+    assert body["type"] == "rate_limit_error"
+    assert body["code"] == "rate_limited"
+    assert "Too many requests" in body["message"]
+
+
+def test_upstream_timeout_maps_504(wired, gguf, monkeypatch):
+    wired(_config(gguf))
+    from openai import APITimeoutError
+    _failing_cloud(monkeypatch, APITimeoutError(request=None))
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user",
+                          "content": "slow upstream should time out"}]})
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "timeout"
+
+
+def test_upstream_auth_maps_502_with_class(wired, gguf, monkeypatch):
+    """A bad key is OUR config problem — 502 with code=auth tells the
+    operator what to fix; the requestor can't do anything about it."""
+    wired(_config(gguf))
+    e = RuntimeError("invalid api key")
+    e.status_code = 401
+    _failing_cloud(monkeypatch, e)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "auth failing request"}]})
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "auth"
+
+
+def test_upstream_unknown_stays_502(wired, gguf, monkeypatch):
+    wired(_config(gguf))
+    _failing_cloud(monkeypatch, RuntimeError("connection refused"))
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user",
+                          "content": "mystery failure kind request"}]})
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "unknown"
+
+
+def test_stream_error_event_carries_class(wired, gguf, monkeypatch):
+    """Mid-flight stream errors: SSE has no status to change — the error
+    EVENT carries the class so clients can react."""
+    wired(_config(gguf))
+    e = RuntimeError("upstream exploded")
+    e.status_code = 500
+    fake = _FakeCloud()
+
+    async def _boom(**kwargs):
+        raise e
+
+    fake.chat.completions.create = _boom
+    _patch_cloud(monkeypatch, fake)
+    with TestClient(gw_app.app) as client:
+        with client.stream("POST", "/v1/chat/completions", json={
+                "model": "groq:cloud-fast", "stream": True,
+                "messages": [{"role": "user",
+                              "content": "stream failure probe"}]}) as r:
+            assert r.status_code == 200  # SSE headers already sent
+            lines = [ln for ln in r.iter_lines() if ln.strip()]
+    err = json.loads(lines[-2][len("data: "):])
+    assert err["error"]["code"] == "server"
+    assert lines[-1] == "data: [DONE]"
