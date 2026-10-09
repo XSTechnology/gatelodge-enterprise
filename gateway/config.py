@@ -393,6 +393,21 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
             entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
+            # Output cap applied to client-sent max_tokens: int ≥ 1, or
+            # null = UNCAPPED (reasoning models — gpt-oss via the HF
+            # router — spend the budget on reasoning_content and come
+            # back empty under a tight cap). Absent = cloud default (800).
+            if "max_tokens_cap" in b:
+                raw_cap = b["max_tokens_cap"]
+                if raw_cap is None:
+                    entry["max_tokens_cap"] = None
+                else:
+                    try:
+                        entry["max_tokens_cap"] = max(1, int(raw_cap))
+                    except (TypeError, ValueError):
+                        logger.warning("gateway config: backend %r "
+                                       "max_tokens_cap must be an int or "
+                                       "null — using the default", name)
             cmodels: dict[str, str] = {}
             for mname, m in (b.get("models") or {}).items():
                 if isinstance(m, dict):

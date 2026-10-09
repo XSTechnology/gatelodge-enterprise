@@ -867,10 +867,10 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     if body.temperature is not None:
         kwargs["temperature"] = body.temperature
     if body.max_tokens:
-        # cap for openai-type cloud (cost); local llama-server and runpod
-        # (per-second billing) pass through
-        kwargs["max_tokens"] = (min(body.max_tokens, cloud.CLOUD_MAX_TOKENS_CAP)
-                                if btype == "openai" else body.max_tokens)
+        # cap per the backend's policy (openai-type cloud = cost control;
+        # max_tokens_cap null = uncapped; local llama-server and runpod
+        # per-second billing pass through)
+        kwargs["max_tokens"] = cloud.cap_max_tokens(backend, body.max_tokens)
     if body.tools:
         kwargs["tools"] = body.tools
     try:
@@ -910,6 +910,35 @@ async def _first_success(tasks: list[asyncio.Task],
     raise errs[0] if errs else RuntimeError("race produced no result")
 
 
+# ── chain cold breaker (ported from the assistant's RunPod hedge
+# bookkeeping): a chain PRIMARY that stalls past hedge_s (or errors)
+# gets skipped for the cooldown window instead of burning hedge_s on
+# every request racing a bad backend. Keyed "backend:model". A primary
+# win clears it; expiry is the retry. Single-entry chains execute
+# regardless (no fallback to skip to). Fallback entries are not
+# breaker-tracked — only primaries pay the per-request hedge cost. ──
+
+_COLD_BREAK_S = 120.0
+_COLD_UNTIL: dict[str, float] = {}
+
+
+def _breaker_open(key: str) -> bool:
+    return time.monotonic() < _COLD_UNTIL.get(key, 0.0)
+
+
+def _breaker_mark(key: str) -> None:
+    _COLD_UNTIL[key] = time.monotonic() + _COLD_BREAK_S
+
+
+def _breaker_clear(key: str) -> None:
+    _COLD_UNTIL.pop(key, None)
+
+
+def reset_breakers() -> None:
+    """Drop breaker state (tests)."""
+    _COLD_UNTIL.clear()
+
+
 async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
                       body: ChatRequest, requested: str):
     """Execute an alias chain with hedge semantics.
@@ -917,26 +946,40 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
     Single entry → direct. Multi entry → run the primary; if it completes
     within hedge_s (or hedge_s is 0) it wins; otherwise (or on its error)
     the next entry races it — first completion wins, remaining entries
-    follow the same rule."""
+    follow the same rule. A recently-stalled primary is skipped outright
+    (cold breaker above)."""
     if len(entries) == 1:
         return await _exec_entry(cfg, entries[0], body, requested)
 
-    primary = asyncio.create_task(_exec_entry(cfg, entries[0], body, requested))
-    if hedge_s and hedge_s > 0:
-        try:
-            return await asyncio.wait_for(asyncio.shield(primary), hedge_s)
-        except asyncio.TimeoutError:
-            pass  # hedge fires — fall through to the race below
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            primary = None  # primary failed fast — fallbacks only
+    pkey = f"{entries[0][0]}:{entries[0][1]}"
+    if _breaker_open(pkey):
+        logger.info("chain primary %s cold (recent stall) — starting at the fallback",
+                    pkey)
+        primary = None
     else:
-        # no hedge configured: wait for the primary; on error, fall back
-        try:
-            return await primary
-        except Exception:
-            primary = None
+        primary = asyncio.create_task(_exec_entry(cfg, entries[0], body, requested))
+    if primary is not None:
+        if hedge_s and hedge_s > 0:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(primary), hedge_s)
+                _breaker_clear(pkey)
+                return result
+            except asyncio.TimeoutError:
+                _breaker_mark(pkey)  # hedge fires — fall through to the race
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _breaker_mark(pkey)
+                primary = None  # primary failed fast — fallbacks only
+        else:
+            # no hedge configured: wait for the primary; on error, fall back
+            try:
+                result = await primary
+                _breaker_clear(pkey)
+                return result
+            except Exception:
+                _breaker_mark(pkey)
+                primary = None
 
     def _cancel_ok(entry: tuple[str, str]) -> bool:
         return (cfg.backends.get(entry[0]) or {}).get("type") != "embedded"
@@ -946,8 +989,13 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
         fb = asyncio.create_task(_exec_entry(cfg, entry, body, requested))
         racers = ([primary, fb] if primary is not None else [fb])
         try:
-            return await _first_success(
+            result = await _first_success(
                 racers, [_cancel_ok(entries[0]), _cancel_ok(entry)][:len(racers)])
+            if (primary is not None and primary.done()
+                    and not primary.cancelled()
+                    and primary.exception() is None):
+                _breaker_clear(pkey)  # primary finished fine after all
+            return result
         except Exception as e:
             last_err = e
             primary = None
@@ -1291,10 +1339,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 if body.temperature is not None:
                     kwargs["temperature"] = body.temperature
                 if body.max_tokens:
-                    kwargs["max_tokens"] = (min(body.max_tokens,
-                                                cloud.CLOUD_MAX_TOKENS_CAP)
-                                            if backend.get("type") == "openai"
-                                            else body.max_tokens)
+                    kwargs["max_tokens"] = cloud.cap_max_tokens(
+                        backend, body.max_tokens)
                 if body.tools:
                     kwargs["tools"] = body.tools
                 stream = await client.chat.completions.create(**kwargs)
@@ -1672,8 +1718,7 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         if body.temperature is not None:
             kwargs["temperature"] = body.temperature
         if body.max_tokens:
-            kwargs["max_tokens"] = (min(body.max_tokens, cloud.CLOUD_MAX_TOKENS_CAP)
-                                    if btype == "openai" else body.max_tokens)
+            kwargs["max_tokens"] = cloud.cap_max_tokens(backend, body.max_tokens)
         try:
             resp = await client.completions.create(**kwargs)
         except Exception as e:

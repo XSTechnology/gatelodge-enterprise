@@ -473,3 +473,231 @@ def test_jsonl_log_one_line_per_request(wired, gguf, monkeypatch):
                               "usage", "status"} for e in entries)
 
     _with_fake_llama(fn)
+
+
+# ── api key resolution: env → OS keyring ───────────────────────────────────
+
+def test_key_env_beats_keyring(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "env-key")
+    monkeypatch.setitem(sys.modules, "keyring", types.SimpleNamespace(
+        get_password=lambda svc, user: "ring-key"))
+    assert gw_cloud._env_or_keyring("GROQ_API_KEY") == "env-key"
+
+
+def test_key_keyring_fallback_both_casings(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    seen: list[str] = []
+
+    def _get(svc, user):
+        seen.append(svc)
+        return "ring-key" if svc == "workshop" and user == "GROQ_API_KEY" else None
+
+    monkeypatch.setitem(sys.modules, "keyring",
+                        types.SimpleNamespace(get_password=_get))
+    assert gw_cloud._env_or_keyring("GROQ_API_KEY") == "ring-key"
+    assert seen == ["Workshop", "workshop"]  # both casings tried in order
+
+
+def test_cloud_client_builds_from_keyring(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "keyring", types.SimpleNamespace(
+        get_password=lambda svc, user: "ring-key" if user == "GROQ_API_KEY" else None))
+    # fresh backend dict — the module-level GROQ is mutated by earlier tests
+    backend = {"type": "openai", "base_url": "https://api.groq.com/openai/v1",
+               "api_key_env": "GROQ_API_KEY",
+               "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    gw_cloud.reset_clients()
+    try:
+        c1 = gw_cloud.get_cloud_client("krg-test", backend)
+        c2 = gw_cloud.get_cloud_client("krg-test", backend)
+        assert c1 is not None and c2 is c1  # cached per signature
+    finally:
+        gw_cloud.reset_clients()
+
+
+def test_key_missing_everywhere_raises(monkeypatch):
+    monkeypatch.delenv("GATEWAY_TEST_KEY_DEFINITELY_UNSET", raising=False)
+    monkeypatch.setitem(sys.modules, "keyring",
+                        types.SimpleNamespace(get_password=lambda s, u: None))
+    gw_cloud.reset_clients()
+    with pytest.raises(CloudBackendError, match="keyring"):
+        gw_cloud.get_cloud_client("nokey", {
+            "type": "openai", "base_url": "https://x.example/v1",
+            "api_key_env": "GATEWAY_TEST_KEY_DEFINITELY_UNSET",
+            "models": {}})
+
+
+# ── per-backend max_tokens policy ──────────────────────────────────────────
+
+def test_cap_max_tokens_policy():
+    b = {"type": "openai"}
+    assert gw_cloud.cap_max_tokens(b, 2000) == 800            # default cap
+    assert gw_cloud.cap_max_tokens(b, 50) == 50               # under cap
+    assert gw_cloud.cap_max_tokens({**b, "max_tokens_cap": 100}, 2000) == 100
+    assert gw_cloud.cap_max_tokens({**b, "max_tokens_cap": None}, 2000) == 2000
+    assert gw_cloud.cap_max_tokens({"type": "runpod"}, 2000) == 2000
+    assert gw_cloud.cap_max_tokens({"type": "llama-server"}, 2000) == 2000
+    assert gw_cloud.cap_max_tokens(b, None) is None           # omitted stays omitted
+
+
+def test_backend_cap_override_end_to_end(wired, gguf, monkeypatch):
+    """max_tokens_cap: null = uncapped (HF router / gpt-oss), int = custom,
+    absent = default 800 — parsed by config, applied at the cap sites."""
+    cfgd = _config(gguf)
+    # fresh dicts — the module-level GROQ is shared (and mutated) by
+    # other tests; never write through it
+    cfgd["backends"]["groq"] = {
+        "type": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY", "max_tokens_cap": 100,
+        "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    cfgd["backends"]["hf"] = {
+        "type": "openai", "base_url": "https://router.huggingface.co/v1",
+        "api_key_env": "HF_TOKEN", "max_tokens_cap": None,
+        "models": {"glm53": "zai-org/GLM-5.3-Flash"}}
+    _, cfg, _ = wired(cfgd)
+    assert cfg.backends["hf"]["max_tokens_cap"] is None
+    assert cfg.backends["groq"]["max_tokens_cap"] == 100
+    assert "max_tokens_cap" not in cfg.backends["local"]  # default applies
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions", json={
+                "model": "hf:glm53", "max_tokens": 2000,
+                "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert fake.calls[0]["max_tokens"] == 2000   # null = uncapped
+            r = client.post("/v1/chat/completions", json={
+                "model": "groq:cloud-fast", "max_tokens": 2000,
+                "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert fake.calls[1]["max_tokens"] == 100    # custom cap
+            r = client.post("/v1/chat/completions", json={
+                "model": "groq:cloud-fast", "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert fake.calls[2]["max_tokens"] == 50     # under cap unchanged
+
+    _with_fake_llama(fn)
+
+
+# ── chain cold breaker ─────────────────────────────────────────────────────
+
+def _breaker_cfg(gguf, hedge=0.2):
+    return _config(gguf, aliases={
+        "smart": {"chain": ["groq:cloud-fast", "local:fast"],
+                  "hedge_s": hedge}})
+
+
+def test_breaker_opens_after_stall_then_skips_primary(wired, gguf, monkeypatch):
+    """Primary stalls past hedge_s → fallback answers + breaker opens; the
+    NEXT request starts at the fallback without calling the primary again
+    (no hedge_s burned, no remote round-trip)."""
+    wired(_breaker_cfg(gguf))
+    fake = _patch_cloud(monkeypatch, _FakeCloud(delay=2.0))
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r1 = client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "q1"}]})
+            assert r1.status_code == 200, r1.text
+            assert r1.json()["served_by"]["backend"] == "local"
+            assert gw_app._breaker_open("groq:cloud-fast") is True
+            r2 = client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "q2"}]})
+            assert r2.status_code == 200, r2.text
+            assert r2.json()["served_by"]["backend"] == "local"
+        assert len(fake.calls) == 1  # primary attempted once, then skipped
+
+    gw_app.reset_breakers()
+    try:
+        _with_fake_llama(fn)
+    finally:
+        gw_app.reset_breakers()
+
+
+def test_breaker_primary_error_also_opens(wired, gguf, monkeypatch):
+    """A fast primary ERROR (not a stall) opens the breaker too — a dead
+    backend must not be retried at full hedge cost every request."""
+    wired(_breaker_cfg(gguf, hedge=5))
+    calls: list[int] = []
+
+    async def _boom_create(**kwargs):
+        calls.append(1)
+        raise RuntimeError("cloud down")
+
+    fake = _FakeCloud()
+    fake.chat.completions.create = _boom_create
+    _patch_cloud(monkeypatch, fake)
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r1 = client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "q1"}]})
+            assert r1.status_code == 200, r1.text
+            assert r1.json()["served_by"]["backend"] == "local"
+            assert gw_app._breaker_open("groq:cloud-fast") is True
+            r2 = client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "q2"}]})
+            assert r2.status_code == 200, r2.text
+            assert r2.json()["served_by"]["backend"] == "local"
+        assert len(calls) == 1  # errored once, then skipped
+
+    gw_app.reset_breakers()
+    try:
+        _with_fake_llama(fn)
+    finally:
+        gw_app.reset_breakers()
+
+
+def test_breaker_expires_primary_retried(wired, gguf, monkeypatch):
+    """After the cooldown the primary is attempted again."""
+    wired(_breaker_cfg(gguf))
+    fake = _patch_cloud(monkeypatch, _FakeCloud(delay=2.0))
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "q1"}]})
+            assert gw_app._breaker_open("groq:cloud-fast") is True
+            # force-expire the cooldown window
+            gw_app._COLD_UNTIL["groq:cloud-fast"] -= gw_app._COLD_BREAK_S + 1
+            assert gw_app._breaker_open("groq:cloud-fast") is False
+            client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "q2"}]})
+        assert len(fake.calls) == 2  # primary retried after expiry
+
+    gw_app.reset_breakers()
+    try:
+        _with_fake_llama(fn)
+    finally:
+        gw_app.reset_breakers()
+
+
+def test_breaker_primary_fast_win_keeps_it_closed(wired, gguf, monkeypatch):
+    """A primary that answers within hedge_s wins and never opens the
+    breaker — slow backends are only skipped after they actually stall."""
+    wired(_breaker_cfg(gguf, hedge=5))
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions", json={
+                "model": "smart",
+                "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert r.json()["served_by"]["backend"] == "groq"
+            assert gw_app._breaker_open("groq:cloud-fast") is False
+        assert len(fake.calls) == 1
+
+    gw_app.reset_breakers()
+    try:
+        _with_fake_llama(fn)
+    finally:
+        gw_app.reset_breakers()
