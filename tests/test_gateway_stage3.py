@@ -14,6 +14,7 @@ import time
 import types
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1064,3 +1065,202 @@ def test_stream_error_event_carries_class(wired, gguf, monkeypatch):
     err = json.loads(lines[-2][len("data: "):])
     assert err["error"]["code"] == "server"
     assert lines[-1] == "data: [DONE]"
+
+
+# ── console model-add: "name" key survives the normalizer ──────────────────
+
+def test_config_accepts_name_key_for_cloud_models(wired, gguf):
+    """The console's model form writes {"name": <remote_id>} for openai /
+    llama-server-remote models — the normalizer must read it or those
+    entries silently vanish on reload (observed bug)."""
+    _, cfg, _ = wired(_config(gguf))
+    raw = json.dumps({
+        "port": 9911, "bind": "127.0.0.1", "models_dir": str(gguf.parent / "models"),
+        "backends": {
+            "groq": {"type": "openai", "base_url": "https://api.groq.com/openai/v1",
+                     "api_key_env": "GROQ_API_KEY",
+                     "models": {"a": {"name": "org/model-a"},
+                                "b": "org/model-b",
+                                "c": {"id": "org/model-c"}}},
+            "ws": {"type": "llama-server", "base_url": "http://127.0.0.1:1/v1",
+                   "models": {"d": {"name": "remote-d"}}}},
+        "aliases": {}})
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "gw.json"
+        p.write_text(raw, encoding="utf-8")
+        c2 = gw_config.GatewayConfig(p)
+    assert c2.backends["groq"]["models"] == {
+        "a": "org/model-a", "b": "org/model-b", "c": "org/model-c"}
+    assert c2.backends["ws"]["models"] == {"d": "remote-d"}
+
+
+def test_console_add_model_survives_reload(wired, gguf, monkeypatch):
+    """POST /admin/models (the console form) for an openai backend → the
+    entry persists through a config reload with the right wire id."""
+    cfgfile, cfg, _ = wired(_config(gguf))
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/models", json={
+            "name": "glm53", "backend": "groq", "role": "chat",
+            "remote_id": "zai-org/GLM-5.3-Flash"})
+        assert r.status_code == 200, r.text
+    fresh = gw_config.GatewayConfig(cfgfile)
+    assert fresh.backends["groq"]["models"]["glm53"] == "zai-org/GLM-5.3-Flash"
+
+
+# ── /admin/backends/{name}/remote-models (cloud catalog proxy) ─────────────
+
+def test_remote_models_proxies_catalog(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _config(gguf)
+    # fresh dict — the module-level GROQ is mutated by earlier tests
+    cfgd["backends"]["groq"] = {
+        "type": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    wired(cfgd)
+
+    async def _fake_fetch(base_url, api_key):
+        assert base_url == "https://api.groq.com/openai/v1"
+        return {"data": [{"id": "zai-org/GLM-5.3-Flash",
+                          "pricing": {"groq": 0.1}},
+                         {"id": "openai/gpt-oss-120b"}]}
+
+    monkeypatch.setattr(gw_app, "_fetch_remote_catalog", _fake_fetch)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/backends/groq/remote-models")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["backend"] == "groq"
+    assert d["count"] == 2
+    # metadata passes through verbatim for the console picker
+    assert d["models"][0]["pricing"] == {"groq": 0.1}
+
+
+def test_remote_models_rejects_non_openai_backend(wired, gguf):
+    wired(_config(gguf))  # "local" is embedded
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/backends/local/remote-models")
+    assert r.status_code == 400
+    r = client.get("/admin/backends/nope/remote-models")
+    assert r.status_code == 404
+
+
+def test_remote_models_missing_key_is_auth_error(wired, gguf, monkeypatch):
+    monkeypatch.delenv("GATEWAY_TEST_KEY_DEFINITELY_UNSET", raising=False)
+    monkeypatch.setitem(sys.modules, "keyring",
+                        types.SimpleNamespace(get_password=lambda s, u: None))
+    cfgd = _config(gguf)
+    cfgd["backends"]["groq"] = {
+        "type": "openai", "base_url": "https://x.example/v1",
+        "api_key_env": "GATEWAY_TEST_KEY_DEFINITELY_UNSET",
+        "models": {"m": "x"}}
+    wired(cfgd)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/backends/groq/remote-models")
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "auth"
+
+
+def test_remote_models_upstream_failure_is_network(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _config(gguf)
+    cfgd["backends"]["groq"] = {  # fresh dict — GROQ is mutated by earlier tests
+        "type": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    wired(cfgd)
+
+    async def _fetch_boom(base_url, api_key):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(gw_app, "_fetch_remote_catalog", _fetch_boom)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/backends/groq/remote-models")
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "network"
+
+
+# ── monthly token budget (openai-type cloud backends) ──────────────────────
+
+def _seed_budget_log(tokens_this_month, extra_lines=()):
+    """Write ledger lines into the request log: this-month usage for the
+    groq backend + decoys (old month, cache hits)."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    old = "2020-01-01T00:00:00"
+    lines = [
+        json.dumps({"ts": now, "model": "groq:cloud-fast", "backend": "groq",
+                    "stream": False, "ms": 1,
+                    "usage": {"total_tokens": tokens_this_month}, "status": 200}),
+        # decoys: different month, cache hit, different backend
+        json.dumps({"ts": old, "model": "groq:cloud-fast", "backend": "groq",
+                    "stream": False, "ms": 1,
+                    "usage": {"total_tokens": 9999}, "status": 200}),
+        json.dumps({"ts": now, "model": "groq:cloud-fast", "backend": "cache",
+                    "stream": False, "ms": 0,
+                    "usage": {"total_tokens": 9999}, "status": 200}),
+    ] + list(extra_lines)
+    gw_app._LOG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_token_budget_blocks_and_charges(wired, gguf, monkeypatch):
+    cfgd = _config(gguf)
+    cfgd["backends"]["groq"] = {
+        "type": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY", "monthly_token_budget": 100,
+        "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    wired(cfgd)
+    _seed_budget_log(90)  # 90/100 used this month (decoys excluded)
+    fake = _patch_cloud(monkeypatch, _FakeCloud())  # usage total = 8
+
+    with TestClient(gw_app.app) as client:
+        # gate checks BEFORE the call: 90 < 100 → executes → ledger 98
+        r1 = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "budget under"}]})
+        assert r1.status_code == 200, r1.text
+        assert gw_app._token_budget_used("groq") == 98
+        # 98 < 100 → still allowed → ledger 106 (goes OVER mid-flight)
+        r2 = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "budget edge"}]})
+        assert r2.status_code == 200, r2.text
+        # 106 ≥ 100 → refused without touching the provider
+        r3 = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "budget over now"}]})
+        assert r3.status_code == 503
+        body = r3.json()["error"]
+        assert body["code"] == "budget_exceeded"
+        assert body["type"] == "overloaded_error"
+        assert "106/100" in body["message"]
+        assert len(fake.calls) == 2  # the third never reached the provider
+
+
+def test_token_budget_zero_is_off(wired, gguf, monkeypatch):
+    """No monthly_token_budget (default 0) → no enforcement ever."""
+    wired(_config(gguf))
+    _seed_budget_log(999999)
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "no budget configured"}]})
+        assert r.status_code == 200, r.text
+        assert len(fake.calls) == 1
+
+
+def test_token_budget_in_stats(wired, gguf, monkeypatch):
+    cfgd = _config(gguf)
+    cfgd["backends"]["groq"] = {
+        "type": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY", "monthly_token_budget": 500,
+        "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    wired(cfgd)
+    _seed_budget_log(120)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/stats")
+        assert r.status_code == 200
+        budgets = r.json()["budgets"]
+        assert budgets == [{"backend": "groq", "budget": 500, "used": 120,
+                            "month": time.strftime("%Y-%m")}]

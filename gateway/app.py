@@ -382,6 +382,84 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
         logger.warning("gateway_log write failed", exc_info=True)
 
 
+# ── per-backend monthly token budget (openai-type cloud backends) ──────────
+# The request log IS the ledger: the counter derives from gateway_log.jsonl
+# (backend == <name>, ts in the current month; cache hits log backend
+# "cache" and never bill upstream, so they are excluded for free) and
+# increments in memory afterwards. month roll-over re-derives from the
+# log. Streams are NOT charged — their usage isn't extracted (the same
+# blind spot /admin/stats has). 0 = off (default).
+
+_TOKEN_LEDGER: dict[str, dict[str, Any]] = {}  # backend → {month, used}
+
+
+def _month_key() -> str:
+    return time.strftime("%Y-%m")
+
+
+def _token_budget_used(backend_name: str) -> int:
+    """Tokens used this month by a backend — log-derived, cached in
+    memory; re-derived when the month rolls over."""
+    month = _month_key()
+    led = _TOKEN_LEDGER.get(backend_name)
+    if led is not None and led.get("month") == month:
+        return int(led.get("used") or 0)
+    used = 0
+    prefix = month + "-"
+    try:
+        with open(_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if backend_name not in ln:
+                    continue  # cheap pre-filter before json parsing
+                try:
+                    e = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if (e.get("backend") == backend_name
+                        and str(e.get("ts") or "").startswith(prefix)):
+                    used += int((e.get("usage") or {})
+                                .get("total_tokens") or 0)
+    except OSError:
+        pass
+    _TOKEN_LEDGER[backend_name] = {"month": month, "used": used}
+    return used
+
+
+def _charge_tokens(backend_name: str, total_tokens: int) -> None:
+    if total_tokens <= 0:
+        return
+    led = _TOKEN_LEDGER.get(backend_name)
+    if led is None or led.get("month") != _month_key():
+        _token_budget_used(backend_name)  # initialize from the log
+        led = _TOKEN_LEDGER.get(backend_name) or {}
+    led["used"] = int(led.get("used") or 0) + int(total_tokens)
+
+
+def reset_token_ledger() -> None:
+    """Drop in-memory budget counters (tests / admin)."""
+    _TOKEN_LEDGER.clear()
+
+
+async def _token_budget_gate(cfg, backend_name: str) -> None:
+    """Raise LifecycleBudgetExceeded (→ 503 budget_exceeded) when the
+    backend's monthly token budget is exhausted. No-op without a budget."""
+    backend = cfg.backends.get(backend_name) or {}
+    if backend.get("type") != "openai":
+        return
+    try:
+        budget = int(backend.get("monthly_token_budget") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if budget <= 0:
+        return
+    used = _token_budget_used(backend_name)
+    if used >= budget:
+        raise lifecycle.LifecycleBudgetExceeded(
+            f"backend {backend_name!r}: monthly token budget exhausted "
+            f"({used}/{budget} tokens) — raise monthly_token_budget or "
+            f"wait for the month to roll over")
+
+
 # ── request model ──────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -889,6 +967,9 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     client_timeout = (float(m.get("timeout_s") or 0)
                       if btype == "runpod" else 0.0) \
         or cfg.queue["timeout_s"]
+    if btype == "openai":
+        # monthly token budget (503 budget_exceeded when exhausted)
+        await _token_budget_gate(cfg, backend_name)
     client = cloud.get_cloud_client(client_name, cloud_backend,
                                     timeout=client_timeout)
     kwargs: dict[str, Any] = {
@@ -912,6 +993,9 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     d = (json.loads(resp.model_dump_json())
          if hasattr(resp, "model_dump_json") else dict(resp))
     d["model"] = requested  # consistent echo; served_by carries the truth
+    if btype == "openai":
+        _charge_tokens(backend_name,
+                       int((d.get("usage") or {}).get("total_tokens") or 0))
     return d, backend_name, model_key
 
 
@@ -1436,6 +1520,9 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                                       or cfg.queue["timeout_s"])
                 client = cloud.get_cloud_client(client_name, cloud_backend,
                                                 timeout=stream_timeout)
+                if backend.get("type") == "openai":
+                    # monthly token budget — 503-shaped mid-stream event
+                    await _token_budget_gate(cfg, backend_name)
                 kwargs: dict[str, Any] = {
                     "model": remote_id,
                     "messages": body.messages, "stream": True,
@@ -1458,6 +1545,13 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             logger.info("gateway stream ok (%s / %s) in %dms",
                         backend_name, model_key, ms)
             _log_request(requested, backend_name, True, ms, {}, 200)
+        except lifecycle.LifecycleBudgetExceeded as e:
+            ms = int((time.perf_counter() - t0) * 1000)
+            yield "data: " + json.dumps({"error": {
+                "message": str(e), "type": "overloaded_error",
+                "code": "budget_exceeded"}}) + "\n\n"
+            yield "data: [DONE]\n\n"
+            _log_request(requested, "", True, ms, {}, 503)
         except Exception as e:
             ms = int((time.perf_counter() - t0) * 1000)
             kind = cloud.classify_error(e)
@@ -1819,6 +1913,8 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         client_timeout = (float(m.get("timeout_s") or 0)
                           if btype == "runpod" else 0.0) \
             or cfg.queue["timeout_s"]
+        if btype == "openai":
+            await _token_budget_gate(cfg, backend_name)
         client = cloud.get_cloud_client(client_name, cloud_backend,
                                         timeout=client_timeout)
         kwargs: dict[str, Any] = {"model": remote_id, "prompt": body.prompt}
@@ -1834,10 +1930,18 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         d = (json.loads(resp.model_dump_json())
              if hasattr(resp, "model_dump_json") else dict(resp))
         d["model"] = requested
+        if btype == "openai":
+            _charge_tokens(backend_name,
+                           int((d.get("usage") or {}).get("total_tokens") or 0))
         ms = int((time.perf_counter() - t0) * 1000)
         _log_request(requested, backend_name, False, ms,
                      d.get("usage") or {}, 200)
         return JSONResponse(d)
+    except lifecycle.LifecycleBudgetExceeded as e:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _log_request(requested, "", body.stream, ms, {}, 503)
+        return _error(503, str(e), err_type="overloaded_error",
+                      code="budget_exceeded")
     except Exception as e:
         return _exec_error_response(e, requested, body.stream, t0)
     finally:
@@ -2534,7 +2638,24 @@ async def admin_stats() -> Response:
                      "total_tokens": agg["total_tokens"],
                      "errors": agg["errors"]})
     rows.sort(key=lambda r: -r["n"])
-    return {"per_model": rows, "recent": recent[-50:], "total": total}
+    # Monthly token budgets (openai-type cloud backends): live used/budget
+    # from the log-derived ledger — the console's HF panel shows this.
+    budgets = []
+    try:
+        bcfg = get_gateway_config()
+        for bname, b in (bcfg.backends or {}).items():
+            if (b.get("type") == "openai"
+                    and int(b.get("monthly_token_budget") or 0) > 0):
+                budgets.append({
+                    "backend": bname,
+                    "budget": int(b["monthly_token_budget"]),
+                    "used": _token_budget_used(bname),
+                    "month": _month_key(),
+                })
+    except Exception:
+        pass
+    return {"per_model": rows, "recent": recent[-50:], "total": total,
+            "budgets": budgets}
 
 
 @app.post("/admin/verify")
@@ -2841,6 +2962,55 @@ async def admin_upsert_backend(payload: BackendConfigPayload) -> Response:
 
     _mutate_config(lambda raw: raw.setdefault("backends", {}).update({name: bcfg}))
     return {"saved": name, "type": payload.backend_type}
+
+
+# ── Admin: remote model catalog (openai-type cloud backends) ───────────────
+
+async def _fetch_remote_catalog(base_url: str, api_key: str) -> dict[str, Any]:
+    """GET {base_url}/models, verbatim JSON (a separate function so tests
+    can monkeypatch it). The HF router includes per-provider pricing /
+    latency / throughput metadata on each entry — passed through
+    untouched for the console's model picker."""
+    async with httpx.AsyncClient(timeout=30.0) as hc:
+        r = await hc.get(f"{base_url.rstrip('/')}/models",
+                         headers={"Authorization": f"Bearer {api_key}"})
+        r.raise_for_status()
+        return r.json()
+
+
+@app.get("/admin/backends/{name}/remote-models")
+async def admin_remote_models(name: str) -> Response:
+    """Live model catalog for an openai-type cloud backend: proxies the
+    backend's GET {base_url}/models SERVER-SIDE so the API key never
+    reaches the browser (same secrecy rule as /admin/secrets). Works for
+    any OpenAI-compatible provider (HF router, Groq, OpenRouter...)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    backend = cfg.backends.get(name)
+    if not backend:
+        return _error(404, f"backend {name!r} not found", param="backend")
+    if backend.get("type") != "openai":
+        return _error(400, f"backend {name!r} is not an openai-type "
+                           f"cloud backend", param="backend")
+    key_env = str(backend.get("api_key_env") or "").strip()
+    api_key = cloud._env_or_keyring(key_env)
+    if key_env and not api_key:
+        return _error(502, f"api key env var {key_env!r} is not set and the "
+                           f"OS keyring has no '{key_env}' entry",
+                      code="auth")
+    try:
+        data = await _fetch_remote_catalog(
+            str(backend.get("base_url") or ""), api_key)
+    except httpx.HTTPStatusError as e:
+        return _exec_error_response(e, f"{name}:models", False,
+                                    time.perf_counter())
+    except httpx.RequestError as e:
+        return _error(502, f"catalog fetch failed: {e}", code="network")
+    models = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        models = []
+    return {"backend": name, "base_url": backend.get("base_url"),
+            "count": len(models), "models": models}
 
 
 @app.get("/admin/secrets")

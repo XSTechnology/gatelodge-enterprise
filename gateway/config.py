@@ -225,10 +225,11 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
             if base_url:
                 # REMOTE mode (RunPod / any llama-server over HTTP): models
                 # map our name → the server's model id, cloud-style.
+                # ("name" accepted for parity with the console's model form.)
                 rmodels: dict[str, str] = {}
                 for mname, m in (b.get("models") or {}).items():
                     if isinstance(m, dict):
-                        m = m.get("id") or m.get("model") or ""
+                        m = m.get("id") or m.get("model") or m.get("name") or ""
                     if isinstance(m, str) and m.strip():
                         rmodels[str(mname)] = m.strip()
                 entry["models"] = rmodels
@@ -399,6 +400,16 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
             entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
+            # Monthly token budget (0 = off): the gateway counts usage from
+            # its own request log (cache hits never bill — they log as
+            # backend "cache") and refuses with 503 budget_exceeded once
+            # the cap is hit. Streams are NOT charged (their usage isn't
+            # extracted — same blind spot as /admin/stats).
+            try:
+                entry["monthly_token_budget"] = max(0, int(
+                    b.get("monthly_token_budget") or 0))
+            except (TypeError, ValueError):
+                entry["monthly_token_budget"] = 0
             # Output cap applied to client-sent max_tokens: int ≥ 1, or
             # null = UNCAPPED (reasoning models — gpt-oss via the HF
             # router — spend the budget on reasoning_content and come
@@ -417,7 +428,10 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
             cmodels: dict[str, str] = {}
             for mname, m in (b.get("models") or {}).items():
                 if isinstance(m, dict):
-                    m = m.get("id") or m.get("model") or ""
+                    # "name" is what the console's model form writes —
+                    # accept it or console-added cloud models silently
+                    # vanish on reload (observed bug)
+                    m = m.get("id") or m.get("model") or m.get("name") or ""
                 if isinstance(m, str) and m.strip():
                     cmodels[str(mname)] = m.strip()
             entry["models"] = cmodels

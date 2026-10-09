@@ -20,6 +20,8 @@ def _clean_gateway_request_state():
     import gateway.app as gw_app
     gw_app.clear_response_cache()
     gw_app.reset_breakers()
+    gw_app.reset_token_ledger()
     yield
     gw_app.clear_response_cache()
     gw_app.reset_breakers()
+    gw_app.reset_token_ledger()

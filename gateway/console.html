@@ -358,10 +358,12 @@ function showModels(ui) {
     });
     _configuredModels = configured;
     var html = buildModelForm(defs, d.discovered || []) +
+      buildCloudCatalogWidget(defs) +
       buildConfiguredTable(configured, d) +
       buildLoadedTable(d.loaded || []) +
       buildDiscoveredChips(d.discovered || [], configured) +
-      buildDownloadWidget();
+      buildDownloadWidget() +
+      buildTryItWidget(configured);
     ui.body.innerHTML = html;
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
@@ -553,6 +555,163 @@ function downloadModel() {
   api('/admin/models/download', {method: 'POST', body: payload})
     .then(function (d) { notify('✓ ' + d.downloaded + ' (' + d.size_mb + ' MB)'); showPanel('models'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
+// ---------- Cloud catalog (openai-type backends: HF router, Groq, ...) ----------
+var _catalogModels = null;
+function buildCloudCatalogWidget(defs) {
+  var cloudBackends = (defs.backends || []).filter(function (b) {
+    return b.type === 'openai';
+  });
+  if (!cloudBackends.length) return '';
+  var html = '<div class="widget"><h3>☁️ Cloud catalog</h3>';
+  html += '<div class="srow"><label>Backend</label><select id="cat-backend">';
+  cloudBackends.forEach(function (b) {
+    html += '<option value="' + esc(b.name) + '">' +
+      esc(b.name + ' — ' + (b.base_url || '')) + '</option>';
+  });
+  html += '</select></div>';
+  html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">' +
+    '<button class="btn btn-primary" onclick="loadCatalog()">🔍 Load catalog</button>' +
+    '<input id="cat-filter" placeholder="filter by id…" oninput="renderCatalog()" style="flex:1;min-width:180px;padding:6px 10px;">' +
+    '<select id="cat-suffix" title="Routing suffix appended to the model id (HF router)">' +
+      '<option value="">:fastest (default)</option>' +
+      '<option value=":cheapest">:cheapest</option>' +
+      '<option value=":preferred">:preferred</option>' +
+      '<option value=":groq">:groq</option>' +
+      '<option value=":cerebras">:cerebras</option>' +
+      '<option value=":together">:together</option>' +
+    '</select></div>';
+  html += '<div id="cat-status" class="muted" style="margin-top:6px">Live model list fetched server-side — the API key never reaches this page.</div>';
+  html += '<div id="cat-list" style="margin-top:8px;max-height:40vh;overflow-y:auto;"></div>';
+  html += '</div>';
+  return html;
+}
+
+function loadCatalog() {
+  var backend = document.getElementById('cat-backend').value;
+  document.getElementById('cat-status').textContent = 'Loading catalog…';
+  _catalogModels = null;
+  renderCatalog();
+  api('/admin/backends/' + encodeURIComponent(backend) + '/remote-models')
+    .then(function (d) {
+      _catalogModels = d.models || [];
+      document.getElementById('cat-status').textContent =
+        d.count + ' models from ' + (d.base_url || backend) +
+        ' — click ＋ to prefill the Add-model form above.';
+      renderCatalog();
+    })
+    .catch(function (e) {
+      _catalogModels = null;
+      document.getElementById('cat-status').textContent = '✗ ' + e.message;
+      renderCatalog();
+    });
+}
+
+function renderCatalog() {
+  var list = document.getElementById('cat-list');
+  if (!list) return;
+  if (_catalogModels == null) { list.innerHTML = ''; return; }
+  var q = (document.getElementById('cat-filter').value || '').toLowerCase();
+  var rows = _catalogModels.filter(function (m) {
+    return !q || String(m.id || '').toLowerCase().indexOf(q) >= 0;
+  }).slice(0, 200);
+  var html = '<table><thead><tr><th>model id</th><th>details</th><th></th></tr></thead><tbody>';
+  rows.forEach(function (m) {
+    var extra = [];
+    if (m.owned_by) extra.push(esc(m.owned_by));
+    // HF router passes pricing/latency/throughput metadata through —
+    // show a compact hint of whatever is present
+    ['context_length', 'pricing', 'providers', 'throughput', 'latency'].forEach(function (k) {
+      if (m[k] != null) {
+        try { extra.push(esc(k) + ': ' + esc(JSON.stringify(m[k]).slice(0, 70))); }
+        catch (err) { /* skip unparsable metadata */ }
+      }
+    });
+    html += '<tr><td style="white-space:nowrap">' + esc(m.id) + '</td>' +
+      '<td class="muted" style="font-size:0.72rem;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' +
+      (extra.join(' · ') || '—') + '</td>' +
+      '<td><button class="btn" style="padding:2px 8px;font-size:0.75rem;" ' +
+      'onclick="pickCatalogModel(\'' + esc(String(m.id)) + '\')">＋ Add</button></td></tr>';
+  });
+  if (!rows.length) html += '<tr><td colspan="3" class="muted">no matches</td></tr>';
+  html += '</tbody></table>';
+  if (_catalogModels.length > 200) {
+    html += '<div class="muted">showing 200 of ' + _catalogModels.length +
+      ' — use the filter</div>';
+  }
+  list.innerHTML = html;
+}
+
+function pickCatalogModel(id) {
+  var backend = document.getElementById('cat-backend').value;
+  var suffix = document.getElementById('cat-suffix').value || '';
+  // Prefill the Add / Edit model form (rendered above the catalog):
+  // select the backend first so its dynamic fields exist, then fill.
+  document.getElementById('m-backend').value = backend;
+  document.getElementById('m-role').value = 'chat';
+  onBackendChange();
+  document.getElementById('m-name').value =
+    String(id).toLowerCase().split('/').pop()
+      .replace(/[^a-z0-9._-]/g, '').slice(0, 40);
+  var rid = document.getElementById('m-remote_id');
+  if (rid) { rid.value = id + suffix; rid.focus(); }
+  notify('Prefilled — review and Save');
+}
+
+// ---------- Try it ----------
+function buildTryItWidget(configured) {
+  var chatModels = [];
+  Object.keys(configured || {}).forEach(function (n) {
+    var c = configured[n];
+    if (c.role === 'chat') {
+      chatModels.push({id: c.backend + ':' + n});
+    }
+  });
+  if (!chatModels.length) return '';
+  var html = '<div class="widget"><h3>🧪 Try it</h3>';
+  html += '<div class="srow"><label>Model</label><select id="try-model">';
+  chatModels.forEach(function (m) {
+    html += '<option value="' + esc(m.id) + '">' + esc(m.id) + '</option>';
+  });
+  html += '</select></div>';
+  html += '<div class="srow"><label>Prompt</label><input id="try-prompt" placeholder="Ask something…" style="flex:1;min-width:260px" onkeydown="if(event.key===\'Enter\')tryIt()"></div>';
+  html += '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;">' +
+    '<button class="btn btn-primary" onclick="tryIt()">⚡ Send</button>' +
+    '<span id="try-status" class="muted"></span></div>';
+  html += '<div id="try-out" style="margin-top:8px;"></div>';
+  html += '<div class="muted" style="margin-top:6px">One live round-trip through the gateway (a per-request nonce defeats the response cache).</div>';
+  html += '</div>';
+  return html;
+}
+
+function tryIt() {
+  var model = document.getElementById('try-model').value;
+  var prompt = (document.getElementById('try-prompt').value || '').trim();
+  var status = document.getElementById('try-status');
+  var out = document.getElementById('try-out');
+  if (!prompt) { status.textContent = 'type a prompt first'; return; }
+  status.textContent = 'sending…';
+  out.innerHTML = '';
+  var t0 = Date.now();
+  var nonce = Date.now();
+  api('/v1/chat/completions', {method: 'POST', body: {
+    model: model,
+    messages: [{role: 'user', content: prompt + ' (request id ' + nonce + ')'}]
+  }}).then(function (d) {
+    var ms = Date.now() - t0;
+    var text = (((d.choices || [])[0] || {}).message || {}).content || '(no content)';
+    var tok = ((d.usage || {}).total_tokens) || 0;
+    var sb = d.served_by || {};
+    status.textContent = '✓ ' + ms + 'ms';
+    out.innerHTML = '<div class="muted" style="font-size:0.75rem;margin-bottom:4px">' +
+      'answered by ' + esc((sb.backend || '?') + ':' + (sb.model || '?')) +
+      ' · ' + tok + ' tokens</div>' +
+      '<div style="white-space:pre-wrap;">' + esc(text) + '</div>';
+  }).catch(function (e) {
+    status.textContent = '✗ ' + e.message;
+    out.innerHTML = '';
+  });
 }
 
 // Store backend info for form rendering

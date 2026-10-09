@@ -183,7 +183,8 @@ def test_admin_stats_empty_log(wired, gguf):
     with TestClient(gw_app.app) as client:
         r = client.get("/admin/stats")
     assert r.status_code == 200
-    assert r.json() == {"per_model": [], "recent": [], "total": 0}
+    assert r.json() == {"per_model": [], "recent": [], "total": 0,
+                        "budgets": []}
 
 
 # ── events ─────────────────────────────────────────────────────────────────
