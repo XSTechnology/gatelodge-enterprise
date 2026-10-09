@@ -81,6 +81,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import hashlib
 import itertools
 import json
 import logging
@@ -337,11 +338,16 @@ async def _validation_error(request: Request, exc: RequestValidationError) -> JS
 # ── JSONL request log ──────────────────────────────────────────────────────
 
 def _log_request(model: str, backend: str, stream: bool, ms: int,
-                 usage: dict[str, Any], status: int) -> None:
-    """One line per request — best effort, never fails the request."""
-    line = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                       "model": model, "backend": backend, "stream": stream,
-                       "ms": ms, "usage": usage, "status": status})
+                 usage: dict[str, Any], status: int, err: str = "") -> None:
+    """One line per request — best effort, never fails the request.
+    err (optional) carries the classified failure kind for status >= 400
+    (timeout/network/rate_limit/server/auth/client — cloud.classify_error)."""
+    rec: dict[str, Any] = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                           "model": model, "backend": backend, "stream": stream,
+                           "ms": ms, "usage": usage, "status": status}
+    if err:
+        rec["err"] = err
+    line = json.dumps(rec)
     try:
         with _log_lock:
             _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -968,8 +974,11 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
                 _breaker_mark(pkey)  # hedge fires — fall through to the race
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                _breaker_mark(pkey)
+            except Exception as e:
+                # Client errors (4xx) are the REQUEST's fault — the backend
+                # is fine and must not be breaker-skipped for 120s.
+                if cloud.classify_error(e) != "client":
+                    _breaker_mark(pkey)
                 primary = None  # primary failed fast — fallbacks only
         else:
             # no hedge configured: wait for the primary; on error, fall back
@@ -977,8 +986,9 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
                 result = await primary
                 _breaker_clear(pkey)
                 return result
-            except Exception:
-                _breaker_mark(pkey)
+            except Exception as e:
+                if cloud.classify_error(e) != "client":
+                    _breaker_mark(pkey)
                 primary = None
 
     def _cancel_ok(entry: tuple[str, str]) -> bool:
@@ -1000,6 +1010,50 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
             last_err = e
             primary = None
     raise last_err or RuntimeError("no chain entry succeeded")
+
+
+# ── response cache (ported from the assistant's LLMClient) ─────────────────
+# Repeated SIMPLE prompts (no tools, single user message, nothing
+# time-sensitive, short) answer from memory instead of re-billing cloud
+# backends per token — health checks and retrying third-party programs
+# are the target. local_only aliases NEVER cache (privacy guarantee
+# scope); streaming never caches. Sizing/kill switch: config
+# response_cache {enabled, ttl_s, max} — hot-reloadable.
+
+_RESPONSE_CACHE: dict[str, dict[str, Any]] = {}
+_CACHE_TIME_KEYWORDS = ("time", "date", "today", "now", "current",
+                        "weather", "forecast", "latest", "news")
+
+
+def _cache_key(requested: str, body: ChatRequest) -> str:
+    """'' when the request is not cacheable (tools/stream/multi-turn/
+    long/time-sensitive prompts). Key covers model, messages AND the
+    generation params that change the answer (max_tokens, temperature)."""
+    if body.tools or body.stream:
+        return ""
+    msgs = body.messages
+    if not msgs or msgs[-1].get("role") != "user" or len(msgs) > 2:
+        return ""
+    text = str(msgs[-1].get("content") or "").strip().lower()
+    if not text or len(text) > 200:
+        return ""
+    if any(kw in text for kw in _CACHE_TIME_KEYWORDS):
+        return ""
+    payload = json.dumps([requested, body.messages, body.max_tokens,
+                          body.temperature], sort_keys=True, default=str)
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+def cache_stats() -> dict[str, Any]:
+    total_hits = sum(e.get("hits", 0) for e in _RESPONSE_CACHE.values())
+    return {"entries": len(_RESPONSE_CACHE), "hits": total_hits}
+
+
+def clear_response_cache() -> int:
+    """Drop cached responses (tests / admin). Returns entries cleared."""
+    n = len(_RESPONSE_CACHE)
+    _RESPONSE_CACHE.clear()
+    return n
 
 
 # ── POST /v1/chat/completions ──────────────────────────────────────────────
@@ -1040,6 +1094,24 @@ async def chat_completions(body: ChatRequest) -> Response:
             return _error(400, str(e), param="model", code="model_not_found")
     entries = plan["entries"]
 
+    # Response cache: simple repeated prompts answer from memory. Never
+    # for local_only aliases (privacy guarantee) or when disabled in config.
+    rc_cfg = getattr(cfg, "response_cache", None) or {}
+    ckey = ""
+    if rc_cfg.get("enabled", True) and not plan["local_only"]:
+        ckey = _cache_key(requested, body)
+    if ckey:
+        rc_ttl = float(rc_cfg.get("ttl_s") or 3600)
+        hit = _RESPONSE_CACHE.get(ckey)
+        if hit and (time.monotonic() - hit["ts"]) < rc_ttl:
+            hit["hits"] = int(hit.get("hits", 0)) + 1
+            resp = dict(hit["resp"])
+            _log_request(requested, "cache", body.stream, 0,
+                         resp.get("usage") or {}, 200)
+            return JSONResponse(resp)
+        if hit:  # expired — drop before re-executing
+            _RESPONSE_CACHE.pop(ckey, None)
+
     if body.stream:
         # Streaming executes the PRIMARY entry only — hedge racing is a
         # non-streaming feature (first-completion-wins has no stream analog
@@ -1069,12 +1141,24 @@ async def chat_completions(body: ChatRequest) -> Response:
         except Exception as e:
             ms = int((time.perf_counter() - t0) * 1000)
             logger.warning("gateway chat failed (%s): %s", requested, e)
-            _log_request(requested, "", body.stream, ms, {}, 502)
+            _log_request(requested, "", body.stream, ms, {}, 502,
+                         err=cloud.classify_error(e))
             return _error(502, str(e), err_type="server_error",
                           code="execution_error")
         ms = int((time.perf_counter() - t0) * 1000)
         resp.setdefault("served_by", {"backend": winner, "model": model_key,
                                       "ms": ms})
+        if ckey:
+            # Store under the cache (bounded; oldest evicted). A max of 0
+            # disables storage while leaving lookups inert.
+            rc_max = int(rc_cfg.get("max") or 100)
+            if rc_max > 0:
+                if len(_RESPONSE_CACHE) >= rc_max:
+                    oldest = min(_RESPONSE_CACHE.items(),
+                                 key=lambda kv: kv[1]["ts"])
+                    _RESPONSE_CACHE.pop(oldest[0], None)
+                _RESPONSE_CACHE[ckey] = {"resp": dict(resp),
+                                         "ts": time.monotonic(), "hits": 0}
         _log_request(requested, winner, body.stream, ms,
                      resp.get("usage") or {}, 200)
         return JSONResponse(resp)
@@ -1734,7 +1818,8 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     except Exception as e:
         ms = int((time.perf_counter() - t0) * 1000)
         logger.warning("gateway completion failed (%s): %s", requested, e)
-        _log_request(requested, "", body.stream, ms, {}, 502)
+        _log_request(requested, "", body.stream, ms, {}, 502,
+                     err=cloud.classify_error(e))
         return _error(502, str(e), err_type="server_error",
                       code="execution_error")
     finally:
@@ -2423,6 +2508,76 @@ async def admin_stats() -> Response:
                      "errors": agg["errors"]})
     rows.sort(key=lambda r: -r["n"])
     return {"per_model": rows, "recent": recent[-50:], "total": total}
+
+
+@app.post("/admin/verify")
+async def admin_verify(request: Request) -> Response:
+    """Active round-trip self-test (ported from the assistant's verify
+    stack): a nonce prompt through every configured backend×model,
+    reporting latency/pass/detail per entry. POD models are skipped by
+    default (they deploy on demand — real money, minutes); pass
+    {"include_pods": true} to verify those too. Body: {include_pods?,
+    timeout_s? (default 30)}. Calls _exec_entry directly — the response
+    cache is untouched."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    include_pods = bool(body.get("include_pods"))
+    try:
+        timeout_s = max(5.0, float(body.get("timeout_s") or 30.0))
+    except (TypeError, ValueError):
+        timeout_s = 30.0
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    nonce = int(time.time() * 1000)
+    results: list[dict[str, Any]] = []
+    for bname, backend in cfg.backends.items():
+        btype = backend.get("type")
+        for mkey in (backend.get("models") or {}):
+            label = f"{bname}:{mkey}"
+            if (btype == "runpod" and not include_pods
+                    and not (backend["models"][mkey] or {}).get("endpoint_id")):
+                results.append({"backend": bname, "model": mkey,
+                                "latency_ms": None, "pass": False,
+                                "detail": "skipped (pod — deploy on demand; "
+                                          "include_pods to verify)"})
+                continue
+            req = ChatRequest(model=label, messages=[{
+                "role": "user",
+                "content": f"Reply with exactly: gateway verify ok {nonce}"}])
+            t0 = time.perf_counter()
+            try:
+                resp, _winner, _mk = await asyncio.wait_for(
+                    _exec_entry(cfg, (bname, mkey), req, label),
+                    timeout=timeout_s)
+                ms = int((time.perf_counter() - t0) * 1000)
+                text = ""
+                try:
+                    text = str((((resp.get("choices") or [{}])[0])
+                                .get("message") or {}).get("content") or "")
+                except Exception:
+                    pass
+                ok = bool(text.strip())
+                results.append({
+                    "backend": bname, "model": mkey, "latency_ms": ms,
+                    "pass": ok,
+                    "detail": (f"answered: {text[:60]!r}" if ok
+                               else "responded with no content")})
+            except asyncio.TimeoutError:
+                results.append({"backend": bname, "model": mkey,
+                                "latency_ms": int((time.perf_counter() - t0) * 1000),
+                                "pass": False,
+                                "detail": f"timeout after {timeout_s:g}s"})
+            except Exception as e:
+                results.append({"backend": bname, "model": mkey,
+                                "latency_ms": int((time.perf_counter() - t0) * 1000),
+                                "pass": False,
+                                "detail": f"{cloud.classify_error(e)}: {str(e)[:120]}"})
+    npass = sum(1 for r in results if r["pass"])
+    return {"results": results,
+            "summary": {"total": len(results), "pass": npass,
+                        "fail": len(results) - npass}}
 
 
 @app.get("/admin/events")

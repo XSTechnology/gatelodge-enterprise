@@ -701,3 +701,250 @@ def test_breaker_primary_fast_win_keeps_it_closed(wired, gguf, monkeypatch):
         _with_fake_llama(fn)
     finally:
         gw_app.reset_breakers()
+
+
+def test_breaker_not_opened_on_client_error(wired, gguf, monkeypatch):
+    """A 4xx from the primary is the REQUEST's fault — the breaker stays
+    closed and the primary is retried on the next request."""
+    wired(_breaker_cfg(gguf, hedge=5))
+    calls: list[int] = []
+
+    async def _client_err(**kwargs):
+        calls.append(1)
+        e = RuntimeError("bad request")
+        e.status_code = 400
+        raise e
+
+    fake = _FakeCloud()
+    fake.chat.completions.create = _client_err
+    _patch_cloud(monkeypatch, fake)
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            for q in ("first question", "second question"):
+                r = client.post("/v1/chat/completions", json={
+                    "model": "smart",
+                    "messages": [{"role": "user", "content": q}]})
+                assert r.status_code == 200, r.text
+                assert r.json()["served_by"]["backend"] == "local"
+        assert len(calls) == 2  # primary retried — no breaker
+        assert gw_app._breaker_open("groq:cloud-fast") is False
+
+    gw_app.reset_breakers()
+    try:
+        _with_fake_llama(fn)
+    finally:
+        gw_app.reset_breakers()
+
+
+# ── error classification ───────────────────────────────────────────────────
+
+def test_classify_error_buckets():
+    from openai import APIConnectionError, APITimeoutError
+
+    assert gw_cloud.classify_error(APIConnectionError(request=None)) == "network"
+    assert gw_cloud.classify_error(APITimeoutError(request=None)) == "timeout"
+
+    def _err(status):
+        e = RuntimeError("http error")
+        e.status_code = status
+        return e
+
+    assert gw_cloud.classify_error(_err(429)) == "rate_limit"
+    assert gw_cloud.classify_error(_err(500)) == "server"
+    assert gw_cloud.classify_error(_err(502)) == "server"
+    assert gw_cloud.classify_error(_err(401)) == "auth"
+    assert gw_cloud.classify_error(_err(400)) == "client"
+    assert gw_cloud.classify_error(RuntimeError("mystery")) == "unknown"
+    # gateway call sites wrap the original — __cause__ chains are walked
+    wrapped = CloudBackendError("cloud backend 'groq' call failed")
+    wrapped.__cause__ = _err(503)
+    assert gw_cloud.classify_error(wrapped) == "server"
+
+
+def test_error_class_in_request_log(wired, gguf, monkeypatch):
+    """502 responses log the classified failure kind (err field)."""
+    wired(_config(gguf))
+
+    async def _server_err(**kwargs):
+        e = RuntimeError("upstream exploded")
+        e.status_code = 502
+        raise e
+
+    fake = _FakeCloud()
+    fake.chat.completions.create = _server_err
+    _patch_cloud(monkeypatch, fake)
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions", json={
+                "model": "groq:cloud-fast",
+                "messages": [{"role": "user",
+                              "content": "trigger a classified failure"}]})
+            assert r.status_code == 502
+        lines = [json.loads(ln) for ln in
+                 gw_app._LOG_PATH.read_text(encoding="utf-8").strip().splitlines()]
+        assert lines[-1]["status"] == 502
+        assert lines[-1]["err"] == "server"
+
+    _with_fake_llama(fn)
+
+
+# ── response cache ─────────────────────────────────────────────────────────
+
+def test_cache_simple_prompt_served_from_memory(wired, gguf, monkeypatch):
+    wired(_config(gguf))
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r1 = client.post("/v1/chat/completions", json={
+                "model": "groq:cloud-fast",
+                "messages": [{"role": "user", "content": "cache me once"}]})
+            assert r1.status_code == 200
+            r2 = client.post("/v1/chat/completions", json={
+                "model": "groq:cloud-fast",
+                "messages": [{"role": "user", "content": "cache me once"}]})
+            assert r2.status_code == 200
+            assert r2.json() == r1.json()
+        assert len(fake.calls) == 1  # remote billed once
+        lines = [json.loads(ln) for ln in
+                 gw_app._LOG_PATH.read_text(encoding="utf-8").strip().splitlines()]
+        assert lines[-1]["backend"] == "cache"
+        assert gw_app.cache_stats() == {"entries": 1, "hits": 1}
+
+    _with_fake_llama(fn)
+
+
+def test_cache_skips_tools_multiturn_timeful_and_local_only(wired, gguf, monkeypatch):
+    cfgd = _config(gguf, aliases={
+        "private": {"chain": ["local:fast"], "local_only": True}})
+    wired(cfgd)
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            for _ in range(2):
+                # tools → never cached
+                client.post("/v1/chat/completions", json={
+                    "model": "groq:cloud-fast",
+                    "tools": [{"type": "function",
+                               "function": {"name": "f", "parameters": {}}}],
+                    "messages": [{"role": "user",
+                                  "content": "tool prompt never cached"}]})
+                # multi-turn → never cached
+                client.post("/v1/chat/completions", json={
+                    "model": "groq:cloud-fast",
+                    "messages": [{"role": "user", "content": "a"},
+                                 {"role": "assistant", "content": "b"},
+                                 {"role": "user", "content": "c"}]})
+                # time-sensitive → never cached
+                client.post("/v1/chat/completions", json={
+                    "model": "groq:cloud-fast",
+                    "messages": [{"role": "user",
+                                  "content": "what time is it right now"}]})
+        assert len(fake.calls) == 6
+        assert gw_app.cache_stats()["entries"] == 0
+        # local_only alias: privacy scope — executed twice, never cached
+        with TestClient(gw_app.app) as client:
+            for _ in range(2):
+                r = client.post("/v1/chat/completions", json={
+                    "model": "private",
+                    "messages": [{"role": "user",
+                                  "content": "local only never cached"}]})
+                assert r.status_code == 200, r.text
+        assert len([r for r in records if "call" in r]) == 2
+        assert gw_app.cache_stats()["entries"] == 0
+
+    _with_fake_llama(fn)
+
+
+def test_cache_key_covers_max_tokens(wired, gguf, monkeypatch):
+    """Same prompt + different max_tokens = different answers — both
+    execute (the key includes the generation params)."""
+    wired(_config(gguf))
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            for mt in (100, 200):
+                r = client.post("/v1/chat/completions", json={
+                    "model": "groq:cloud-fast", "max_tokens": mt,
+                    "messages": [{"role": "user", "content": "same prompt"}]})
+                assert r.status_code == 200
+        assert len(fake.calls) == 2
+
+    _with_fake_llama(fn)
+
+
+def test_cache_disabled_via_config(wired, gguf, monkeypatch):
+    cfgd = _config(gguf)
+    cfgd["response_cache"] = {"enabled": False}
+    wired(cfgd)
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            for _ in range(2):
+                r = client.post("/v1/chat/completions", json={
+                    "model": "groq:cloud-fast",
+                    "messages": [{"role": "user", "content": "cache is off"}]})
+                assert r.status_code == 200
+        assert len(fake.calls) == 2
+        assert gw_app.cache_stats()["entries"] == 0
+
+    _with_fake_llama(fn)
+
+
+# ── /admin/verify ──────────────────────────────────────────────────────────
+
+def test_admin_verify_probes_all_backends(wired, gguf, monkeypatch):
+    cfgd = _config(gguf)
+    cfgd["backends"]["rp"] = {
+        "type": "runpod", "api_key_env": "RUNPOD_API_KEY",
+        "models": {"podbig": {"gpu_type_ids": ["NVIDIA RTX A6000"],
+                              "image": "ghcr.io/x", "alias": "podbig"}}}
+    wired(cfgd)
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/admin/verify", json={})
+            assert r.status_code == 200, r.text
+            data = r.json()
+            rows = {f"{x['backend']}:{x['model']}": x for x in data["results"]}
+            assert set(rows) == {"local:fast", "groq:cloud-fast", "rp:podbig"}
+            assert rows["groq:cloud-fast"]["pass"] is True
+            assert rows["groq:cloud-fast"]["latency_ms"] is not None
+            assert rows["groq:cloud-fast"]["detail"].startswith("answered:")
+            assert rows["local:fast"]["pass"] is True
+            assert rows["rp:podbig"]["pass"] is False
+            assert "skipped" in rows["rp:podbig"]["detail"]
+            assert data["summary"] == {"total": 3, "pass": 2, "fail": 1}
+        assert len(fake.calls) == 1  # one cloud round-trip
+
+    _with_fake_llama(fn)
+
+
+def test_admin_verify_reports_failures(wired, gguf, monkeypatch):
+    wired(_config(gguf))
+
+    async def _boom(**kwargs):
+        raise RuntimeError("cloud down")
+
+    fake = _FakeCloud()
+    fake.chat.completions.create = _boom
+    _patch_cloud(monkeypatch, fake)
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/admin/verify", json={"timeout_s": 5})
+            assert r.status_code == 200, r.text
+            data = r.json()
+            rows = {f"{x['backend']}:{x['model']}": x for x in data["results"]}
+            assert rows["groq:cloud-fast"]["pass"] is False
+            assert rows["groq:cloud-fast"]["detail"].startswith("unknown:")
+            assert rows["local:fast"]["pass"] is True
+            assert data["summary"]["fail"] == 1
+
+    _with_fake_llama(fn)

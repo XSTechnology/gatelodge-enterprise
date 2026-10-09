@@ -101,6 +101,10 @@ def _config(gguf, workers=None) -> dict:
     return {
         "port": 9911, "bind": "127.0.0.1", "default_alias": "fast",
         "models_dir": str(gguf.parent / "models"),
+        # these tests exercise EXECUTION machinery (pool slots, admission,
+        # child replacement) with identical prompts — the response cache
+        # would serve repeats from memory and break the expected counts.
+        "response_cache": {"enabled": False},
         "backends": {"local": {"type": "embedded",
                                "models": {"fast": m}}},
         "aliases": {},

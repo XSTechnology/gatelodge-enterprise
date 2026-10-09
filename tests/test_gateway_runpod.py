@@ -180,6 +180,10 @@ def _rp_config(gguf, **pod_over) -> dict:
     return {
         "port": 9911, "bind": "127.0.0.1", "default_alias": "",
         "models_dir": str(gguf.parent / "models"),
+        # lifecycle tests repeat identical prompts across pod states —
+        # the response cache would serve a stale 200 instead of the
+        # expected failure after a pod change.
+        "response_cache": {"enabled": False},
         "backends": {
             "local": {"type": "embedded",
                       "models": {"loc": {"gguf": str(gguf), "ctx": 1024}}},

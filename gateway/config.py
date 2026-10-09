@@ -45,7 +45,8 @@ one so configs don't churn between stages):
     "smart": {"chain": ["local:big", "groq:cloud-fast"], "hedge_s": 8},
     "private": {"chain": ["local:big"], "local_only": true}
   },
-  "queue": {"max_waiting": 4, "timeout_s": 120}
+  "queue": {"max_waiting": 4, "timeout_s": 120},
+  "response_cache": {"enabled": true, "ttl_s": 3600, "max": 100}
 }
 
 Semantics:
@@ -131,6 +132,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "backends": {"local": {"type": "embedded", "models": {}}},
     "aliases": {},
     "queue": {"max_waiting": 4, "timeout_s": 120},
+    # Response cache (ported from the assistant's LLMClient): repeated
+    # SIMPLE prompts (no tools, single user message, nothing
+    # time-sensitive) answer from memory instead of re-billing cloud
+    # backends per token. local_only aliases never cache (privacy).
+    "response_cache": {"enabled": True, "ttl_s": 3600, "max": 100},
 }
 
 
@@ -510,6 +516,13 @@ class GatewayConfig:
             self.budget_usd_month = float(raw.get("budget_usd_month") or 0)
         except (TypeError, ValueError):
             self.budget_usd_month = 0.0
+        # Response cache: kill switch + sizing (see DEFAULT_CONFIG).
+        rc = raw.get("response_cache") if isinstance(raw.get("response_cache"), dict) else {}
+        self.response_cache = {
+            "enabled": bool(rc.get("enabled", True)),
+            "ttl_s": max(0.0, float(rc.get("ttl_s") or 3600)),
+            "max": max(0, int(rc.get("max") or 100)),
+        }
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""

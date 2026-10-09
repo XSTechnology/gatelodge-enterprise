@@ -19,7 +19,7 @@ import logging
 import os
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import (APIConnectionError, APITimeoutError, AsyncOpenAI)
 
 logger = logging.getLogger(__name__)
 
@@ -105,3 +105,35 @@ def cap_max_tokens(backend: dict[str, Any], requested: int | None) -> int | None
         return requested
     cap = backend.get("max_tokens_cap", CLOUD_MAX_TOKENS_CAP)
     return min(requested, cap) if cap else requested
+
+
+def classify_error(e: BaseException) -> str:
+    """Bucket a backend failure: timeout | network | rate_limit | server |
+    auth | client | unknown (ported from the assistant's LLMClient).
+
+    Walks __cause__ chains — gateway call sites wrap the original backend
+    exception in CloudBackendError(... from e). 'client' means the REQUEST
+    was bad (4xx other than auth/rate-limit): retrying or breaker-skipping
+    won't help, so callers (chain breaker) treat it as non-opening."""
+    cur: BaseException | None = e
+    for _ in range(5):
+        if cur is None:
+            break
+        if isinstance(cur, APITimeoutError):
+            return "timeout"
+        if isinstance(cur, APIConnectionError):
+            return "network"
+        status = getattr(cur, "status_code", None)
+        if status is None:
+            status = getattr(getattr(cur, "response", None), "status_code", None)
+        if isinstance(status, int):
+            if status == 429:
+                return "rate_limit"
+            if 500 <= status < 600:
+                return "server"
+            if status in (401, 403):
+                return "auth"
+            if 400 <= status < 500:
+                return "client"
+        cur = cur.__cause__
+    return "unknown"

@@ -162,6 +162,9 @@ def _config(gguf, remote=False, **model_over) -> dict:
     cfg = {
         "port": 9911, "bind": "127.0.0.1", "default_alias": "",
         "models_dir": str(gguf.parent / "models"),
+        # child-management tests repeat identical prompts around config
+        # changes — the response cache would mask the new child entirely.
+        "response_cache": {"enabled": False},
         "backends": {
             "local": {"type": "embedded", "models": {}},
             "srv": {"type": "llama-server", "server_exe": "llama-server",
