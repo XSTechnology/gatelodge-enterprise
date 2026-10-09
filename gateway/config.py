@@ -137,6 +137,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # time-sensitive) answer from memory instead of re-billing cloud
     # backends per token. local_only aliases never cache (privacy).
     "response_cache": {"enabled": True, "ttl_s": 3600, "max": 100},
+    # Virtual (per-consumer) API keys: each program gets its own bearer,
+    # usage is attributed per key in the log/stats, and per-key monthly
+    # budgets (tokens / USD) enforce spend. gateway_keys stay the ADMIN
+    # keys — /admin/* requires one whenever ANY keys are configured.
+    "api_keys": [],
+    # Cached provider pricing ($ per MILLION tokens) captured from
+    # backend catalogs (the HF router returns per-provider rates) —
+    # powers per-request cost estimation and per-key USD budgets.
+    "model_prices": {},
 }
 
 
@@ -439,6 +448,76 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
+    """api_keys: list of {id, key, owner?, note?, monthly_token_budget?,
+    monthly_usd_budget?} → {id: entry}. Invalid entries dropped."""
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, list):
+        return out
+    for k in raw:
+        if not isinstance(k, dict):
+            continue
+        kid = str(k.get("id") or "").strip()
+        key = str(k.get("key") or "").strip()
+        if not kid or not key:
+            logger.warning("gateway config: api_keys entry needs id + key — dropped")
+            continue
+        try:
+            tok_b = max(0, int(k.get("monthly_token_budget") or 0))
+        except (TypeError, ValueError):
+            tok_b = 0
+        try:
+            usd_b = max(0.0, float(k.get("monthly_usd_budget") or 0))
+        except (TypeError, ValueError):
+            usd_b = 0.0
+        out[kid] = {
+            "id": kid, "key": key,
+            "owner": str(k.get("owner") or "").strip(),
+            "note": str(k.get("note") or "").strip(),
+            "monthly_token_budget": tok_b,
+            "monthly_usd_budget": usd_b,
+        }
+    return out
+
+
+def _normalize_model_prices(raw: Any) -> dict[str, dict[str, Any]]:
+    """model_prices: {backend: {model_id: {"in": $/Mtok, "out": $/Mtok,
+    "providers": {name: {"in","out"}}?}}} — light validation, pass-through."""
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for backend, models in raw.items():
+        if not isinstance(models, dict):
+            continue
+        bmap: dict[str, Any] = {}
+        for mid, p in models.items():
+            if not isinstance(p, dict):
+                continue
+            try:
+                entry = {"in": max(0.0, float(p.get("in") or 0)),
+                         "out": max(0.0, float(p.get("out") or 0))}
+            except (TypeError, ValueError):
+                continue
+            provs = p.get("providers")
+            if isinstance(provs, dict) and provs:
+                pmap: dict[str, Any] = {}
+                for pn, pv in provs.items():
+                    if not isinstance(pv, dict):
+                        continue
+                    try:
+                        pmap[str(pn)] = {
+                            "in": max(0.0, float(pv.get("in") or 0)),
+                            "out": max(0.0, float(pv.get("out") or 0))}
+                    except (TypeError, ValueError):
+                        continue
+                if pmap:
+                    entry["providers"] = pmap
+            bmap[str(mid)] = entry
+        if bmap:
+            out[str(backend)] = bmap
+    return out
+
+
 def _normalize_aliases(raw: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     if not isinstance(raw, dict):
@@ -537,6 +616,9 @@ class GatewayConfig:
             "ttl_s": max(0.0, float(rc.get("ttl_s") or 3600)),
             "max": max(0, int(rc.get("max") or 100)),
         }
+        # Virtual (per-consumer) keys + cached provider pricing
+        self.api_keys = _normalize_api_keys(raw.get("api_keys"))
+        self.model_prices = _normalize_model_prices(raw.get("model_prices"))
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""

@@ -399,7 +399,9 @@ def test_embed_jsonl_logged(wired, gguf):
         with TestClient(gw_app.app) as client:
             assert client.post("/v1/embeddings", json={
                 "model": "embed", "input": "hi"}).status_code == 200
-        line = gw_app._LOG_PATH.read_text(encoding="utf-8").strip().splitlines()[-1]
+        # month-scoped log (the legacy path migrates on first write)
+        p = gw_app._month_log_path(gw_app._month_key())
+        line = p.read_text(encoding="utf-8").strip().splitlines()[-1]
         e = json.loads(line)
         assert e["model"] == "embed"
         assert e["backend"] == "local"

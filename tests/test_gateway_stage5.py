@@ -7,6 +7,7 @@ returns the in-memory ring (an engine load shows up there).
 """
 import json
 import sys
+import time
 import types
 from contextlib import contextmanager
 from pathlib import Path
@@ -149,15 +150,20 @@ def test_admin_config_put_invalid_json(wired, gguf):
 
 def test_admin_stats_aggregates(wired, gguf):
     _, cfg, _ = wired(_config(gguf))
+    # current-month timestamps — lines from other months archive on migration
+    m = time.strftime("%Y-%m")
     lines = [
-        {"ts": "t1", "model": "fast", "backend": "local", "stream": False,
-         "ms": 100, "usage": {"total_tokens": 10}, "status": 200},
-        {"ts": "t2", "model": "fast", "backend": "local", "stream": True,
-         "ms": 300, "usage": {}, "status": 200},
-        {"ts": "t3", "model": "fast", "backend": "local", "stream": False,
-         "ms": 50, "usage": {"total_tokens": 5}, "status": 429},
-        {"ts": "t4", "model": "groq:cloud", "backend": "groq", "stream": False,
-         "ms": 700, "usage": {"total_tokens": 99}, "status": 200},
+        {"ts": m + "-01T10:00:00", "model": "fast", "backend": "local",
+         "stream": False, "ms": 100, "usage": {"total_tokens": 10},
+         "status": 200},
+        {"ts": m + "-02T10:00:00", "model": "fast", "backend": "local",
+         "stream": True, "ms": 300, "usage": {}, "status": 200},
+        {"ts": m + "-03T10:00:00", "model": "fast", "backend": "local",
+         "stream": False, "ms": 50, "usage": {"total_tokens": 5},
+         "status": 429},
+        {"ts": m + "-04T10:00:00", "model": "groq:cloud", "backend": "groq",
+         "stream": False, "ms": 700, "usage": {"total_tokens": 99},
+         "status": 200},
         "not json at all",
     ]
     gw_app._LOG_PATH.write_text("\n".join(json.dumps(l) for l in lines[:4]) +
@@ -176,6 +182,7 @@ def test_admin_stats_aggregates(wired, gguf):
     cloud = next(x for x in s["per_model"] if x["model"] == "groq:cloud")
     assert cloud["backend"] == "groq" and cloud["n"] == 1
     assert len(s["recent"]) == 4
+    assert s["per_key"] == []  # no keyed lines in the seed
 
 
 def test_admin_stats_empty_log(wired, gguf):
@@ -183,8 +190,8 @@ def test_admin_stats_empty_log(wired, gguf):
     with TestClient(gw_app.app) as client:
         r = client.get("/admin/stats")
     assert r.status_code == 200
-    assert r.json() == {"per_model": [], "recent": [], "total": 0,
-                        "budgets": []}
+    assert r.json() == {"per_model": [], "per_key": [], "recent": [],
+                        "total": 0, "budgets": []}
 
 
 # ── events ─────────────────────────────────────────────────────────────────

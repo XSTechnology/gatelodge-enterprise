@@ -4070,13 +4070,87 @@ function removeGatewayKey(key) {
 }
 
 // ---------- API Keys ----------
+// ---------- virtual (per-consumer) API keys ----------
+function _maskKey(k) {
+  k = String(k || '');
+  return k.length > 11 ? k.slice(0, 8) + '…' + k.slice(-4) : k;
+}
+function renderApiKeys(rows) {
+  var html = '<div class="widget"><h3>Consumer keys (virtual)</h3>';
+  html += '<div class="muted" style="margin-bottom:8px">Give each program its own bearer key — usage is attributed per key in the log/stats, and monthly token / USD budgets cap spend. Requests with these keys are limited to /v1 endpoints (no admin surface).</div>';
+  if (rows && rows.length) {
+    html += '<table><thead><tr><th>id</th><th>owner</th><th>key</th><th>budget (tok / $)</th><th>this month</th><th></th></tr></thead><tbody>';
+    rows.forEach(function (k) {
+      var bud = (k.monthly_token_budget ? k.monthly_token_budget + ' tok' : '—')
+        + ' / ' + (k.monthly_usd_budget ? '$' + k.monthly_usd_budget : '—');
+      var used = k.used_tokens + ' tok' + (k.used_usd ? ' · $' + Number(k.used_usd).toFixed(4) : '');
+      html += '<tr><td><b>' + esc(k.id) + '</b>' + (k.note ? '<div class="muted" style="font-size:0.72rem">' + esc(k.note) + '</div>' : '') + '</td>' +
+        '<td>' + esc(k.owner || '—') + '</td>' +
+        '<td><code>' + esc(_maskKey(k.key)) + '</code></td>' +
+        '<td class="muted">' + esc(bud) + '</td>' +
+        '<td>' + esc(used) + '</td>' +
+        '<td><button class="btn" style="color:var(--danger, #e5484d);padding:2px 8px;font-size:0.75rem;" onclick="revokeApiKey(\'' + esc(k.id) + '\')">Revoke</button></td></tr>';
+    });
+    html += '</tbody></table>';
+  } else {
+    html += '<div class="muted">No consumer keys. The gateway trusts localhost while nothing is configured.</div>';
+  }
+  html += '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">' +
+    '<div><div class="muted" style="font-size:0.72rem">id</div><input id="nk-id" placeholder="program-x" style="width:130px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">owner</div><input id="nk-owner" placeholder="(optional)" style="width:130px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">note</div><input id="nk-note" placeholder="(optional)" style="width:160px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">token budget /mo</div><input id="nk-tok" type="number" min="0" placeholder="0 = off" style="width:110px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">$ budget /mo</div><input id="nk-usd" type="number" min="0" step="0.01" placeholder="0 = off" style="width:100px;padding:6px 10px;"></div>' +
+    '<button class="btn btn-primary" onclick="createApiKey()">＋ Create key</button></div>';
+  html += '<div id="nk-out" style="margin-top:8px;"></div>';
+  html += '</div>';
+  return html;
+}
+
+function createApiKey() {
+  var payload = {
+    id: document.getElementById('nk-id').value.trim(),
+    owner: document.getElementById('nk-owner').value.trim(),
+    note: document.getElementById('nk-note').value.trim()
+  };
+  var tok = document.getElementById('nk-tok').value.trim();
+  var usd = document.getElementById('nk-usd').value.trim();
+  if (tok) payload.monthly_token_budget = parseInt(tok, 10) || 0;
+  if (usd) payload.monthly_usd_budget = parseFloat(usd) || 0;
+  api('/admin/keys', {method: 'POST', body: payload}).then(function (d) {
+    document.getElementById('nk-out').innerHTML =
+      '<div class="kv"><span class="badge ok">created</span> <code>' + esc(d.key) + '</code> — copy it now:</div>' +
+      '<div class="muted">Use it as <code>Authorization: Bearer ' + esc(d.key) + '</code></div>';
+    notify('✓ key ' + d.created + ' created');
+    // refresh the table but keep the revealed key visible
+    api('/admin/keys').then(function (kk) {
+      var t = document.querySelector('#modal-body .widget table');
+      if (t) t.outerHTML = ''; // crude refresh below re-renders whole pane minus reveal
+    });
+  }).catch(function (e) {
+    document.getElementById('nk-out').innerHTML = '<div class="muted" style="color:var(--danger,#e5484d)">✗ ' + esc(e.message) + '</div>';
+  });
+}
+
+function revokeApiKey(id) {
+  if (!confirm('Revoke key "' + id + '"? Programs using it get 401 immediately.')) return;
+  api('/admin/keys', {method: 'POST', body: {id: id, delete: true}})
+    .then(function () { notify('✓ revoked ' + id); showPanel('keys'); })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
 function showKeys(ui) {
   ui.title.textContent = '🔑 API Keys & Connections';
-  // Fetch both secrets and backends data
-  Promise.all([api('/admin/secrets'), api('/admin/backends')]).then(function (results) {
+  Promise.all([api('/admin/secrets'), api('/admin/backends'),
+               api('/admin/keys')]).then(function (results) {
     var secrets = results[0];
     var backends = results[1];
+    var vkeys = results[2];
     var html = '';
+    // Consumer (virtual) keys
+    html += renderApiKeys(vkeys.api_keys || []);
+    if (vkeys.api_keys && vkeys.api_keys.length && !vkeys.admin_keys_configured)
+      html += '<div class="widget"><div class="kv"><span class="badge warn">no admin key</span> virtual keys are active but gateway_keys is empty — add an admin key via <b>Parameters</b> or the admin surface stays locked.</div></div>';
     // Gateway access section
     html += '<div class="widget"><h3>Gateway access (bearer keys)</h3>';
     html += secrets.gateway_keys_configured

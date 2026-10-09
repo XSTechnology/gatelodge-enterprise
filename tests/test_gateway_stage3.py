@@ -457,7 +457,9 @@ def test_jsonl_log_one_line_per_request(wired, gguf, monkeypatch):
                 "model": "nope",
                 "messages": [{"role": "user", "content": "hi"}]})
             assert r4.status_code == 400
-        lines = gw_app._LOG_PATH.read_text(encoding="utf-8").strip().splitlines()
+        # month-scoped log (the legacy path migrates on first write)
+        lines = (gw_app._month_log_path(gw_app._month_key())
+                 .read_text(encoding="utf-8").strip().splitlines())
         assert len(lines) == 4
         entries = [json.loads(ln) for ln in lines]
         by_model = {e["model"]: e for e in entries}
@@ -784,7 +786,8 @@ def test_error_class_in_request_log(wired, gguf, monkeypatch):
                               "content": "trigger a classified failure"}]})
             assert r.status_code == 502
         lines = [json.loads(ln) for ln in
-                 gw_app._LOG_PATH.read_text(encoding="utf-8").strip().splitlines()]
+                 (gw_app._month_log_path(gw_app._month_key())
+                  .read_text(encoding="utf-8").strip().splitlines())]
         assert lines[-1]["status"] == 502
         assert lines[-1]["err"] == "server"
 
@@ -810,7 +813,8 @@ def test_cache_simple_prompt_served_from_memory(wired, gguf, monkeypatch):
             assert r2.json() == r1.json()
         assert len(fake.calls) == 1  # remote billed once
         lines = [json.loads(ln) for ln in
-                 gw_app._LOG_PATH.read_text(encoding="utf-8").strip().splitlines()]
+                 (gw_app._month_log_path(gw_app._month_key())
+                  .read_text(encoding="utf-8").strip().splitlines())]
         assert lines[-1]["backend"] == "cache"
         assert gw_app.cache_stats() == {"entries": 1, "hits": 1}
 
@@ -1264,3 +1268,273 @@ def test_token_budget_in_stats(wired, gguf, monkeypatch):
         budgets = r.json()["budgets"]
         assert budgets == [{"backend": "groq", "budget": 500, "used": 120,
                             "month": time.strftime("%Y-%m")}]
+
+
+# ── tier 1: virtual keys, pricing, log rotation ────────────────────────────
+
+def _secured_config(gguf, api_keys=None, gateway_keys=("admin-secret",)):
+    """Config with a fresh groq backend + auth enabled (any configured
+    key turns bearer auth on; gateway_keys are the ADMIN keys)."""
+    cfgd = _config(gguf)
+    cfgd["backends"]["groq"] = {  # fresh dict — GROQ is mutated by earlier tests
+        "type": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "models": {"cloud-fast": "llama-3.1-8b-instant"}}
+    if gateway_keys is not None:
+        cfgd["gateway_keys"] = list(gateway_keys)
+    if api_keys is not None:
+        cfgd["api_keys"] = api_keys
+    return cfgd
+
+
+def _seed_key_log(key_id: str, tokens: int) -> None:
+    """One current-month log line attributed to a virtual key."""
+    gw_app._LOG_PATH.write_text(json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model": "groq:cloud-fast", "backend": "groq", "stream": False,
+        "ms": 1, "usage": {"total_tokens": tokens}, "status": 200,
+        "key": key_id}) + "\n", encoding="utf-8")
+
+
+def test_virtual_key_auth_and_attribution(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    wired(_secured_config(gguf, api_keys=[
+        {"id": "program-x", "key": "vk-test-1", "owner": "X"}]))
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        # any configured key enables auth: none / wrong → 401
+        for headers in ({}, {"Authorization": "Bearer wrong"}):
+            r = client.post("/v1/chat/completions", headers=headers, json={
+                "model": "groq:cloud-fast",
+                "messages": [{"role": "user", "content": "auth check"}]})
+            assert r.status_code == 401
+        # virtual key works and is attributed in the log
+        r2 = client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer vk-test-1"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "attributed request"}]})
+        assert r2.status_code == 200, r2.text
+        # virtual keys are CONSUMER keys — no admin surface
+        r3 = client.get("/admin/stats", headers={
+            "Authorization": "Bearer vk-test-1"})
+        assert r3.status_code == 403
+        # admin key reaches stats and sees the per-key usage
+        r4 = client.get("/admin/stats", headers={
+            "Authorization": "Bearer admin-secret"})
+        assert r4.status_code == 200
+        rows = r4.json()["per_key"]
+        assert rows and rows[0]["key"] == "program-x"
+        assert rows[0]["n"] == 1
+        assert rows[0]["total_tokens"] == 8
+    lines = [json.loads(ln) for ln in
+             (gw_app._month_log_path(gw_app._month_key())
+              .read_text(encoding="utf-8").strip().splitlines())]
+    keyed = [e for e in lines if e.get("key")]
+    assert keyed and keyed[-1]["key"] == "program-x"
+
+
+def test_admin_keys_create_and_revoke(wired, gguf):
+    cfgfile, _, _ = wired(_secured_config(gguf))
+    with TestClient(gw_app.app) as client:
+        h = {"Authorization": "Bearer admin-secret"}
+        r = client.post("/admin/keys", headers=h, json={
+            "id": "prog-a", "owner": "A", "monthly_token_budget": 1000})
+        assert r.status_code == 200, r.text
+        key = r.json()["key"]
+        assert key.startswith("vk-")
+        # listing shows it with budgets
+        r2 = client.get("/admin/keys", headers=h)
+        assert r2.status_code == 200
+        entries = r2.json()["api_keys"]
+        assert [e["id"] for e in entries] == ["prog-a"]
+        assert entries[0]["monthly_token_budget"] == 1000
+        assert entries[0]["key"] == key
+        # the fresh key authenticates /v1 (healthz requires a key now)
+        r3 = client.get("/healthz", headers={"Authorization": f"Bearer {key}"})
+        assert r3.status_code == 200
+        # revoke → immediate 401
+        r4 = client.post("/admin/keys", headers=h,
+                         json={"id": "prog-a", "delete": True})
+        assert r4.status_code == 200
+        r5 = client.get("/healthz", headers={"Authorization": f"Bearer {key}"})
+        assert r5.status_code == 401
+    # persisted through the config file
+    fresh = gw_config.GatewayConfig(cfgfile)
+    assert fresh.api_keys == {}
+
+
+def test_admin_keys_requires_admin_key_first(wired, gguf):
+    """No gateway_keys → creating a virtual key is refused: it would
+    enable auth and lock the admin surface out."""
+    wired(_secured_config(gguf, gateway_keys=[]))
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/keys", json={"id": "x"})
+    assert r.status_code == 400
+    assert "admin" in r.json()["error"]["message"].lower()
+
+
+def test_key_token_budget_429(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    wired(_secured_config(gguf, api_keys=[
+        {"id": "prog-b", "key": "vk-b", "monthly_token_budget": 10}]))
+    _seed_key_log("prog-b", 12)  # already over
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer vk-b"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "key budget test"}]})
+        assert r.status_code == 429
+        body = r.json()["error"]
+        assert body["code"] == "key_budget_exceeded"
+        assert "12/10" in body["message"]
+        assert len(fake.calls) == 0  # never reached the provider
+
+
+# ── pricing ────────────────────────────────────────────────────────────────
+
+def test_extract_price_cheapest_live_provider():
+    model = {"id": "m", "providers": [
+        {"provider": "a", "status": "live",
+         "pricing": {"input": 0.42, "output": 3}},
+        {"provider": "b", "status": "live",
+         "pricing": {"input": 0.1, "output": 0.5}},
+        {"provider": "dead", "status": "error",
+         "pricing": {"input": 0.01, "output": 0.01}},
+    ]}
+    p = gw_app._extract_price(model)
+    assert p is not None
+    assert (p["in"], p["out"]) == (0.1, 0.5)  # cheapest LIVE provider
+    assert set(p["providers"]) == {"a", "b"}   # per-provider map kept
+    assert gw_app._extract_price({"id": "m"}) is None
+
+
+def test_cost_usd_suffix_pinning():
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(model_prices={
+        "hf": {"org/m": {"in": 1.0, "out": 2.0,
+                         "providers": {"groq": {"in": 0.1, "out": 0.2}}}}})
+    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+    assert gw_app._cost_usd(cfg, "hf", "org/m", usage) == 3.0  # cheapest
+    assert gw_app._cost_usd(cfg, "hf", "org/m:groq", usage) == 0.3  # pinned
+    assert gw_app._cost_usd(cfg, "hf", "unknown", usage) is None
+
+
+def test_cost_tracking_end_to_end(wired, gguf, monkeypatch):
+    """Priced request → cost_usd in the response, the log, and stats."""
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _secured_config(gguf, api_keys=[
+        {"id": "p", "key": "vk-p", "monthly_usd_budget": 1.0}])
+    cfgd["model_prices"] = {"groq": {
+        "llama-3.1-8b-instant": {"in": 0.5, "out": 2.0}}}
+    wired(cfgd)
+    _patch_cloud(monkeypatch, _FakeCloud())  # usage: 5 in / 3 out
+    expected = round((5 * 0.5 + 3 * 2.0) / 1_000_000, 6)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer vk-p"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "costed request"}]})
+        assert r.status_code == 200
+        assert r.json()["cost_usd"] == expected
+        s = client.get("/admin/stats", headers={
+            "Authorization": "Bearer admin-secret"}).json()
+        row = next(x for x in s["per_model"]
+                   if x["model"] == "groq:cloud-fast")
+        assert row["cost_usd"] == expected
+        krow = next(x for x in s["per_key"] if x["key"] == "p")
+        assert krow["cost_usd"] == expected
+    lines = [json.loads(ln) for ln in
+             (gw_app._month_log_path(gw_app._month_key())
+              .read_text(encoding="utf-8").strip().splitlines())]
+    assert lines[-1]["cost_usd"] == expected
+
+
+def test_price_capture_on_catalog_fetch(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgfile, _, _ = wired(_secured_config(gguf))
+
+    async def _fake_fetch(base_url, api_key):
+        return {"data": [
+            {"id": "org/m", "providers": [
+                {"provider": "a", "status": "live",
+                 "pricing": {"input": 0.1, "output": 0.5}}]},
+            {"id": "org/n"}]}  # no pricing → not captured
+
+    monkeypatch.setattr(gw_app, "_fetch_remote_catalog", _fake_fetch)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/backends/groq/remote-models", headers={
+            "Authorization": "Bearer admin-secret"})
+        assert r.status_code == 200
+    fresh = gw_config.GatewayConfig(cfgfile)
+    assert fresh.model_prices["groq"]["org/m"] == {
+        "in": 0.1, "out": 0.5, "providers": {"a": {"in": 0.1, "out": 0.5}}}
+    assert "org/n" not in fresh.model_prices["groq"]
+
+
+# ── log rotation + rollups ─────────────────────────────────────────────────
+
+def test_log_migration_splits_month_and_archive(wired, gguf):
+    wired(_config(gguf))
+    m = time.strftime("%Y-%m")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    lines = [
+        json.dumps({"ts": now, "model": "a", "backend": "local",
+                    "stream": False, "ms": 1, "usage": {}, "status": 200}),
+        json.dumps({"ts": now, "model": "b", "backend": "local",
+                    "stream": False, "ms": 1, "usage": {}, "status": 200}),
+        json.dumps({"ts": "2020-01-01T00:00:00", "model": "old",
+                    "backend": "local", "stream": False, "ms": 1,
+                    "usage": {}, "status": 200}),
+        "not json at all",
+    ]
+    gw_app._LOG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path = gw_app._ensure_month_log()
+    # current-month lines imported; old + junk archived; legacy renamed
+    kept = [json.loads(l) for l in
+            path.read_text(encoding="utf-8").strip().splitlines()]
+    assert [e["model"] for e in kept] == ["a", "b"]
+    arch = (gw_app._LOG_PATH.parent / "gateway-log-archive.jsonl"
+            ).read_text(encoding="utf-8").strip().splitlines()
+    assert len(arch) == 2  # old month line + junk
+    assert not gw_app._LOG_PATH.exists()
+    assert (gw_app._LOG_PATH.parent
+            / (gw_app._LOG_PATH.name + ".migrated")).exists()
+
+
+def test_rollup_and_stats_history(wired, gguf):
+    """A closed month's file rolls up on demand and /admin/stats merges
+    it with the live month — full history without scanning archives."""
+    wired(_config(gguf))
+    closed = "2020-05"
+    closed_lines = [
+        json.dumps({"ts": closed + "-01T00:00:00", "model": "hist",
+                    "backend": "groq", "stream": False, "ms": 10,
+                    "usage": {"total_tokens": 7}, "status": 200,
+                    "cost_usd": 0.001, "key": "old-key"}),
+        json.dumps({"ts": closed + "-02T00:00:00", "model": "hist",
+                    "backend": "groq", "stream": False, "ms": 20,
+                    "usage": {"total_tokens": 3}, "status": 200,
+                    "key": "old-key"}),
+    ]
+    (gw_app._LOG_PATH.parent / f"gateway-log-{closed}.jsonl").write_text(
+        "\n".join(closed_lines) + "\n", encoding="utf-8")
+    # one live current-month line
+    gw_app._LOG_PATH.write_text(json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "model": "live",
+        "backend": "local", "stream": False, "ms": 5,
+        "usage": {"total_tokens": 1}, "status": 200}) + "\n",
+        encoding="utf-8")
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/stats")
+        assert r.status_code == 200
+        s = r.json()
+    assert s["total"] == 3  # 2 rolled-up + 1 live
+    hist = next(x for x in s["per_model"] if x["model"] == "hist")
+    assert hist["n"] == 2 and hist["total_tokens"] == 10
+    assert hist["cost_usd"] == 0.001
+    krow = next(x for x in s["per_key"] if x["key"] == "old-key")
+    assert krow["n"] == 2
+    # the rollup file now exists (closed month aggregated)
+    assert (gw_app._LOG_PATH.parent
+            / f"gateway-rollup-{closed}.json").is_file()

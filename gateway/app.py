@@ -81,10 +81,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import contextvars
 import hashlib
 import itertools
 import json
 import logging
+import re
+import secrets
 import struct
 import threading
 import time
@@ -329,26 +332,63 @@ def _exec_error_response(e: BaseException, requested: str,
                   headers=headers)
 
 
-# ── Bearer auth (gateway_keys; empty list = open, localhost trust) ─────────
+# ── Bearer auth (gateway_keys = ADMIN keys; api_keys = per-consumer
+# virtual keys with usage attribution). Empty both = open localhost trust. ──
+
+# Per-request key identity (set by the auth middleware, read by the
+# logger/budget machinery — a ContextVar avoids threading a key param
+# through every _log_request call site).
+_REQUEST_KEY_ID = contextvars.ContextVar("gw_request_key", default="")
+
+
+def _resolve_bearer(cfg, token: str) -> str:
+    """Bearer token → key_id: 'admin' for gateway_keys, the api_keys id
+    for a virtual key, '' when unknown."""
+    if not token:
+        return ""
+    if token in (cfg.gateway_keys or []):
+        return "admin"
+    for entry in (cfg.api_keys or {}).values():
+        if entry.get("key") == token:
+            return str(entry.get("id") or "")
+    return ""
+
 
 @app.middleware("http")
 async def _bearer_auth(request: Request, call_next):
     cfg = get_gateway_config()
     cfg.maybe_reload()
     keys = cfg.gateway_keys
-    if keys:
+    vkeys = cfg.api_keys
+    if keys or vkeys:
         if request.method == "GET" and request.url.path == "/":
-            return await call_next(request)  # static console shell — its API
+            _REQUEST_KEY_ID.set("")  # static console shell — its API
             # calls still require the key (the page prompts for it)
+            return await call_next(request)
         auth = request.headers.get("authorization") or ""
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        if token not in keys:
+        key_id = _resolve_bearer(cfg, token)
+        if not key_id:
             return JSONResponse(
                 status_code=401,
                 content={"error": {
                     "message": "missing or invalid API key",
                     "type": "invalid_request_error", "param": None,
                     "code": "invalid_api_key"}})
+        if (key_id != "admin"
+                and request.url.path.startswith("/admin")):
+            # Virtual keys are CONSUMER keys — admin surface needs an
+            # admin key (gateway_keys). Prevents a program key from
+            # reading config, stats, or minting keys.
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": "admin endpoints require a gateway admin key",
+                    "type": "invalid_request_error", "param": None,
+                    "code": "admin_key_required"}})
+        _REQUEST_KEY_ID.set(key_id)
+        return await call_next(request)
+    _REQUEST_KEY_ID.set("")
     return await call_next(request)
 
 
@@ -363,81 +403,255 @@ async def _validation_error(request: Request, exc: RequestValidationError) -> JS
 # ── JSONL request log ──────────────────────────────────────────────────────
 
 def _log_request(model: str, backend: str, stream: bool, ms: int,
-                 usage: dict[str, Any], status: int, err: str = "") -> None:
+                 usage: dict[str, Any], status: int, err: str = "",
+                 cost_usd: float | None = None) -> None:
     """One line per request — best effort, never fails the request.
     err (optional) carries the classified failure kind for status >= 400
-    (timeout/network/rate_limit/server/auth/client — cloud.classify_error)."""
+    (timeout/network/rate_limit/server/auth/client — cloud.classify_error).
+    cost_usd (optional) is the estimated provider cost. The consuming
+    key's id rides in via the request ContextVar (absent for open mode)."""
     rec: dict[str, Any] = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                            "model": model, "backend": backend, "stream": stream,
                            "ms": ms, "usage": usage, "status": status}
     if err:
         rec["err"] = err
+    kid = _REQUEST_KEY_ID.get()
+    if kid:
+        rec["key"] = kid
+    if cost_usd is not None:
+        rec["cost_usd"] = round(cost_usd, 6)
     line = json.dumps(rec)
     try:
         with _log_lock:
-            _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            global _LOG_MONTH_STATE
+            if _LOG_MONTH_STATE != _month_key():
+                _LOG_MONTH_STATE = _month_key()
+                _rollup_closed_months()
+            path = _ensure_month_log()
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
     except OSError:
         logger.warning("gateway_log write failed", exc_info=True)
 
 
-# ── per-backend monthly token budget (openai-type cloud backends) ──────────
-# The request log IS the ledger: the counter derives from gateway_log.jsonl
-# (backend == <name>, ts in the current month; cache hits log backend
-# "cache" and never bill upstream, so they are excluded for free) and
-# increments in memory afterwards. month roll-over re-derives from the
-# log. Streams are NOT charged — their usage isn't extracted (the same
-# blind spot /admin/stats has). 0 = off (default).
+# ── monthly spend ledger + rotating request log ────────────────────────────
+# The request log IS the ledger. Files are month-scoped
+# (gateway-log-YYYY-MM.jsonl next to the legacy path); the legacy single
+# file migrates once (current-month lines imported, older lines archived
+# to gateway-log-archive.jsonl, legacy renamed *.migrated). Closed months
+# roll up into gateway-rollup-YYYY-MM.json so /admin/stats keeps full
+# history without scanning archives. Spend scopes: "backend:<name>"
+# (openai-type token budgets) and "key:<id>" (per-consumer token/USD
+# budgets). Cache hits log backend="cache" and never bill upstream.
 
-_TOKEN_LEDGER: dict[str, dict[str, Any]] = {}  # backend → {month, used}
+_SPEND_LEDGER: dict[str, dict[str, Any]] = {}   # scope → {month, tokens, usd}
+_SPEND_ALERTED: set[str] = set()                # "scope:month" 80% alerts
+_LOG_MIGRATED: bool = False
+_LOG_MONTH_STATE: str | None = None
 
 
 def _month_key() -> str:
     return time.strftime("%Y-%m")
 
 
-def _token_budget_used(backend_name: str) -> int:
-    """Tokens used this month by a backend — log-derived, cached in
-    memory; re-derived when the month rolls over."""
-    month = _month_key()
-    led = _TOKEN_LEDGER.get(backend_name)
-    if led is not None and led.get("month") == month:
-        return int(led.get("used") or 0)
-    used = 0
-    prefix = month + "-"
+def _month_log_path(month: str) -> Path:
+    return _LOG_PATH.parent / f"gateway-log-{month}.jsonl"
+
+
+def _ensure_month_log(month: str | None = None) -> Path:
+    """Current month's log path, lazily migrating the legacy single-file
+    log (current-month lines imported; older lines archived; legacy
+    renamed .migrated — idempotent, no data ever lost)."""
+    global _LOG_MIGRATED
+    month = month or _month_key()
+    path = _month_log_path(month)
+    if _LOG_MIGRATED:
+        return path
+    _LOG_MIGRATED = True
     try:
-        with open(_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                if backend_name not in ln:
-                    continue  # cheap pre-filter before json parsing
+        if _LOG_PATH.is_file():
+            keep: list[str] = []
+            archive: list[str] = []
+            for ln in _LOG_PATH.read_text(encoding="utf-8",
+                                          errors="replace").splitlines():
                 try:
                     e = json.loads(ln)
                 except json.JSONDecodeError:
+                    archive.append(ln)
                     continue
-                if (e.get("backend") == backend_name
-                        and str(e.get("ts") or "").startswith(prefix)):
-                    used += int((e.get("usage") or {})
-                                .get("total_tokens") or 0)
+                (keep if str(e.get("ts") or "").startswith(month + "-")
+                 else archive).append(ln)
+            if keep:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write("\n".join(keep) + "\n")
+            if archive:
+                ap = _LOG_PATH.parent / "gateway-log-archive.jsonl"
+                with open(ap, "a", encoding="utf-8") as f:
+                    f.write("\n".join(archive) + "\n")
+            _LOG_PATH.rename(str(_LOG_PATH) + ".migrated")
+            logger.info("gateway log migrated to month files "
+                        "(%d current-month lines, %d archived)",
+                        len(keep), len(archive))
     except OSError:
-        pass
-    _TOKEN_LEDGER[backend_name] = {"month": month, "used": used}
-    return used
+        logger.warning("gateway log migration failed", exc_info=True)
+    return path
 
 
-def _charge_tokens(backend_name: str, total_tokens: int) -> None:
-    if total_tokens <= 0:
+def _iter_month_lines(month: str) -> list[dict[str, Any]]:
+    """Parsed lines of a month's log (missing file → [])."""
+    try:
+        raw = _month_log_path(month).read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in raw:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _rollup_closed_months() -> None:
+    """Aggregate any CLOSED month file lacking a rollup into
+    gateway-rollup-YYYY-MM.json (the current month is never rolled up —
+    it is still being written)."""
+    try:
+        current = _month_key()
+        for p in sorted(_LOG_PATH.parent.glob("gateway-log-*.jsonl")):
+            name = p.name[len("gateway-log-"):-len(".jsonl")]
+            if not name or name >= current:
+                continue
+            rp = _LOG_PATH.parent / f"gateway-rollup-{name}.json"
+            if rp.exists():
+                continue
+            agg = _aggregate_lines(_iter_month_lines(name))
+            agg["month"] = name
+            rp.write_text(json.dumps(agg), encoding="utf-8")
+            logger.info("gateway log rolled up: %s", name)
+    except OSError:
+        logger.warning("gateway log rollup failed", exc_info=True)
+
+
+def _aggregate_lines(lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """Parsed log lines → {per_model, per_key, total} (the rollup file
+    format AND the current-month half of /admin/stats)."""
+    per: dict[tuple[str, str], dict[str, Any]] = {}
+    keys: dict[str, dict[str, Any]] = {}
+    total = 0
+    for e in lines:
+        total += 1
+        mk = (str(e.get("model") or "?"), str(e.get("backend") or "?"))
+        agg = per.setdefault(mk, {
+            "model": mk[0], "backend": mk[1], "n": 0, "ms_sum": 0,
+            "max_ms": 0, "total_tokens": 0, "cost_usd": 0.0, "errors": 0})
+        ms = int(e.get("ms") or 0)
+        agg["n"] += 1
+        agg["ms_sum"] += ms
+        agg["max_ms"] = max(agg["max_ms"], ms)
+        agg["total_tokens"] += int((e.get("usage") or {})
+                                   .get("total_tokens") or 0)
+        agg["cost_usd"] += float(e.get("cost_usd") or 0.0)
+        if int(e.get("status") or 200) >= 400:
+            agg["errors"] += 1
+        kid = str(e.get("key") or "")
+        if kid:
+            kagg = keys.setdefault(kid, {"key": kid, "n": 0,
+                                         "total_tokens": 0, "cost_usd": 0.0,
+                                         "errors": 0})
+            kagg["n"] += 1
+            kagg["total_tokens"] += int((e.get("usage") or {})
+                                        .get("total_tokens") or 0)
+            kagg["cost_usd"] += float(e.get("cost_usd") or 0.0)
+            if int(e.get("status") or 200) >= 400:
+                kagg["errors"] += 1
+    return {"per_model": list(per.values()), "per_key": list(keys.values()),
+            "total": total}
+
+
+def _scope_spend(scope: str) -> dict[str, float]:
+    """{tokens, usd} this month for a spend scope — derived from the
+    current month's log, cached in memory; month rollover re-derives."""
+    month = _month_key()
+    led = _SPEND_LEDGER.get(scope)
+    if led is not None and led.get("month") == month:
+        return {"tokens": int(led.get("tokens") or 0),
+                "usd": float(led.get("usd") or 0.0)}
+    _ensure_month_log()
+    kind, _, marker = scope.partition(":")
+    tokens = 0
+    usd = 0.0
+    for e in _iter_month_lines(month):
+        if kind == "backend":
+            if e.get("backend") != marker:
+                continue
+        elif e.get("key") != marker:
+            continue
+        tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
+        usd += float(e.get("cost_usd") or 0.0)
+    _SPEND_LEDGER[scope] = {"month": month, "tokens": tokens, "usd": usd}
+    return {"tokens": tokens, "usd": usd}
+
+
+def _charge_scope(scope: str, tokens: int, usd: float | None) -> None:
+    if tokens <= 0 and not usd:
         return
-    led = _TOKEN_LEDGER.get(backend_name)
+    led = _SPEND_LEDGER.get(scope)
     if led is None or led.get("month") != _month_key():
-        _token_budget_used(backend_name)  # initialize from the log
-        led = _TOKEN_LEDGER.get(backend_name) or {}
-    led["used"] = int(led.get("used") or 0) + int(total_tokens)
+        _scope_spend(scope)  # initialize from the log
+        led = _SPEND_LEDGER.get(scope) or {}
+    led["tokens"] = int(led.get("tokens") or 0) + int(tokens)
+    led["usd"] = float(led.get("usd") or 0.0) + float(usd or 0.0)
+
+
+def _token_budget_used(backend_name: str) -> int:
+    """This-month tokens for a backend (the backend budget gate's view)."""
+    return _scope_spend(f"backend:{backend_name}")["tokens"]
 
 
 def reset_token_ledger() -> None:
-    """Drop in-memory budget counters (tests / admin)."""
-    _TOKEN_LEDGER.clear()
+    """Drop in-memory spend counters + alerts (tests / admin)."""
+    _SPEND_LEDGER.clear()
+    _SPEND_ALERTED.clear()
+
+
+def _charge_request(cfg, backend_name: str, usage: dict,
+                    cost_usd: float | None) -> None:
+    """Charge a successful request: the backend's token ledger
+    (openai-type, costed) + the consuming key's ledger (tokens always,
+    usd when priced) + the 80%-of-budget alert."""
+    tokens = int((usage or {}).get("total_tokens") or 0)
+    backend = cfg.backends.get(backend_name) or {}
+    if backend.get("type") == "openai":
+        _charge_scope(f"backend:{backend_name}", tokens, cost_usd)
+    kid = _REQUEST_KEY_ID.get()
+    if kid and kid != "admin":
+        _charge_scope(f"key:{kid}", tokens, cost_usd)
+        _maybe_spend_alert(kid, (cfg.api_keys or {}).get(kid) or {})
+
+
+def _maybe_spend_alert(key_id: str, entry: dict) -> None:
+    """Event-ring warning when a key crosses 80% of either monthly budget
+    (once per key+month)."""
+    tok_b = int(entry.get("monthly_token_budget") or 0)
+    usd_b = float(entry.get("monthly_usd_budget") or 0)
+    if tok_b <= 0 and usd_b <= 0:
+        return
+    month = _month_key()
+    marker = f"key:{key_id}:{month}"
+    if marker in _SPEND_ALERTED:
+        return
+    spend = _scope_spend(f"key:{key_id}")
+    if ((tok_b > 0 and spend["tokens"] >= 0.8 * tok_b)
+            or (usd_b > 0 and spend["usd"] >= 0.8 * usd_b)):
+        _SPEND_ALERTED.add(marker)
+        msg = (f"key {key_id!r} at ≥80% of monthly budget "
+               f"({spend['tokens']} tokens, ${spend['usd']:.2f})")
+        logger.warning("gateway: %s", msg)
+        _event_ring().push({"ts": time.strftime("%H:%M:%S"),
+                            "level": "WARNING", "logger": "gateway.budget",
+                            "message": msg})
 
 
 async def _token_budget_gate(cfg, backend_name: str) -> None:
@@ -452,12 +666,127 @@ async def _token_budget_gate(cfg, backend_name: str) -> None:
         budget = 0
     if budget <= 0:
         return
-    used = _token_budget_used(backend_name)
+    used = _scope_spend(f"backend:{backend_name}")["tokens"]
     if used >= budget:
         raise lifecycle.LifecycleBudgetExceeded(
             f"backend {backend_name!r}: monthly token budget exhausted "
             f"({used}/{budget} tokens) — raise monthly_token_budget or "
             f"wait for the month to roll over")
+
+
+def _key_budget_gate(cfg) -> Response | None:
+    """Per-KEY monthly budgets (tokens + USD): returns a 429 response when
+    the presented virtual key is over budget; None when OK. Admin keys
+    and open mode are exempt. Runs AFTER the response cache — cache hits
+    cost nothing and stay available to over-budget keys."""
+    kid = _REQUEST_KEY_ID.get()
+    if not kid or kid == "admin":
+        return None
+    entry = (cfg.api_keys or {}).get(kid)
+    if not entry:
+        return None
+    tok_b = int(entry.get("monthly_token_budget") or 0)
+    usd_b = float(entry.get("monthly_usd_budget") or 0)
+    if tok_b <= 0 and usd_b <= 0:
+        return None
+    spend = _scope_spend(f"key:{kid}")
+    if tok_b > 0 and spend["tokens"] >= tok_b:
+        return _error(429, f"key {kid!r}: monthly token budget exhausted "
+                           f"({spend['tokens']}/{tok_b} tokens)",
+                      err_type="rate_limit_error",
+                      code="key_budget_exceeded")
+    if usd_b > 0 and spend["usd"] >= usd_b:
+        return _error(429, f"key {kid!r}: monthly spend budget exhausted "
+                           f"(${spend['usd']:.2f}/${usd_b:.2f})",
+                      err_type="rate_limit_error",
+                      code="key_budget_exceeded")
+    return None
+
+
+# ── provider pricing (cost estimation) ─────────────────────────────────────
+
+def _extract_price(model: dict[str, Any]) -> dict[str, Any] | None:
+    """Cheapest live provider's $/Mtok rates + the per-provider map from
+    the HF router's providers metadata."""
+    provs = model.get("providers")
+    if not isinstance(provs, list):
+        return None
+    best: dict[str, Any] | None = None
+    provider_map: dict[str, Any] = {}
+    for pv in provs:
+        if not isinstance(pv, dict) or pv.get("status") not in (None, "live"):
+            continue
+        pr = pv.get("pricing") or {}
+        try:
+            pin = float(pr.get("input") or 0)
+            pout = float(pr.get("output") or 0)
+        except (TypeError, ValueError):
+            continue
+        pname = str(pv.get("provider") or "").strip()
+        if pname and (pin or pout):
+            provider_map[pname] = {"in": pin, "out": pout}
+            if best is None or (pin + pout) < (best["in"] + best["out"]):
+                best = {"in": pin, "out": pout}
+    if not best:
+        return None
+    out = dict(best)
+    if provider_map:
+        out["providers"] = provider_map
+    return out
+
+
+def _capture_prices(backend_name: str, models: list) -> None:
+    """Persist pricing from a fetched catalog into config model_prices
+    (best-effort — never fails the catalog response)."""
+    updates: dict[str, Any] = {}
+    for m in models:
+        mid = str((m or {}).get("id") or "").strip()
+        if not mid:
+            continue
+        p = _extract_price(m)
+        if p:
+            updates[mid] = p
+    if not updates:
+        return
+
+    def _mut(raw: dict) -> None:
+        prices = raw.setdefault("model_prices", {})
+        prices.setdefault(backend_name, {}).update(updates)
+
+    try:
+        _mutate_config(_mut)
+        logger.info("captured pricing for %d %s models",
+                    len(updates), backend_name)
+    except Exception:
+        logger.warning("price capture failed", exc_info=True)
+
+
+def _cost_usd(cfg, backend_name: str, wire_model: str,
+              usage: dict) -> float | None:
+    """Estimated request cost from cached provider pricing ($ per MILLION
+    tokens). Suffix-aware: ':<provider>' uses that provider's rate;
+    otherwise the cheapest provider's (the router's default :fastest may
+    land anywhere — the estimate is deliberately conservative-low).
+    None when the model isn't priced (local, runpod, uncataloged)."""
+    prices = (cfg.model_prices or {}).get(backend_name) or {}
+    p = prices.get(wire_model)
+    if p is None and ":" in wire_model:
+        base, suffix = wire_model.rsplit(":", 1)
+        p = prices.get(base)
+        if p:
+            pv = (p.get("providers") or {}).get(suffix)
+            if pv:
+                p = {"in": pv.get("in", p.get("in") or 0),
+                     "out": pv.get("out", p.get("out") or 0)}
+    if not p:
+        return None
+    u = usage or {}
+    try:
+        return (int(u.get("prompt_tokens") or 0) * float(p.get("in") or 0)
+                + int(u.get("completion_tokens") or 0)
+                * float(p.get("out") or 0)) / 1_000_000
+    except (TypeError, ValueError):
+        return None
 
 
 # ── request model ──────────────────────────────────────────────────────────
@@ -993,9 +1322,14 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     d = (json.loads(resp.model_dump_json())
          if hasattr(resp, "model_dump_json") else dict(resp))
     d["model"] = requested  # consistent echo; served_by carries the truth
+    usage = d.get("usage") or {}
     if btype == "openai":
-        _charge_tokens(backend_name,
-                       int((d.get("usage") or {}).get("total_tokens") or 0))
+        cost = _cost_usd(cfg, backend_name, str(remote_id), usage)
+        if cost is not None:
+            d["cost_usd"] = round(cost, 6)  # estimate rides to the caller
+        _charge_request(cfg, backend_name, usage, cost)
+    else:
+        _charge_request(cfg, backend_name, usage, None)
     return d, backend_name, model_key
 
 
@@ -1221,6 +1555,15 @@ async def chat_completions(body: ChatRequest) -> Response:
         if hit:  # expired — drop before re-executing
             _RESPONSE_CACHE.pop(ckey, None)
 
+    # Per-key monthly budgets (AFTER the cache — hits are free). Admin
+    # keys and open mode pass through.
+    over = _key_budget_gate(cfg)
+    if over is not None:
+        ms = int((time.perf_counter() - t0) * 1000)
+        _log_request(requested, "", body.stream, ms, {}, 429,
+                     err="key_budget")
+        return over
+
     if body.stream:
         # Streaming executes the PRIMARY entry only — hedge racing is a
         # non-streaming feature (first-completion-wins has no stream analog
@@ -1264,7 +1607,8 @@ async def chat_completions(body: ChatRequest) -> Response:
                 _RESPONSE_CACHE[ckey] = {"resp": dict(resp),
                                          "ts": time.monotonic(), "hits": 0}
         _log_request(requested, winner, body.stream, ms,
-                     resp.get("usage") or {}, 200)
+                     resp.get("usage") or {}, 200,
+                     cost_usd=resp.get("cost_usd"))
         return JSONResponse(resp)
     finally:
         _release_chat_slot(slot)
@@ -1718,6 +2062,14 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     backend = cfg.backends[backend_name]
     btype = backend.get("type")
 
+    # Per-key monthly budgets (tokens + USD)
+    over = _key_budget_gate(cfg)
+    if over is not None:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 429,
+                     err="key_budget")
+        return over
+
     engine = get_engine()
     _reap_stale_chat_slots(cfg)
     capacity = (max(1, len(engine.loaded_models()))
@@ -1930,12 +2282,18 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         d = (json.loads(resp.model_dump_json())
              if hasattr(resp, "model_dump_json") else dict(resp))
         d["model"] = requested
+        usage = d.get("usage") or {}
+        cost = None
         if btype == "openai":
-            _charge_tokens(backend_name,
-                           int((d.get("usage") or {}).get("total_tokens") or 0))
+            cost = _cost_usd(cfg, backend_name, str(remote_id), usage)
+            if cost is not None:
+                d["cost_usd"] = round(cost, 6)
+            _charge_request(cfg, backend_name, usage, cost)
+        else:
+            _charge_request(cfg, backend_name, usage, None)
         ms = int((time.perf_counter() - t0) * 1000)
         _log_request(requested, backend_name, False, ms,
-                     d.get("usage") or {}, 200)
+                     usage, 200, cost_usd=cost)
         return JSONResponse(d)
     except lifecycle.LifecycleBudgetExceeded as e:
         ms = int((time.perf_counter() - t0) * 1000)
@@ -2603,32 +2961,64 @@ async def admin_put_config(payload: ConfigPayload) -> Response:
 
 @app.get("/admin/stats")
 async def admin_stats() -> Response:
-    """Per-model aggregates + recent requests from gateway_log.jsonl."""
+    """Per-model aggregates + per-key usage + recent requests.
+
+    Full history without scanning archives: closed months load from
+    gateway-rollup-*.json; the current month aggregates live from the
+    month-scoped log. per_key rows carry their configured budgets."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    _rollup_closed_months()
     per: dict[tuple[str, str], dict[str, Any]] = {}
-    recent: list[dict[str, Any]] = []
+    keys: dict[str, dict[str, Any]] = {}
     total = 0
+
+    def _merge(agg: dict[str, Any]) -> None:
+        nonlocal total
+        total += int(agg.get("total") or 0)
+        for row in agg.get("per_model") or []:
+            mk = (str(row.get("model")), str(row.get("backend")))
+            dst = per.setdefault(mk, {"model": mk[0], "backend": mk[1],
+                                      "n": 0, "ms_sum": 0, "max_ms": 0,
+                                      "total_tokens": 0, "cost_usd": 0.0,
+                                      "errors": 0})
+            dst["n"] += int(row.get("n") or 0)
+            dst["ms_sum"] += int(row.get("ms_sum") or 0)
+            dst["max_ms"] = max(dst["max_ms"], int(row.get("max_ms") or 0))
+            dst["total_tokens"] += int(row.get("total_tokens") or 0)
+            dst["cost_usd"] += float(row.get("cost_usd") or 0.0)
+            dst["errors"] += int(row.get("errors") or 0)
+        for row in agg.get("per_key") or []:
+            kid = str(row.get("key"))
+            dst = keys.setdefault(kid, {"key": kid, "n": 0, "total_tokens": 0,
+                                        "cost_usd": 0.0, "errors": 0})
+            dst["n"] += int(row.get("n") or 0)
+            dst["total_tokens"] += int(row.get("total_tokens") or 0)
+            dst["cost_usd"] += float(row.get("cost_usd") or 0.0)
+            dst["errors"] += int(row.get("errors") or 0)
+
     try:
-        lines = _LOG_PATH.read_text(encoding="utf-8").strip().splitlines()
+        for rp in sorted(_LOG_PATH.parent.glob("gateway-rollup-*.json")):
+            try:
+                _merge(json.loads(rp.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
     except OSError:
-        lines = []
-    for ln in lines[-20000:]:
-        try:
-            e = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
-        total += 1
-        recent.append(e)
-        key = (str(e.get("model") or "?"), str(e.get("backend") or "?"))
-        agg = per.setdefault(key, {
-            "model": key[0], "backend": key[1], "n": 0, "ms_sum": 0,
-            "max_ms": 0, "total_tokens": 0, "errors": 0})
-        ms = int(e.get("ms") or 0)
-        agg["n"] += 1
-        agg["ms_sum"] += ms
-        agg["max_ms"] = max(agg["max_ms"], ms)
-        agg["total_tokens"] += int((e.get("usage") or {}).get("total_tokens") or 0)
-        if int(e.get("status") or 200) >= 400:
-            agg["errors"] += 1
+        pass
+    month = _month_key()
+    _ensure_month_log()
+    month_lines = _iter_month_lines(month)
+    _merge(_aggregate_lines(month_lines))
+
+    key_rows = []
+    for kid, kagg in keys.items():
+        entry = (cfg.api_keys or {}).get(kid) or {}
+        kagg["monthly_token_budget"] = int(
+            entry.get("monthly_token_budget") or 0)
+        kagg["monthly_usd_budget"] = float(
+            entry.get("monthly_usd_budget") or 0)
+        key_rows.append(kagg)
+
     rows = []
     for agg in per.values():
         rows.append({"model": agg["model"], "backend": agg["backend"],
@@ -2636,25 +3026,27 @@ async def admin_stats() -> Response:
                      "avg_ms": round(agg["ms_sum"] / agg["n"]) if agg["n"] else 0,
                      "max_ms": agg["max_ms"],
                      "total_tokens": agg["total_tokens"],
+                     "cost_usd": round(agg["cost_usd"], 6),
                      "errors": agg["errors"]})
     rows.sort(key=lambda r: -r["n"])
+    key_rows.sort(key=lambda r: -r["n"])
     # Monthly token budgets (openai-type cloud backends): live used/budget
     # from the log-derived ledger — the console's HF panel shows this.
     budgets = []
     try:
-        bcfg = get_gateway_config()
-        for bname, b in (bcfg.backends or {}).items():
+        for bname, b in (cfg.backends or {}).items():
             if (b.get("type") == "openai"
                     and int(b.get("monthly_token_budget") or 0) > 0):
                 budgets.append({
                     "backend": bname,
                     "budget": int(b["monthly_token_budget"]),
-                    "used": _token_budget_used(bname),
-                    "month": _month_key(),
+                    "used": _scope_spend(f"backend:{bname}")["tokens"],
+                    "month": month,
                 })
     except Exception:
         pass
-    return {"per_model": rows, "recent": recent[-50:], "total": total,
+    return {"per_model": rows, "per_key": key_rows,
+            "recent": month_lines[-50:], "total": total,
             "budgets": budgets}
 
 
@@ -3009,8 +3401,93 @@ async def admin_remote_models(name: str) -> Response:
     models = data.get("data") if isinstance(data, dict) else None
     if not isinstance(models, list):
         models = []
+    # Opportunistic pricing capture — the HF router's providers metadata
+    # carries per-provider $/Mtok rates; persisting them powers cost
+    # estimation and per-key USD budgets. Best-effort.
+    _capture_prices(name, models)
     return {"backend": name, "base_url": backend.get("base_url"),
             "count": len(models), "models": models}
+
+
+# ── Admin: virtual (per-consumer) API keys ─────────────────────────────────
+
+class ApiKeyPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = ""
+    owner: str = ""
+    note: str = ""
+    monthly_token_budget: int | None = None
+    monthly_usd_budget: float | None = None
+    delete: bool = False
+
+
+@app.get("/admin/keys")
+async def admin_keys() -> Response:
+    """Virtual key inventory + live usage (the consuming key's identity
+    rides in every request log line; usage sums the current month)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    month = _month_key()
+    rows = []
+    for kid, e in sorted((cfg.api_keys or {}).items()):
+        spend = _scope_spend(f"key:{kid}")
+        rows.append({
+            "id": kid, "owner": e.get("owner") or "",
+            "note": e.get("note") or "",
+            "key": e.get("key") or "",
+            "monthly_token_budget": int(e.get("monthly_token_budget") or 0),
+            "monthly_usd_budget": float(e.get("monthly_usd_budget") or 0),
+            "used_tokens": spend["tokens"],
+            "used_usd": round(spend["usd"], 6),
+            "month": month,
+        })
+    return {"api_keys": rows,
+            "admin_keys_configured": bool(cfg.gateway_keys)}
+
+
+@app.post("/admin/keys")
+async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
+    """Create or revoke a virtual key. Creating one ENABLES auth (any key
+    configured → bearer required), so an admin key (gateway_keys) must
+    exist first — otherwise the admin surface locks itself out."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    kid = payload.id.strip()
+    if not kid or not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", kid):
+        return _error(400, "key id: letters/digits/dots/dashes/underscores, "
+                           "max 40 chars", param="id")
+    if payload.delete:
+        def _del(raw: dict) -> None:
+            raw["api_keys"] = [k for k in (raw.get("api_keys") or [])
+                               if str((k or {}).get("id")) != kid]
+        _mutate_config(_del)
+        return {"revoked": kid}
+    if not cfg.gateway_keys:
+        return _error(400, "configure a gateway ADMIN key first "
+                           "(gateway_keys) — creating virtual keys enables "
+                           "auth and would otherwise lock out the admin "
+                           "surface", param="gateway_keys")
+    entry: dict[str, Any] = {
+        "id": kid,
+        "key": f"vk-{secrets.token_urlsafe(24)}",
+        "owner": payload.owner.strip(),
+        "note": payload.note.strip(),
+        "monthly_token_budget": max(0, int(payload.monthly_token_budget or 0)),
+        "monthly_usd_budget": max(0.0, float(payload.monthly_usd_budget or 0)),
+    }
+
+    def _upsert(raw: dict) -> None:
+        lst = [k for k in (raw.get("api_keys") or [])
+               if str((k or {}).get("id")) != kid]
+        lst.append(entry)
+        raw["api_keys"] = lst
+
+    _mutate_config(_upsert)
+    # The full key returns ONCE here (it also lives in the config JSON —
+    # the admin owns the machine and /admin/config exposes it anyway).
+    return {"created": kid, "key": entry["key"],
+            "monthly_token_budget": entry["monthly_token_budget"],
+            "monthly_usd_budget": entry["monthly_usd_budget"]}
 
 
 @app.get("/admin/secrets")
