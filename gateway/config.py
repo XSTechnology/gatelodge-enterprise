@@ -450,7 +450,11 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
 
 def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
     """api_keys: list of {id, key, owner?, note?, monthly_token_budget?,
-    monthly_usd_budget?} → {id: entry}. Invalid entries dropped."""
+    monthly_usd_budget?, models?, rate_limit_rpm?} → {id: entry}.
+    models = allowlist (empty or ["*"] = everything; entries match the
+    requested name, a bare model, a "backend:model" pair, or a whole
+    backend name). rate_limit_rpm = requests/minute (0 = unlimited).
+    Invalid entries dropped."""
     out: dict[str, dict[str, Any]] = {}
     if not isinstance(raw, list):
         return out
@@ -470,14 +474,52 @@ def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
             usd_b = max(0.0, float(k.get("monthly_usd_budget") or 0))
         except (TypeError, ValueError):
             usd_b = 0.0
+        try:
+            rpm = max(0, int(k.get("rate_limit_rpm") or 0))
+        except (TypeError, ValueError):
+            rpm = 0
+        models = [str(m).strip() for m in (k.get("models") or [])
+                  if str(m).strip()]
         out[kid] = {
             "id": kid, "key": key,
             "owner": str(k.get("owner") or "").strip(),
             "note": str(k.get("note") or "").strip(),
             "monthly_token_budget": tok_b,
             "monthly_usd_budget": usd_b,
+            "models": models,
+            "rate_limit_rpm": rpm,
         }
     return out
+
+
+def _normalize_verify_schedule(raw: Any) -> dict[str, Any]:
+    """verify_schedule: {enabled, interval_min, backends, timeout_s,
+    failures_before_alert, webhook_url} — the scheduled synthetic
+    verification (tier 2). Defaults: disabled, 30 min, all openai-type
+    backends, 2 consecutive failures before alerting, no webhook."""
+    rc = raw if isinstance(raw, dict) else {}
+    try:
+        interval = max(1, int(rc.get("interval_min") or 30))
+    except (TypeError, ValueError):
+        interval = 30
+    try:
+        timeout_s = max(5.0, float(rc.get("timeout_s") or 30.0))
+    except (TypeError, ValueError):
+        timeout_s = 30.0
+    try:
+        failures = max(1, int(rc.get("failures_before_alert") or 2))
+    except (TypeError, ValueError):
+        failures = 2
+    backends = [str(b).strip() for b in (rc.get("backends") or [])
+                if str(b).strip()]
+    return {
+        "enabled": bool(rc.get("enabled", False)),
+        "interval_min": interval,
+        "backends": backends,
+        "timeout_s": timeout_s,
+        "failures_before_alert": failures,
+        "webhook_url": str(rc.get("webhook_url") or "").strip(),
+    }
 
 
 def _normalize_model_prices(raw: Any) -> dict[str, dict[str, Any]]:
@@ -619,6 +661,9 @@ class GatewayConfig:
         # Virtual (per-consumer) keys + cached provider pricing
         self.api_keys = _normalize_api_keys(raw.get("api_keys"))
         self.model_prices = _normalize_model_prices(raw.get("model_prices"))
+        # Scheduled synthetic verification (tier 2)
+        self.verify_schedule = _normalize_verify_schedule(
+            raw.get("verify_schedule"))
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""

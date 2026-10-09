@@ -354,6 +354,32 @@ def _resolve_bearer(cfg, token: str) -> str:
     return ""
 
 
+# ── per-key rate limiting (requests/minute, sliding window) ────────────────
+# Admin keys and open mode are unlimited. In-memory only — a restart
+# clears the window (one minute of slack, acceptable for an RPM limiter).
+
+_RATE_WINDOWS: dict[str, collections.deque] = {}
+
+
+def reset_rate_windows() -> None:
+    """Drop in-memory rate windows (tests)."""
+    _RATE_WINDOWS.clear()
+
+
+def _key_rate_limit(key_id: str, rpm: int) -> float:
+    """Record a request for key_id against its rpm limit. Returns 0.0
+    when allowed, else the seconds until the oldest request leaves the
+    60s window (Retry-After)."""
+    now = time.monotonic()
+    win = _RATE_WINDOWS.setdefault(key_id, collections.deque())
+    while win and now - win[0] > 60.0:
+        win.popleft()
+    if len(win) >= rpm:
+        return max(0.0, 60.0 - (now - win[0]))
+    win.append(now)
+    return 0.0
+
+
 @app.middleware("http")
 async def _bearer_auth(request: Request, call_next):
     cfg = get_gateway_config()
@@ -386,6 +412,21 @@ async def _bearer_auth(request: Request, call_next):
                     "message": "admin endpoints require a gateway admin key",
                     "type": "invalid_request_error", "param": None,
                     "code": "admin_key_required"}})
+        # Per-key RPM (sliding 60s window) on the serving surface
+        if key_id != "admin" and request.url.path.startswith("/v1/"):
+            entry = (cfg.api_keys or {}).get(key_id) or {}
+            rpm = int(entry.get("rate_limit_rpm") or 0)
+            if rpm > 0:
+                retry_after = _key_rate_limit(key_id, rpm)
+                if retry_after > 0:
+                    return JSONResponse(
+                        status_code=429,
+                        content={"error": {
+                            "message": (f"key {key_id!r}: rate limit "
+                                        f"({rpm} requests/minute)"),
+                            "type": "rate_limit_error", "param": None,
+                            "code": "rate_limited"}},
+                        headers={"Retry-After": str(int(retry_after) + 1)})
         _REQUEST_KEY_ID.set(key_id)
         return await call_next(request)
     _REQUEST_KEY_ID.set("")
@@ -674,6 +715,34 @@ async def _token_budget_gate(cfg, backend_name: str) -> None:
             f"wait for the month to roll over")
 
 
+def _key_model_allowed(entry: dict, requested: str,
+                       entries: list[tuple[str, str]]) -> bool:
+    """Allowlist matching: an allowlist entry matches when it equals the
+    requested name, a resolved 'backend:model' pair, the bare model, or
+    a whole backend name. Empty allowlist (or containing '*') = all."""
+    allowed = {str(a) for a in (entry.get("models") or [])}
+    if not allowed or "*" in allowed:
+        return True
+    names = {requested}
+    for b, m in entries:
+        names.update({f"{b}:{m}", m, b})
+    return bool(names & allowed)
+
+
+def _key_model_gate(cfg, requested: str,
+                    entries: list[tuple[str, str]]) -> Response | None:
+    """Per-key model allowlist: 403 model_not_allowed when the virtual
+    key may not use the requested model. Admin keys / open mode pass."""
+    kid = _REQUEST_KEY_ID.get()
+    if not kid or kid == "admin":
+        return None
+    entry = (cfg.api_keys or {}).get(kid)
+    if not entry or _key_model_allowed(entry, requested, entries):
+        return None
+    return _error(403, f"key {kid!r} is not allowed to use {requested!r}",
+                  param="model", code="model_not_allowed")
+
+
 def _key_budget_gate(cfg) -> Response | None:
     """Per-KEY monthly budgets (tokens + USD): returns a 429 response when
     the presented virtual key is over budget; None when OK. Admin keys
@@ -754,7 +823,7 @@ def _capture_prices(backend_name: str, models: list) -> None:
         prices.setdefault(backend_name, {}).update(updates)
 
     try:
-        _mutate_config(_mut)
+        _mutate_config(_mut, f"price-capture {backend_name}")
         logger.info("captured pricing for %d %s models",
                     len(updates), backend_name)
     except Exception:
@@ -1316,6 +1385,17 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
         kwargs["tools"] = body.tools
     try:
         resp = await client.chat.completions.create(**kwargs)
+    except cloud.APIConnectionError as e:
+        # Connect-class failure: the request never reached the provider —
+        # one immediate retry of the SAME model (policy: a retry is not
+        # engine switching). Timeouts are NOT retried (ambiguous + slow).
+        logger.info("gateway: connect failure on %s (%s) — one retry",
+                    backend_name, str(e)[:120])
+        try:
+            resp = await client.chat.completions.create(**kwargs)
+        except Exception as e2:
+            raise cloud.CloudBackendError(
+                f"cloud backend {backend_name!r} call failed: {e2}") from e2
     except Exception as e:
         raise cloud.CloudBackendError(
             f"cloud backend {backend_name!r} call failed: {e}") from e
@@ -1536,6 +1616,14 @@ async def chat_completions(body: ChatRequest) -> Response:
                          int((time.perf_counter() - t0) * 1000), {}, 400)
             return _error(400, str(e), param="model", code="model_not_found")
     entries = plan["entries"]
+
+    # Per-key model allowlist (before the cache — a cached disallowed
+    # model is still disallowed)
+    denied = _key_model_gate(cfg, requested, entries)
+    if denied is not None:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 403)
+        return denied
 
     # Response cache: simple repeated prompts answer from memory. Never
     # for local_only aliases (privacy guarantee) or when disabled in config.
@@ -1878,7 +1966,14 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         backend, body.max_tokens)
                 if body.tools:
                     kwargs["tools"] = body.tools
-                stream = await client.chat.completions.create(**kwargs)
+                try:
+                    stream = await client.chat.completions.create(**kwargs)
+                except cloud.APIConnectionError:
+                    # connect-class failure — one immediate retry (the
+                    # request never reached the provider)
+                    logger.info("gateway: stream connect failure on %s — "
+                                "one retry", backend_name)
+                    stream = await client.chat.completions.create(**kwargs)
                 async for chunk in stream:
                     data = (chunk.model_dump_json()
                             if hasattr(chunk, "model_dump_json")
@@ -2061,6 +2156,13 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     backend_name, model_key = plan["entries"][0]
     backend = cfg.backends[backend_name]
     btype = backend.get("type")
+
+    # Per-key model allowlist
+    denied = _key_model_gate(cfg, requested, plan["entries"])
+    if denied is not None:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 403)
+        return denied
 
     # Per-key monthly budgets (tokens + USD)
     over = _key_budget_gate(cfg)
@@ -2276,6 +2378,15 @@ async def legacy_completions(body: CompletionRequest) -> Response:
             kwargs["max_tokens"] = cloud.cap_max_tokens(backend, body.max_tokens)
         try:
             resp = await client.completions.create(**kwargs)
+        except cloud.APIConnectionError as e:
+            # connect-class failure — one immediate retry (same model)
+            logger.info("gateway: completion connect failure on %s (%s) — "
+                        "one retry", backend_name, str(e)[:120])
+            try:
+                resp = await client.completions.create(**kwargs)
+            except Exception as e2:
+                raise cloud.CloudBackendError(
+                    f"cloud backend {backend_name!r} completion failed: {e2}") from e2
         except Exception as e:
             raise cloud.CloudBackendError(
                 f"cloud backend {backend_name!r} completion failed: {e}") from e
@@ -2304,6 +2415,73 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         return _exec_error_response(e, requested, body.stream, t0)
     finally:
         _release_chat_slot(slot)
+
+
+# ── POST /v1/images/generations (openai-backend passthrough) ───────────────
+
+async def _passthrough_images(base_url: str, api_key: str,
+                              payload: dict) -> dict[str, Any]:
+    """POST {base_url}/images/generations, verbatim JSON (a separate
+    function so tests can monkeypatch it)."""
+    async with httpx.AsyncClient(timeout=120.0) as hc:
+        r = await hc.post(f"{base_url.rstrip('/')}/images/generations",
+                          headers={"Authorization": f"Bearer {api_key}"},
+                          json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+@app.post("/v1/images/generations")
+async def images_generations(request: Request) -> Response:
+    """OpenAI images passthrough for openai-type cloud backends (the wire
+    model id maps through backend models like chat). NOTE: the HF
+    router's OpenAI-compatible surface is chat-only — point image models
+    at a provider that serves /images/generations (OpenAI, Together,
+    fal, ...)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "invalid JSON body")
+    requested = str(body.get("model") or "").strip()
+    if not requested:
+        return _error(400, "model is required", param="model")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    try:
+        plan = cfg.resolve_chain(requested)
+    except GatewayConfigError as e:
+        _log_request(requested, "", False, 0, {}, 400)
+        return _error(400, str(e), param="model", code="model_not_found")
+    backend_name, model_key = plan["entries"][0]
+    backend = cfg.backends.get(backend_name) or {}
+    if backend.get("type") != "openai":
+        _log_request(requested, "", False, 0, {}, 400)
+        return _error(400, f"backend {backend_name!r} does not serve images "
+                           f"(openai-type cloud backends only)",
+                      param="model", code="images_unsupported")
+    denied = _key_model_gate(cfg, requested, plan["entries"])
+    if denied is not None:
+        return denied
+    key_env = str(backend.get("api_key_env") or "").strip()
+    api_key = cloud._env_or_keyring(key_env)
+    if key_env and not api_key:
+        return _error(502, f"api key env var {key_env!r} is not set and the "
+                           f"OS keyring has no '{key_env}' entry",
+                      code="auth")
+    wire = str((backend.get("models") or {}).get(model_key) or model_key)
+    payload = {k: v for k, v in body.items() if k != "model"}
+    payload["model"] = wire
+    t0 = time.perf_counter()
+    try:
+        data = await _passthrough_images(str(backend.get("base_url") or ""),
+                                         api_key, payload)
+    except httpx.HTTPStatusError as e:
+        return _exec_error_response(e, requested, False, t0)
+    except httpx.RequestError as e:
+        return _error(502, f"images request failed: {e}", code="network")
+    _log_request(requested, backend_name, False,
+                 int((time.perf_counter() - t0) * 1000), {}, 200)
+    return JSONResponse(data)
 
 
 # ── GET /healthz ───────────────────────────────────────────────────────────
@@ -2350,9 +2528,43 @@ async def healthz() -> dict[str, Any]:
 
 # ── Admin: alias CRUD + instance control (Stage 4) ─────────────────────────
 
-def _mutate_config(mutator) -> None:
+def _audit_config(action: str) -> None:
+    """Append-only audit of config mutations (who / when / what) —
+    config-audit.jsonl next to the request log."""
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "key": _REQUEST_KEY_ID.get() or "(open)",
+           "action": action[:200]}
+    try:
+        p = _LOG_PATH.parent / "config-audit.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with _log_lock:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+    except OSError:
+        logger.warning("config audit write failed", exc_info=True)
+
+
+@app.get("/admin/audit")
+async def admin_audit() -> Response:
+    """Last config mutations (newest first, max 200)."""
+    try:
+        lines = (_LOG_PATH.parent / "config-audit.jsonl").read_text(
+            encoding="utf-8").strip().splitlines()
+    except OSError:
+        lines = []
+    out = []
+    for ln in lines[-200:]:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return {"audit": out[::-1]}
+
+
+def _mutate_config(mutator, action: str = "config-mutation") -> None:
     """Read-modify-write data/gateway_config.json (created from the built-in
-    defaults when absent), then force the process config to reload."""
+    defaults when absent), then force the process config to reload.
+    Every mutation lands in the audit trail with the caller's action."""
     cfg = get_gateway_config()
     if cfg.path.is_file():
         try:
@@ -2367,6 +2579,7 @@ def _mutate_config(mutator) -> None:
     cfg.path.parent.mkdir(parents=True, exist_ok=True)
     cfg.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
     cfg.reload_now()
+    _audit_config(action)
 
 
 class AliasPayload(BaseModel):
@@ -2398,7 +2611,8 @@ async def admin_upsert_alias(payload: AliasPayload) -> Response:
         if name not in cfg.aliases:
             return _error(400, f"alias {name!r} not found", param="name",
                           code="alias_not_found")
-        _mutate_config(lambda raw: raw.setdefault("aliases", {}).pop(name, None))
+        _mutate_config(lambda raw: raw.setdefault("aliases", {}).pop(name, None),
+                       f"alias-delete {name}")
         return {"deleted": name,
                 "aliases": get_gateway_config().aliases}
 
@@ -2421,7 +2635,7 @@ async def admin_upsert_alias(payload: AliasPayload) -> Response:
     def _apply(raw: dict[str, Any]) -> None:
         raw.setdefault("aliases", {})[name] = alias
 
-    _mutate_config(_apply)
+    _mutate_config(_apply, f"alias-upsert {name}")
     return {"upserted": name, "alias": alias,
             "aliases": get_gateway_config().aliases}
 
@@ -2953,6 +3167,7 @@ async def admin_put_config(payload: ConfigPayload) -> Response:
     cfg.path.parent.mkdir(parents=True, exist_ok=True)
     cfg.path.write_text(payload.text, encoding="utf-8")
     cfg.reload_now()
+    _audit_config("raw-config-put")
     return {"ok": True,
             "backends": {n: len(b.get("models") or {})
                          for n, b in cfg.backends.items()},
@@ -3050,32 +3265,11 @@ async def admin_stats() -> Response:
             "budgets": budgets}
 
 
-@app.post("/admin/verify")
-async def admin_verify(request: Request) -> Response:
-    """Active round-trip self-test (ported from the assistant's verify
-    stack): a nonce prompt through every configured backend×model,
-    reporting latency/pass/detail per entry. POD models are skipped by
-    default (they deploy on demand — real money, minutes); pass
-    {"include_pods": true} to verify those too. Body:
-    {include_pods?, timeout_s? (default 30), backends?: [names]} — the
-    backends filter probes a subset (e.g. ["hf"] on a box whose local
-    models don't fit in free VRAM). Calls _exec_entry directly — the
-    response cache is untouched."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    include_pods = bool(body.get("include_pods"))
-    try:
-        timeout_s = max(5.0, float(body.get("timeout_s") or 30.0))
-    except (TypeError, ValueError):
-        timeout_s = 30.0
-    only = None
-    if isinstance(body.get("backends"), list) and body.get("backends"):
-        only = {str(b).strip() for b in body["backends"] if str(b).strip()}
-    cfg = get_gateway_config()
-    cfg.maybe_reload()
-    nonce = int(time.time() * 1000)
+async def _run_verify(cfg, only: set | None, include_pods: bool,
+                      timeout_s: float, nonce: int) -> list[dict[str, Any]]:
+    """The verify probe loop, shared by POST /admin/verify and the
+    scheduled synthetic verification. POD models are skipped unless
+    include_pods (they deploy on demand — real money, minutes)."""
     results: list[dict[str, Any]] = []
     for bname, backend in cfg.backends.items():
         if only is not None and bname not in only:
@@ -3121,10 +3315,151 @@ async def admin_verify(request: Request) -> Response:
                                 "latency_ms": int((time.perf_counter() - t0) * 1000),
                                 "pass": False,
                                 "detail": f"{cloud.classify_error(e)}: {str(e)[:120]}"})
+    return results
+
+
+@app.post("/admin/verify")
+async def admin_verify(request: Request) -> Response:
+    """Active round-trip self-test (ported from the assistant's verify
+    stack): a nonce prompt through every configured backend×model,
+    reporting latency/pass/detail per entry. POD models are skipped by
+    default; pass {"include_pods": true} to verify those too. Body:
+    {include_pods?, timeout_s? (default 30), backends?: [names]} — the
+    backends filter probes a subset (e.g. ["hf"] on a box whose local
+    models don't fit in free VRAM). Calls _exec_entry directly — the
+    response cache is untouched."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    include_pods = bool(body.get("include_pods"))
+    try:
+        timeout_s = max(5.0, float(body.get("timeout_s") or 30.0))
+    except (TypeError, ValueError):
+        timeout_s = 30.0
+    only = None
+    if isinstance(body.get("backends"), list) and body.get("backends"):
+        only = {str(b).strip() for b in body["backends"] if str(b).strip()}
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    results = await _run_verify(cfg, only, include_pods, timeout_s,
+                                int(time.time() * 1000))
     npass = sum(1 for r in results if r["pass"])
     return {"results": results,
             "summary": {"total": len(results), "pass": npass,
                         "fail": len(results) - npass}}
+
+
+# ── scheduled synthetic verification (tier 2) ──────────────────────────────
+# config verify_schedule {enabled, interval_min, backends, timeout_s,
+# failures_before_alert, webhook_url}: a background task re-runs the
+# verify probes on a timer, tracks consecutive failures per backend×model,
+# and alerts (event ring + optional webhook POST) on the OK→FAIL
+# transition once the threshold is crossed — plus a recovery notice.
+
+_VERIFY_STATE: dict[str, dict[str, Any]] = {}  # "backend:model" → {fails, alerting}
+_VERIFY_LAST_RUN: str = ""
+_VERIFY_SCHED_TASK: asyncio.Task | None = None
+
+
+def reset_verify_state() -> None:
+    """Drop scheduler state (tests)."""
+    _VERIFY_STATE.clear()
+    global _VERIFY_LAST_RUN
+    _VERIFY_LAST_RUN = ""
+
+
+async def _verify_webhook(url: str, payload: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            await hc.post(url, json=payload)
+    except Exception:  # noqa: BLE001 — alerting must never crash the loop
+        logger.warning("verify webhook failed", exc_info=True)
+
+
+async def _process_verify_results(cfg, results: list[dict[str, Any]]) -> None:
+    """Consecutive-failure tracking + transition alerts. 'skipped' rows
+    (pods) reset nothing — they are not failures."""
+    sched = cfg.verify_schedule or {}
+    threshold = max(1, int(sched.get("failures_before_alert") or 2))
+    webhook = str(sched.get("webhook_url") or "")
+
+    def _alert(msg: str, payload: dict) -> None:
+        logger.warning("gateway: %s", msg)
+        _event_ring().push({"ts": time.strftime("%H:%M:%S"),
+                            "level": "WARNING", "logger": "gateway.verify",
+                            "message": msg})
+        if webhook:
+            asyncio.create_task(_verify_webhook(webhook, payload))
+
+    for row in results:
+        key = f"{row.get('backend')}:{row.get('model')}"
+        detail = str(row.get("detail") or "")
+        if "skipped" in detail:
+            continue
+        if row.get("pass"):
+            st = _VERIFY_STATE.get(key)
+            if st and st.get("alerting"):
+                _alert(f"verify: {key} RECOVERED",
+                       {"type": "verify_recovered", "target": key})
+            _VERIFY_STATE[key] = {"fails": 0, "alerting": False}
+            continue
+        st = _VERIFY_STATE.setdefault(key, {"fails": 0, "alerting": False})
+        st["fails"] = int(st.get("fails") or 0) + 1
+        if st["fails"] >= threshold and not st.get("alerting"):
+            st["alerting"] = True
+            _alert(f"verify: {key} failing {st['fails']}x — {detail[:120]}",
+                   {"type": "verify_failing", "target": key,
+                    "consecutive_failures": st["fails"],
+                    "detail": detail[:200]})
+
+
+async def _verify_scheduler_loop() -> None:
+    logger.info("verify scheduler started")
+    while True:
+        try:
+            cfg = get_gateway_config()
+            cfg.maybe_reload()
+            sched = cfg.verify_schedule or {}
+            if sched.get("enabled"):
+                only = set(sched.get("backends") or []) or None
+                results = await _run_verify(
+                    cfg, only, False,
+                    float(sched.get("timeout_s") or 30.0),
+                    int(time.time() * 1000))
+                global _VERIFY_LAST_RUN
+                _VERIFY_LAST_RUN = time.strftime("%Y-%m-%dT%H:%M:%S")
+                await _process_verify_results(cfg, results)
+                npass = sum(1 for r in results if r.get("pass"))
+                logger.info("scheduled verify: %d/%d pass", npass, len(results))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the loop must survive anything
+            logger.warning("scheduled verify failed", exc_info=True)
+        try:
+            interval = max(1, int((get_gateway_config().verify_schedule
+                                   or {}).get("interval_min") or 30))
+        except Exception:
+            interval = 30
+        await asyncio.sleep(interval * 60)
+
+
+@app.on_event("startup")
+async def _start_verify_scheduler() -> None:
+    global _VERIFY_SCHED_TASK
+    if _VERIFY_SCHED_TASK is None or _VERIFY_SCHED_TASK.done():
+        _VERIFY_SCHED_TASK = asyncio.create_task(_verify_scheduler_loop())
+
+
+@app.get("/admin/verify")
+async def admin_verify_status() -> Response:
+    """Scheduler state: the configured schedule, per-target consecutive
+    failures, and the last run time."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    return {"schedule": cfg.verify_schedule,
+            "state": {k: dict(v) for k, v in _VERIFY_STATE.items()},
+            "last_run": _VERIFY_LAST_RUN}
 
 
 @app.get("/admin/events")
@@ -3219,7 +3554,8 @@ async def admin_upsert_model(payload: ModelConfigPayload) -> Response:
 
     if payload.delete:
         _mutate_config(lambda raw: _remove_model_from_config(
-            raw, payload.backend, name, payload.role))
+            raw, payload.backend, name, payload.role),
+            f"model-delete {payload.backend}:{name}")
         return {"deleted": name, "backend": payload.backend}
 
     # Validate backend exists
@@ -3265,7 +3601,8 @@ async def admin_upsert_model(payload: ModelConfigPayload) -> Response:
     target_key = "embedding_models" if payload.role == "embed" else "models"
 
     _mutate_config(lambda raw: _upsert_model_in_config(
-        raw, payload.backend, name, model_cfg, target_key))
+        raw, payload.backend, name, model_cfg, target_key),
+        f"model-upsert {payload.backend}:{name}")
     return {"saved": name, "backend": payload.backend, "role": payload.role}
 
 
@@ -3318,7 +3655,8 @@ async def admin_upsert_backend(payload: BackendConfigPayload) -> Response:
         return _error(400, "backend name must not be empty", param="name")
 
     if payload.delete:
-        _mutate_config(lambda raw: raw.get("backends", {}).pop(name, None))
+        _mutate_config(lambda raw: raw.get("backends", {}).pop(name, None),
+                       f"backend-delete {name}")
         return {"deleted": name}
 
     # Build backend config
@@ -3352,7 +3690,8 @@ async def admin_upsert_backend(payload: BackendConfigPayload) -> Response:
         if payload.api_key_env:
             bcfg["api_key_env"] = payload.api_key_env
 
-    _mutate_config(lambda raw: raw.setdefault("backends", {}).update({name: bcfg}))
+    _mutate_config(lambda raw: raw.setdefault("backends", {}).update({name: bcfg}),
+                   f"backend-upsert {name}")
     return {"saved": name, "type": payload.backend_type}
 
 
@@ -3418,6 +3757,8 @@ class ApiKeyPayload(BaseModel):
     note: str = ""
     monthly_token_budget: int | None = None
     monthly_usd_budget: float | None = None
+    models: list[str] | None = None  # allowlist (empty = all)
+    rate_limit_rpm: int | None = None
     delete: bool = False
 
 
@@ -3437,6 +3778,8 @@ async def admin_keys() -> Response:
             "key": e.get("key") or "",
             "monthly_token_budget": int(e.get("monthly_token_budget") or 0),
             "monthly_usd_budget": float(e.get("monthly_usd_budget") or 0),
+            "models": list(e.get("models") or []),
+            "rate_limit_rpm": int(e.get("rate_limit_rpm") or 0),
             "used_tokens": spend["tokens"],
             "used_usd": round(spend["usd"], 6),
             "month": month,
@@ -3460,7 +3803,7 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
         def _del(raw: dict) -> None:
             raw["api_keys"] = [k for k in (raw.get("api_keys") or [])
                                if str((k or {}).get("id")) != kid]
-        _mutate_config(_del)
+        _mutate_config(_del, f"api-key-revoke {kid}")
         return {"revoked": kid}
     if not cfg.gateway_keys:
         return _error(400, "configure a gateway ADMIN key first "
@@ -3474,6 +3817,9 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
         "note": payload.note.strip(),
         "monthly_token_budget": max(0, int(payload.monthly_token_budget or 0)),
         "monthly_usd_budget": max(0.0, float(payload.monthly_usd_budget or 0)),
+        "models": [str(m).strip() for m in (payload.models or [])
+                   if str(m).strip()],
+        "rate_limit_rpm": max(0, int(payload.rate_limit_rpm or 0)),
     }
 
     def _upsert(raw: dict) -> None:
@@ -3482,7 +3828,7 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
         lst.append(entry)
         raw["api_keys"] = lst
 
-    _mutate_config(_upsert)
+    _mutate_config(_upsert, f"api-key-create {kid}")
     # The full key returns ONCE here (it also lives in the config JSON —
     # the admin owns the machine and /admin/config exposes it anyway).
     return {"created": kid, "key": entry["key"],

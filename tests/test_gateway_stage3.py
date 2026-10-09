@@ -1538,3 +1538,225 @@ def test_rollup_and_stats_history(wired, gguf):
     # the rollup file now exists (closed month aggregated)
     assert (gw_app._LOG_PATH.parent
             / f"gateway-rollup-{closed}.json").is_file()
+
+
+# ── tier 2: governance, scheduled verify, images, audit, retry ─────────────
+
+def test_key_model_allowlist(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _secured_config(gguf, api_keys=[
+        {"id": "scoped", "key": "vk-scoped",
+         "models": ["groq:cloud-fast"]},      # one model only
+        {"id": "be", "key": "vk-be", "models": ["groq"]},  # whole backend
+        {"id": "openkey", "key": "vk-open"}])  # no allowlist = all
+    cfgd["backends"]["groq"]["models"]["cloud-slow"] = "llama-3.1-8b"
+    wired(cfgd)
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        def _chat(key, model, prompt):
+            return client.post("/v1/chat/completions", headers={
+                "Authorization": f"Bearer {key}"}, json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}]})
+        # scoped: allowed model OK, the other 403
+        assert _chat("vk-scoped", "groq:cloud-fast", "allowlist allowed").status_code == 200
+        r = _chat("vk-scoped", "groq:cloud-slow", "allowlist denied")
+        assert r.status_code == 403
+        assert r.json()["error"]["code"] == "model_not_allowed"
+        # whole-backend allowlist covers both models
+        assert _chat("vk-be", "groq:cloud-slow", "backend allowlist").status_code == 200
+        # no allowlist = everything; admin = everything
+        assert _chat("vk-open", "groq:cloud-slow", "no allowlist").status_code == 200
+        assert _chat("admin-secret", "groq:cloud-slow",
+                     "admin unrestricted").status_code == 200
+        # the DENIED request never reached the provider
+        assert len(fake.calls) == 4
+
+
+def test_key_rate_limit_rpm(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    wired(_secured_config(gguf, api_keys=[
+        {"id": "bursty", "key": "vk-burst", "rate_limit_rpm": 2}]))
+    _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        def _hit(i):
+            return client.post("/v1/chat/completions", headers={
+                "Authorization": "Bearer vk-burst"}, json={
+                "model": "groq:cloud-fast",
+                "messages": [{"role": "user", "content": f"rpm test {i}"}]})
+        assert _hit(1).status_code == 200
+        assert _hit(2).status_code == 200
+        r3 = _hit(3)
+        assert r3.status_code == 429
+        assert r3.json()["error"]["code"] == "rate_limited"
+        assert "retry-after" in {k.lower() for k in r3.headers}
+        # admin keys are not rate limited
+        r4 = client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer admin-secret"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "admin no limit"}]})
+        assert r4.status_code == 200
+        # window slides: expire the recorded timestamps → allowed again
+        win = gw_app._RATE_WINDOWS["bursty"]
+        for i in range(len(win)):
+            win[i] -= 61.0
+        assert _hit(4).status_code == 200
+
+
+def test_verify_scheduler_alerts_on_transitions(wired, gguf):
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(verify_schedule={
+        "failures_before_alert": 2, "webhook_url": ""})
+    ring = gw_app._event_ring()
+    ring.events.clear()
+    fail = [{"backend": "groq", "model": "cloud-fast", "pass": False,
+             "detail": "network: boom"}]
+    ok = [{"backend": "groq", "model": "cloud-fast", "pass": True,
+           "detail": "answered: 'x'"}]
+    skipped = [{"backend": "rp", "model": "pod", "pass": False,
+                "detail": "skipped (pod — deploy on demand)"}]
+    # first failure: below threshold, no alert
+    asyncio.run(gw_app._process_verify_results(cfg, fail))
+    assert gw_app._VERIFY_STATE["groq:cloud-fast"]["fails"] == 1
+    assert not any("failing" in str(e.get("message")) for e in ring.events)
+    # second failure: transition → alert
+    asyncio.run(gw_app._process_verify_results(cfg, fail))
+    assert gw_app._VERIFY_STATE["groq:cloud-fast"] == {
+        "fails": 2, "alerting": True}
+    assert any("failing 2x" in str(e.get("message")) for e in ring.events)
+    # third failure: no duplicate alert
+    ring.events.clear()
+    asyncio.run(gw_app._process_verify_results(cfg, fail))
+    assert not any("failing" in str(e.get("message")) for e in ring.events)
+    # recovery: transition back → recovered notice + reset
+    asyncio.run(gw_app._process_verify_results(cfg, ok))
+    assert gw_app._VERIFY_STATE["groq:cloud-fast"] == {
+        "fails": 0, "alerting": False}
+    assert any("RECOVERED" in str(e.get("message")) for e in ring.events)
+    # skipped rows are not failures
+    ring.events.clear()
+    asyncio.run(gw_app._process_verify_results(cfg, skipped))
+    assert "rp:pod" not in gw_app._VERIFY_STATE
+    assert not ring.events
+
+
+def test_verify_status_endpoint(wired, gguf):
+    wired(_secured_config(gguf))
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/verify", headers={
+            "Authorization": "Bearer admin-secret"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["schedule"]["enabled"] is False  # default off
+    assert "state" in d and "last_run" in d
+
+
+def test_images_passthrough(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _secured_config(gguf, api_keys=[
+        {"id": "img", "key": "vk-img", "models": ["groq:cloud-fast"]}])
+    cfgd["backends"]["groq"]["models"]["cloud-slow"] = "llama-3.1-8b"
+    wired(cfgd)
+    seen = {}
+
+    async def _fake_img(base_url, api_key, payload):
+        seen.update(payload)
+        return {"data": [{"url": "https://x/img.png"}]}
+
+    monkeypatch.setattr(gw_app, "_passthrough_images", _fake_img)
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/images/generations", headers={
+            "Authorization": "Bearer vk-img"}, json={
+            "model": "groq:cloud-fast", "prompt": "a cat", "n": 1})
+        assert r.status_code == 200, r.text
+        assert r.json()["data"][0]["url"].endswith("img.png")
+        assert seen["model"] == "llama-3.1-8b-instant"  # wire id mapping
+        assert seen["prompt"] == "a cat"
+        # non-openai backend → unsupported
+        r2 = client.post("/v1/images/generations", headers={
+            "Authorization": "Bearer vk-img"}, json={
+            "model": "fast", "prompt": "a cat"})
+        assert r2.status_code == 400
+        assert r2.json()["error"]["code"] == "images_unsupported"
+        # allowlist denies other models
+        r3 = client.post("/v1/images/generations", headers={
+            "Authorization": "Bearer vk-img"}, json={
+            "model": "groq:cloud-slow", "prompt": "a cat"})
+        assert r3.status_code == 403
+
+
+def test_config_audit_trail(wired, gguf):
+    wired(_secured_config(gguf))
+    with TestClient(gw_app.app) as client:
+        h = {"Authorization": "Bearer admin-secret"}
+        client.post("/admin/keys", headers=h, json={"id": "audited"})
+        client.post("/admin/models", headers=h, json={
+            "name": "m1", "backend": "groq", "remote_id": "org/m1"})
+        r = client.get("/admin/audit", headers=h)
+        assert r.status_code == 200
+        actions = [e["action"] for e in r.json()["audit"]]
+        assert actions[0] == "model-upsert groq:m1"  # newest first
+        assert actions[1] == "api-key-create audited"
+        # every entry records WHO (the admin key)
+        assert all(e["key"] == "admin" for e in r.json()["audit"])
+
+
+def test_network_retry_once(wired, gguf, monkeypatch):
+    from openai import APIConnectionError
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    wired(_secured_config(gguf))
+
+    calls: list[int] = []
+
+    async def _flaky(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise APIConnectionError(request=None)  # never reached provider
+        return _FakeResp(_cloud_nonstream("retried"))
+
+    fake = _FakeCloud()
+    fake.chat.completions.create = _flaky
+    _patch_cloud(monkeypatch, fake)
+    _h = {"Authorization": "Bearer admin-secret"}
+    with TestClient(gw_app.app) as client:
+        r = client.post("/v1/chat/completions", headers=_h, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "retry once test"}]})
+        assert r.status_code == 200, r.text
+        assert r.json()["choices"][0]["message"]["content"] == \
+            "cloud[retried] answer"
+        assert len(calls) == 2  # exactly one retry
+
+    # persistently dead: still exactly one retry, then a classified 502
+    calls2: list[int] = []
+
+    async def _dead(**kwargs):
+        calls2.append(1)
+        raise APIConnectionError(request=None)
+
+    fake2 = _FakeCloud()
+    fake2.chat.completions.create = _dead
+    _patch_cloud(monkeypatch, fake2)
+    with TestClient(gw_app.app) as client:
+        r2 = client.post("/v1/chat/completions", headers=_h, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "dead upstream"}]})
+        assert r2.status_code == 502
+        assert r2.json()["error"]["code"] == "network"
+        assert len(calls2) == 2  # one retry, never more
+
+
+def test_verify_schedule_config_parse():
+    raw = {"verify_schedule": {
+        "enabled": True, "interval_min": 15, "backends": ["hf"],
+        "timeout_s": 45, "failures_before_alert": 3,
+        "webhook_url": "https://hooks.example/gw"}}
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "gw.json"
+        p.write_text(json.dumps(raw), encoding="utf-8")
+        cfg = gw_config.GatewayConfig(p)
+    assert cfg.verify_schedule == {
+        "enabled": True, "interval_min": 15, "backends": ["hf"],
+        "timeout_s": 45.0, "failures_before_alert": 3,
+        "webhook_url": "https://hooks.example/gw"}

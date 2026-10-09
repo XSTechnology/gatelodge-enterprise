@@ -23,9 +23,13 @@ def _clean_gateway_request_state():
     gw_app.clear_response_cache()
     gw_app.reset_breakers()
     gw_app.reset_token_ledger()
+    gw_app.reset_rate_windows()
+    gw_app.reset_verify_state()
     gw_app._LOG_MIGRATED = False
     yield
     gw_app.clear_response_cache()
     gw_app.reset_breakers()
     gw_app.reset_token_ledger()
+    gw_app.reset_rate_windows()
+    gw_app.reset_verify_state()
     gw_app._LOG_MIGRATED = False

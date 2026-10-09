@@ -4079,15 +4079,18 @@ function renderApiKeys(rows) {
   var html = '<div class="widget"><h3>Consumer keys (virtual)</h3>';
   html += '<div class="muted" style="margin-bottom:8px">Give each program its own bearer key — usage is attributed per key in the log/stats, and monthly token / USD budgets cap spend. Requests with these keys are limited to /v1 endpoints (no admin surface).</div>';
   if (rows && rows.length) {
-    html += '<table><thead><tr><th>id</th><th>owner</th><th>key</th><th>budget (tok / $)</th><th>this month</th><th></th></tr></thead><tbody>';
+    html += '<table><thead><tr><th>id</th><th>owner</th><th>key</th><th>budget (tok / $)</th><th>limits</th><th>this month</th><th></th></tr></thead><tbody>';
     rows.forEach(function (k) {
       var bud = (k.monthly_token_budget ? k.monthly_token_budget + ' tok' : '—')
         + ' / ' + (k.monthly_usd_budget ? '$' + k.monthly_usd_budget : '—');
+      var limits = (k.models && k.models.length ? esc(k.models.join(', ')) : 'all models');
+      if (k.rate_limit_rpm) limits += '<br>' + k.rate_limit_rpm + ' rpm';
       var used = k.used_tokens + ' tok' + (k.used_usd ? ' · $' + Number(k.used_usd).toFixed(4) : '');
       html += '<tr><td><b>' + esc(k.id) + '</b>' + (k.note ? '<div class="muted" style="font-size:0.72rem">' + esc(k.note) + '</div>' : '') + '</td>' +
         '<td>' + esc(k.owner || '—') + '</td>' +
         '<td><code>' + esc(_maskKey(k.key)) + '</code></td>' +
         '<td class="muted">' + esc(bud) + '</td>' +
+        '<td class="muted" style="font-size:0.72rem;max-width:180px;">' + limits + '</td>' +
         '<td>' + esc(used) + '</td>' +
         '<td><button class="btn" style="color:var(--danger, #e5484d);padding:2px 8px;font-size:0.75rem;" onclick="revokeApiKey(\'' + esc(k.id) + '\')">Revoke</button></td></tr>';
     });
@@ -4096,11 +4099,12 @@ function renderApiKeys(rows) {
     html += '<div class="muted">No consumer keys. The gateway trusts localhost while nothing is configured.</div>';
   }
   html += '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">' +
-    '<div><div class="muted" style="font-size:0.72rem">id</div><input id="nk-id" placeholder="program-x" style="width:130px;padding:6px 10px;"></div>' +
-    '<div><div class="muted" style="font-size:0.72rem">owner</div><input id="nk-owner" placeholder="(optional)" style="width:130px;padding:6px 10px;"></div>' +
-    '<div><div class="muted" style="font-size:0.72rem">note</div><input id="nk-note" placeholder="(optional)" style="width:160px;padding:6px 10px;"></div>' +
-    '<div><div class="muted" style="font-size:0.72rem">token budget /mo</div><input id="nk-tok" type="number" min="0" placeholder="0 = off" style="width:110px;padding:6px 10px;"></div>' +
-    '<div><div class="muted" style="font-size:0.72rem">$ budget /mo</div><input id="nk-usd" type="number" min="0" step="0.01" placeholder="0 = off" style="width:100px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">id</div><input id="nk-id" placeholder="program-x" style="width:120px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">owner</div><input id="nk-owner" placeholder="(optional)" style="width:110px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">models (allowlist)</div><input id="nk-models" placeholder="hf, glm53, hf:glm53… (blank = all)" style="width:220px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">rate limit /min</div><input id="nk-rpm" type="number" min="0" placeholder="0 = off" style="width:90px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">token budget /mo</div><input id="nk-tok" type="number" min="0" placeholder="0 = off" style="width:100px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">$ budget /mo</div><input id="nk-usd" type="number" min="0" step="0.01" placeholder="0 = off" style="width:90px;padding:6px 10px;"></div>' +
     '<button class="btn btn-primary" onclick="createApiKey()">＋ Create key</button></div>';
   html += '<div id="nk-out" style="margin-top:8px;"></div>';
   html += '</div>';
@@ -4111,10 +4115,14 @@ function createApiKey() {
   var payload = {
     id: document.getElementById('nk-id').value.trim(),
     owner: document.getElementById('nk-owner').value.trim(),
-    note: document.getElementById('nk-note').value.trim()
+    note: ''
   };
+  var models = document.getElementById('nk-models').value.trim();
+  if (models) payload.models = models.split(',').map(function (m) { return m.trim(); }).filter(Boolean);
+  var rpm = document.getElementById('nk-rpm').value.trim();
   var tok = document.getElementById('nk-tok').value.trim();
   var usd = document.getElementById('nk-usd').value.trim();
+  if (rpm) payload.rate_limit_rpm = parseInt(rpm, 10) || 0;
   if (tok) payload.monthly_token_budget = parseInt(tok, 10) || 0;
   if (usd) payload.monthly_usd_budget = parseFloat(usd) || 0;
   api('/admin/keys', {method: 'POST', body: payload}).then(function (d) {
