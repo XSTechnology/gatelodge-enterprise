@@ -2543,9 +2543,11 @@ async def admin_verify(request: Request) -> Response:
     stack): a nonce prompt through every configured backend×model,
     reporting latency/pass/detail per entry. POD models are skipped by
     default (they deploy on demand — real money, minutes); pass
-    {"include_pods": true} to verify those too. Body: {include_pods?,
-    timeout_s? (default 30)}. Calls _exec_entry directly — the response
-    cache is untouched."""
+    {"include_pods": true} to verify those too. Body:
+    {include_pods?, timeout_s? (default 30), backends?: [names]} — the
+    backends filter probes a subset (e.g. ["hf"] on a box whose local
+    models don't fit in free VRAM). Calls _exec_entry directly — the
+    response cache is untouched."""
     try:
         body = await request.json()
     except Exception:
@@ -2555,11 +2557,16 @@ async def admin_verify(request: Request) -> Response:
         timeout_s = max(5.0, float(body.get("timeout_s") or 30.0))
     except (TypeError, ValueError):
         timeout_s = 30.0
+    only = None
+    if isinstance(body.get("backends"), list) and body.get("backends"):
+        only = {str(b).strip() for b in body["backends"] if str(b).strip()}
     cfg = get_gateway_config()
     cfg.maybe_reload()
     nonce = int(time.time() * 1000)
     results: list[dict[str, Any]] = []
     for bname, backend in cfg.backends.items():
+        if only is not None and bname not in only:
+            continue
         btype = backend.get("type")
         for mkey in (backend.get("models") or {}):
             label = f"{bname}:{mkey}"

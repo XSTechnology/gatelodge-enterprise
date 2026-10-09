@@ -950,6 +950,26 @@ def test_admin_verify_reports_failures(wired, gguf, monkeypatch):
     _with_fake_llama(fn)
 
 
+def test_admin_verify_backends_filter(wired, gguf, monkeypatch):
+    """{"backends": [...]} probes a subset — e.g. only the cloud backend
+    on a box whose local models don't fit in free VRAM."""
+    wired(_config(gguf))
+    fake = _patch_cloud(monkeypatch, _FakeCloud())
+
+    def fn(records):
+        with TestClient(gw_app.app) as client:
+            r = client.post("/admin/verify", json={"backends": ["groq"]})
+            assert r.status_code == 200, r.text
+            data = r.json()
+            rows = [f"{x['backend']}:{x['model']}" for x in data["results"]]
+            assert rows == ["groq:cloud-fast"]  # local backend untouched
+            assert data["summary"]["total"] == 1
+        assert len(fake.calls) == 1
+        assert len(records) == 0  # no embedded model was ever loaded
+
+    _with_fake_llama(fn)
+
+
 # ── classify-aware error propagation (NO engine switching) ─────────────────
 
 def _failing_cloud(monkeypatch, exc):
