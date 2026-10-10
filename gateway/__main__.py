@@ -58,11 +58,23 @@ def main() -> None:
     import uvicorn
     from .app import app
 
+    # TLS (tier A): https when enabled with certfile+keyfile. Binding
+    # beyond 127.0.0.1 without TLS is the operator's explicit choice —
+    # the config comment says what it means.
+    ssl_kwargs: dict = {}
+    scheme = "http"
+    if (cfg.tls.get("enabled") and cfg.tls.get("certfile")
+            and cfg.tls.get("keyfile")):
+        ssl_kwargs = {"ssl_certfile": cfg.tls["certfile"],
+                      "ssl_keyfile": cfg.tls["keyfile"]}
+        scheme = "https"
+
     logger = logging.getLogger("gateway")
-    logger.info("LLM gateway starting on http://%s:%d (models_dir: %s; models: %s)",
-                cfg.bind, cfg.port, cfg.models_dir,
+    logger.info("LLM gateway starting on %s://%s:%d (models_dir: %s; models: %s)",
+                scheme, cfg.bind, cfg.port, cfg.models_dir,
                 ", ".join(cfg.local_models()) or "none")
-    uvicorn.run(app, host=cfg.bind, port=cfg.port, log_level="info")
+    uvicorn.run(app, host=cfg.bind, port=cfg.port, log_level="info",
+                **ssl_kwargs)
 
 
 if __name__ == "__main__":

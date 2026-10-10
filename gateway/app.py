@@ -354,6 +354,99 @@ def _resolve_bearer(cfg, token: str) -> str:
     return ""
 
 
+# ── request IDs + Prometheus metrics (tier A) ──────────────────────────────
+# Every request gets an id (inbound x-request-id honored, else minted):
+# echoed on the response and stamped into every log line. Metrics are
+# in-memory counters incremented from _log_request (the single chokepoint
+# every request passes through, whatever its status) and rendered in
+# Prometheus text format at GET /metrics. Label cardinality is capped —
+# unknown model names from bad requests collapse into an "other" bucket.
+
+_REQUEST_ID = contextvars.ContextVar("gw_request_id", default="")
+_START_TIME = time.time()
+
+_METRIC_LABELS: dict[str, tuple[str, ...]] = {
+    "gateway_requests_total": ("backend", "model", "key", "status"),
+    "gateway_request_ms_sum": ("backend", "model"),
+    "gateway_request_ms_count": ("backend", "model"),
+    "gateway_tokens_total": ("backend", "model"),
+    "gateway_cost_usd_total": ("backend",),
+    "gateway_requests_by_key_total": ("key",),
+}
+_METRICS: dict[str, dict[tuple, float]] = {n: {} for n in _METRIC_LABELS}
+_METRIC_CARDINALITY_CAP = 1000
+
+
+def reset_metrics() -> None:
+    """Drop in-memory metric counters (tests)."""
+    for d in _METRICS.values():
+        d.clear()
+
+
+def _metric_inc(name: str, labels: tuple, value: float = 1.0) -> None:
+    try:
+        d = _METRICS[name]
+        if labels not in d and len(d) >= _METRIC_CARDINALITY_CAP:
+            labels = ("other",) * len(_METRIC_LABELS[name])
+        d[labels] = d.get(labels, 0.0) + float(value)
+    except Exception:  # noqa: BLE001 — metrics must never break a request
+        pass
+
+
+def _metrics_text() -> str:
+    """Prometheus text exposition (format version 0.0.4)."""
+    helps = {
+        "gateway_requests_total": "Requests processed, by backend/model/key/status.",
+        "gateway_request_ms_sum": "Cumulative latency (ms) by backend/model.",
+        "gateway_request_ms_count": "Latency observations by backend/model.",
+        "gateway_tokens_total": "Total tokens by backend/model.",
+        "gateway_cost_usd_total": "Estimated provider cost (USD) by backend.",
+        "gateway_requests_by_key_total": "Requests by consuming key.",
+    }
+    types = {"gateway_requests_total": "counter",
+             "gateway_request_ms_sum": "counter",
+             "gateway_request_ms_count": "counter",
+             "gateway_tokens_total": "counter",
+             "gateway_cost_usd_total": "counter",
+             "gateway_requests_by_key_total": "counter"}
+    out: list[str] = []
+    for name, label_names in _METRIC_LABELS.items():
+        out.append(f"# HELP {name} {helps[name]}")
+        out.append(f"# TYPE {name} {types[name]}")
+        for labels, value in sorted(_METRICS[name].items()):
+            tag = ",".join(f'{ln}="{lv}"'
+                           for ln, lv in zip(label_names, labels))
+            out.append(f"{name}{{{tag}}} {value:g}")
+    # gauges
+    cs = cache_stats()
+    out.append("# HELP gateway_cache_entries Cached responses.")
+    out.append("# TYPE gateway_cache_entries gauge")
+    out.append(f"gateway_cache_entries {cs['entries']}")
+    out.append("# HELP gateway_cache_hits_total Response-cache hits.")
+    out.append("# TYPE gateway_cache_hits_total counter")
+    out.append(f"gateway_cache_hits_total {cs['hits']}")
+    out.append("# HELP gateway_verify_failing Backends currently failing "
+               "scheduled verification.")
+    out.append("# TYPE gateway_verify_failing gauge")
+    out.append(f"gateway_verify_failing "
+               f"{sum(1 for s in _VERIFY_STATE.values() if s.get('alerting'))}")
+    out.append("# HELP gateway_uptime_seconds Process uptime.")
+    out.append("# TYPE gateway_uptime_seconds gauge")
+    out.append(f"gateway_uptime_seconds {time.time() - _START_TIME:g}")
+    out.append("# HELP gateway_build_info Build version.")
+    out.append("# TYPE gateway_build_info gauge")
+    out.append(f'gateway_build_info{{version="{app.version}"}} 1')
+    return "\n".join(out) + "\n"
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """Prometheus exposition. Reachable by ANY valid key when auth is on
+    (consumers included) — point your scraper at it with a bearer."""
+    return Response(_metrics_text(),
+                    media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
 # ── per-key rate limiting (requests/minute, sliding window) ────────────────
 # Admin keys and open mode are unlimited. In-memory only — a restart
 # clears the window (one minute of slack, acceptable for an RPM limiter).
@@ -380,38 +473,48 @@ def _key_rate_limit(key_id: str, rpm: int) -> float:
     return 0.0
 
 
+def _rid_response(resp: Response, rid: str) -> Response:
+    resp.headers["x-request-id"] = rid
+    return resp
+
+
 @app.middleware("http")
 async def _bearer_auth(request: Request, call_next):
     cfg = get_gateway_config()
     cfg.maybe_reload()
+    # Request id: honor inbound x-request-id (≤64 chars), else mint one.
+    # Echoed on EVERY response and stamped into every log line.
+    rid = ((request.headers.get("x-request-id") or "").strip())[:64] \
+        or uuid.uuid4().hex[:16]
+    _REQUEST_ID.set(rid)
     keys = cfg.gateway_keys
     vkeys = cfg.api_keys
     if keys or vkeys:
         if request.method == "GET" and request.url.path == "/":
             _REQUEST_KEY_ID.set("")  # static console shell — its API
             # calls still require the key (the page prompts for it)
-            return await call_next(request)
+            return _rid_response(await call_next(request), rid)
         auth = request.headers.get("authorization") or ""
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
         key_id = _resolve_bearer(cfg, token)
         if not key_id:
-            return JSONResponse(
+            return _rid_response(JSONResponse(
                 status_code=401,
                 content={"error": {
                     "message": "missing or invalid API key",
                     "type": "invalid_request_error", "param": None,
-                    "code": "invalid_api_key"}})
+                    "code": "invalid_api_key"}}), rid)
         if (key_id != "admin"
                 and request.url.path.startswith("/admin")):
             # Virtual keys are CONSUMER keys — admin surface needs an
             # admin key (gateway_keys). Prevents a program key from
             # reading config, stats, or minting keys.
-            return JSONResponse(
+            return _rid_response(JSONResponse(
                 status_code=403,
                 content={"error": {
                     "message": "admin endpoints require a gateway admin key",
                     "type": "invalid_request_error", "param": None,
-                    "code": "admin_key_required"}})
+                    "code": "admin_key_required"}}), rid)
         # Per-key RPM (sliding 60s window) on the serving surface
         if key_id != "admin" and request.url.path.startswith("/v1/"):
             entry = (cfg.api_keys or {}).get(key_id) or {}
@@ -419,18 +522,19 @@ async def _bearer_auth(request: Request, call_next):
             if rpm > 0:
                 retry_after = _key_rate_limit(key_id, rpm)
                 if retry_after > 0:
-                    return JSONResponse(
+                    return _rid_response(JSONResponse(
                         status_code=429,
                         content={"error": {
                             "message": (f"key {key_id!r}: rate limit "
                                         f"({rpm} requests/minute)"),
                             "type": "rate_limit_error", "param": None,
                             "code": "rate_limited"}},
-                        headers={"Retry-After": str(int(retry_after) + 1)})
+                        headers={"Retry-After": str(int(retry_after) + 1)}),
+                        rid)
         _REQUEST_KEY_ID.set(key_id)
-        return await call_next(request)
+        return _rid_response(await call_next(request), rid)
     _REQUEST_KEY_ID.set("")
-    return await call_next(request)
+    return _rid_response(await call_next(request), rid)
 
 
 @app.exception_handler(RequestValidationError)
@@ -461,7 +565,25 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
         rec["key"] = kid
     if cost_usd is not None:
         rec["cost_usd"] = round(cost_usd, 6)
+    rid = _REQUEST_ID.get()
+    if rid:
+        rec["req"] = rid
     line = json.dumps(rec)
+    # Prometheus counters (best-effort; single chokepoint for every
+    # request whatever its status — errors included)
+    _metric_inc("gateway_requests_total",
+                (backend or "none", model or "none",
+                 kid or "anonymous", str(status)))
+    if backend:
+        _metric_inc("gateway_request_ms_sum", (backend, model), ms)
+        _metric_inc("gateway_request_ms_count", (backend, model))
+        _metric_inc("gateway_tokens_total",
+                    (backend, model),
+                    int((usage or {}).get("total_tokens") or 0))
+        if cost_usd is not None:
+            _metric_inc("gateway_cost_usd_total", (backend,), cost_usd)
+        if kid:
+            _metric_inc("gateway_requests_by_key_total", (kid,))
     try:
         with _log_lock:
             global _LOG_MONTH_STATE

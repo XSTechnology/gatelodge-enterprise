@@ -1760,3 +1760,91 @@ def test_verify_schedule_config_parse():
         "enabled": True, "interval_min": 15, "backends": ["hf"],
         "timeout_s": 45.0, "failures_before_alert": 3,
         "webhook_url": "https://hooks.example/gw"}
+
+
+# ── tier A: request IDs, Prometheus metrics, TLS ───────────────────────────
+
+def test_request_id_echoed_and_logged(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    wired(_config(gguf))
+    _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        # inbound id is honored and echoed
+        r1 = client.post("/v1/chat/completions", headers={
+            "x-request-id": "my-trace-123"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "rid inbound"}]})
+        assert r1.headers["x-request-id"] == "my-trace-123"
+        # no inbound id → minted (16 hex chars) and echoed
+        r2 = client.post("/v1/chat/completions", json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "rid minted"}]})
+        rid2 = r2.headers["x-request-id"]
+        assert len(rid2) == 16 and int(rid2, 16) >= 0
+        # error responses carry it too
+        r3 = client.post("/v1/chat/completions", json={
+            "model": "nope",
+            "messages": [{"role": "user", "content": "rid on error"}]})
+        assert r3.headers["x-request-id"]
+    lines = [json.loads(ln) for ln in
+             (gw_app._month_log_path(gw_app._month_key())
+              .read_text(encoding="utf-8").strip().splitlines())]
+    by_rid = {e.get("req"): e for e in lines if e.get("req")}
+    assert by_rid["my-trace-123"]["model"] == "groq:cloud-fast"
+    assert by_rid[rid2]["model"] == "groq:cloud-fast"
+    # every logged line from this session carries a req id
+    assert all(e.get("req") for e in lines)
+
+
+def test_prometheus_metrics(wired, gguf, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _secured_config(gguf, api_keys=[
+        {"id": "metered", "key": "vk-metered"}])
+    cfgd["model_prices"] = {"groq": {
+        "llama-3.1-8b-instant": {"in": 0.5, "out": 2.0}}}
+    wired(cfgd)
+    _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        # a successful keyed request + a keyed 400 (bad model)
+        r1 = client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer vk-metered"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "metrics probe"}]})
+        assert r1.status_code == 200
+        client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer vk-metered"}, json={
+            "model": "nope",
+            "messages": [{"role": "user", "content": "bad model"}]})
+        # metrics need a valid key when auth is on (consumer keys OK)
+        assert client.get("/metrics").status_code == 401
+        m = client.get("/metrics", headers={
+            "Authorization": "Bearer vk-metered"})
+        assert m.status_code == 200
+        assert "version=0.0.4" in m.headers["content-type"]
+        text = m.text
+    assert 'gateway_requests_total{backend="groq",model="groq:cloud-fast",key="metered",status="200"}' in text
+    assert 'gateway_requests_total{backend="none",model="nope",key="metered",status="400"}' in text
+    assert 'gateway_tokens_total{backend="groq",model="groq:cloud-fast"} 8' in text
+    assert "gateway_cost_usd_total" in text
+    assert 'gateway_requests_by_key_total{key="metered"}' in text
+    assert "gateway_uptime_seconds" in text
+    assert "gateway_build_info" in text
+
+
+def test_tls_config_parse():
+    import tempfile
+    raw = {"tls": {"enabled": True, "certfile": "C:/certs/gw.pem",
+                   "keyfile": "C:/certs/gw.key"}}
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "gw.json"
+        p.write_text(json.dumps(raw), encoding="utf-8")
+        cfg = gw_config.GatewayConfig(p)
+    assert cfg.tls == {"enabled": True,
+                       "certfile": "C:/certs/gw.pem",
+                       "keyfile": "C:/certs/gw.key"}
+    # default: disabled
+    with tempfile.TemporaryDirectory() as td:
+        p2 = Path(td) / "gw2.json"
+        p2.write_text("{}", encoding="utf-8")
+        cfg2 = gw_config.GatewayConfig(p2)
+    assert cfg2.tls == {"enabled": False, "certfile": "", "keyfile": ""}

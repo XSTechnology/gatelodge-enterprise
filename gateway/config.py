@@ -146,6 +146,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # backend catalogs (the HF router returns per-provider rates) —
     # powers per-request cost estimation and per-key USD budgets.
     "model_prices": {},
+    # TLS (tier A): serve https instead of http. bind beyond 127.0.0.1
+    # only makes sense with TLS enabled (or with a reverse proxy that
+    # terminates TLS in front). certfile/keyfile are PEM paths.
+    "tls": {"enabled": False, "certfile": "", "keyfile": ""},
 }
 
 
@@ -664,6 +668,13 @@ class GatewayConfig:
         # Scheduled synthetic verification (tier 2)
         self.verify_schedule = _normalize_verify_schedule(
             raw.get("verify_schedule"))
+        # TLS: https when enabled with certfile+keyfile (tier A)
+        tls = raw.get("tls") if isinstance(raw.get("tls"), dict) else {}
+        self.tls = {
+            "enabled": bool(tls.get("enabled", False)),
+            "certfile": str(tls.get("certfile") or "").strip(),
+            "keyfile": str(tls.get("keyfile") or "").strip(),
+        }
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""
