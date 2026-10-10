@@ -710,8 +710,17 @@ class ConfigStore:
         """Read the raw config. None when unreadable (keep previous)."""
         raise NotImplementedError
 
-    def save(self, raw: dict[str, Any]) -> None:
-        """Persist the raw config."""
+    def save(self, raw: dict[str, Any],
+             *, expected_version: Any = None) -> bool:
+        """Persist the raw config.
+
+        Optimistic concurrency (tier D — multi-replica): when the caller
+        passes the store version it observed before its read-modify-write
+        (``expected_version``), a store that detects a newer committed
+        write in between returns False — the caller should re-load,
+        re-apply its mutation and retry. Stores that cannot detect races
+        (the single-process file store) accept the argument and return
+        True unconditionally."""
         raise NotImplementedError
 
     def version(self) -> Any:
@@ -735,10 +744,12 @@ class FileConfigStore(ConfigStore):
             logger.error("gateway config %s unreadable (%s)", self.path, e)
             return None
 
-    def save(self, raw: dict[str, Any]) -> None:
+    def save(self, raw: dict[str, Any],
+             *, expected_version: Any = None) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(raw, indent=2) + "\n",
                              encoding="utf-8")
+        return True  # single-process file store — no race detection
 
     def version(self) -> Any:
         try:
