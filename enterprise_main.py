@@ -1,4 +1,4 @@
-"""llm_router_enterprise entry point.
+"""Gatelodge Enterprise (gatelodge_enterprise) entry point.
 
 The core (the ``gateway`` package) is NEVER edited in this repo — all
 enterprise behavior is injected through the three seams at startup.
