@@ -4077,7 +4077,7 @@ function _maskKey(k) {
 }
 function renderApiKeys(rows) {
   var html = '<div class="widget"><h3>Consumer keys (virtual)</h3>';
-  html += '<div class="muted" style="margin-bottom:8px">Give each program its own bearer key — usage is attributed per key in the log/stats, and monthly token / USD budgets cap spend. Requests with these keys are limited to /v1 endpoints (no admin surface).</div>';
+  html += '<div class="muted" style="margin-bottom:8px">Give each program its own bearer key — usage is attributed per key in the log/stats, and monthly token / USD budgets cap spend. Keys are HASHED at rest: the full key is shown exactly once at creation. Requests with these keys are limited to /v1 endpoints (no admin surface).</div>';
   if (rows && rows.length) {
     html += '<table><thead><tr><th>id</th><th>owner</th><th>key</th><th>budget (tok / $)</th><th>limits</th><th>this month</th><th></th></tr></thead><tbody>';
     rows.forEach(function (k) {
@@ -4086,9 +4086,11 @@ function renderApiKeys(rows) {
       var limits = (k.models && k.models.length ? esc(k.models.join(', ')) : 'all models');
       if (k.rate_limit_rpm) limits += '<br>' + k.rate_limit_rpm + ' rpm';
       var used = k.used_tokens + ' tok' + (k.used_usd ? ' · $' + Number(k.used_usd).toFixed(4) : '');
+      var keydisp = k.key ? esc(_maskKey(k.key)) :
+        (k.key_hash ? '<span class="muted">' + esc(k.key_hash) + '…</span>' : '—');
       html += '<tr><td><b>' + esc(k.id) + '</b>' + (k.note ? '<div class="muted" style="font-size:0.72rem">' + esc(k.note) + '</div>' : '') + '</td>' +
         '<td>' + esc(k.owner || '—') + '</td>' +
-        '<td><code>' + esc(_maskKey(k.key)) + '</code></td>' +
+        '<td><code>' + keydisp + '</code></td>' +
         '<td class="muted">' + esc(bud) + '</td>' +
         '<td class="muted" style="font-size:0.72rem;max-width:180px;">' + limits + '</td>' +
         '<td>' + esc(used) + '</td>' +

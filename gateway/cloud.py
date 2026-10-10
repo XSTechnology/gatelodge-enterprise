@@ -61,6 +61,43 @@ def _env_or_keyring(key_env: str) -> str:
     return ""
 
 
+def resolve_backend_key(backend: dict[str, Any]) -> str:
+    """Full key-resolution chain for a backend (tier B), in order:
+    1. api_key_env environment variable (always wins)
+    2. api_key_file — first line of the file (Docker/K8s mounted
+       secrets, Vault Agent rendered files)
+    3. api_key_cmd — first line of the command's stdout (vault CLI,
+       aws secretsmanager get-secret-value, any fetcher; the config is
+       operator-trusted, same trust level as base_url)
+    4. OS keyring ('Workshop'/'workshop' casings)
+    Never logs values. Empty string when nothing resolves."""
+    key_env = str(backend.get("api_key_env") or "").strip()
+    key = os.environ.get(key_env) if key_env else ""
+    if key:
+        return key
+    path = str(backend.get("api_key_file") or "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                key = f.readline().strip()
+            if key:
+                return key
+        except OSError:
+            pass
+    cmd = str(backend.get("api_key_cmd") or "").strip()
+    if cmd:
+        try:
+            import subprocess
+            out = subprocess.run(  # noqa: S603 — operator-configured command
+                cmd, shell=True, capture_output=True, text=True, timeout=15)
+            stdout = (out.stdout or "").strip()
+            if stdout:
+                return stdout.splitlines()[0].strip()
+        except Exception:  # noqa: BLE001 — a failing fetcher = no key
+            pass
+    return _env_or_keyring(key_env) if key_env else ""
+
+
 def get_cloud_client(name: str, backend: dict[str, Any],
                      timeout: float = 120.0) -> AsyncOpenAI:
     """Cached AsyncOpenAI client for a configured openai-type backend."""
@@ -70,7 +107,7 @@ def get_cloud_client(name: str, backend: dict[str, Any],
     cached = _CLIENTS.get(name)
     if cached is not None and cached[0] == sig:
         return cached[1]
-    api_key = _env_or_keyring(key_env)
+    api_key = resolve_backend_key(backend)
     if key_env and not api_key:
         raise CloudBackendError(
             f"cloud backend {name!r}: api key env var {key_env!r} is not set "

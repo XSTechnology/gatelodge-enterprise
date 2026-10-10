@@ -341,15 +341,29 @@ def _exec_error_response(e: BaseException, requested: str,
 _REQUEST_KEY_ID = contextvars.ContextVar("gw_request_key", default="")
 
 
+def _sha256_hex(raw: str) -> str:
+    import hashlib
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _resolve_bearer(cfg, token: str) -> str:
-    """Bearer token → key_id: 'admin' for gateway_keys, the api_keys id
-    for a virtual key, '' when unknown."""
+    """Bearer token → key_id: 'admin' for gateway_keys (plaintext OR
+    sha256-hex form), the api_keys id for a virtual key (hash compared,
+    constant-time). '' when unknown. Keys are HASHED AT REST — the
+    presented token is hashed and compared, never stored."""
+    import hmac as _hmac
     if not token:
         return ""
-    if token in (cfg.gateway_keys or []):
-        return "admin"
+    token_hash = _sha256_hex(token)
+    for k in (cfg.gateway_keys or []):
+        k = str(k)
+        if k == token:
+            return "admin"
+        if len(k) == 64 and _hmac.compare_digest(k, token_hash):
+            return "admin"
     for entry in (cfg.api_keys or {}).values():
-        if entry.get("key") == token:
+        if _hmac.compare_digest(str(entry.get("key_hash") or ""),
+                                token_hash):
             return str(entry.get("id") or "")
     return ""
 
@@ -2585,7 +2599,7 @@ async def images_generations(request: Request) -> Response:
     if denied is not None:
         return denied
     key_env = str(backend.get("api_key_env") or "").strip()
-    api_key = cloud._env_or_keyring(key_env)
+    api_key = cloud.resolve_backend_key(backend)
     if key_env and not api_key:
         return _error(502, f"api key env var {key_env!r} is not set and the "
                            f"OS keyring has no '{key_env}' entry",
@@ -2652,7 +2666,8 @@ async def healthz() -> dict[str, Any]:
 
 def _audit_config(action: str) -> None:
     """Append-only audit of config mutations (who / when / what) —
-    config-audit.jsonl next to the request log."""
+    config-audit.jsonl next to the request log. Ships to the configured
+    audit webhook (SIEM) when set (tier B)."""
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "key": _REQUEST_KEY_ID.get() or "(open)",
            "action": action[:200]}
@@ -2664,6 +2679,20 @@ def _audit_config(action: str) -> None:
                 f.write(json.dumps(rec) + "\n")
     except OSError:
         logger.warning("config audit write failed", exc_info=True)
+    # remote sink (best-effort, fire-and-forget)
+    try:
+        cfg = get_gateway_config()
+        url = (cfg.audit or {}).get("webhook_url") if cfg.audit else ""
+        if url:
+            payload = dict(rec)
+            payload["type"] = "config_audit"
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_verify_webhook(url, payload))
+            except RuntimeError:
+                pass  # no loop (sync context) — local log only
+    except Exception:  # noqa: BLE001 — alerting must never break mutation
+        pass
 
 
 @app.get("/admin/audit")
@@ -3492,6 +3521,8 @@ def reset_verify_state() -> None:
 
 
 async def _verify_webhook(url: str, payload: dict) -> None:
+    """POST a JSON payload to a webhook — best-effort, never raises.
+    (Shared by the verify scheduler and the audit sink.)"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as hc:
             await hc.post(url, json=payload)
@@ -3569,8 +3600,76 @@ async def _verify_scheduler_loop() -> None:
 @app.on_event("startup")
 async def _start_verify_scheduler() -> None:
     global _VERIFY_SCHED_TASK
+    # tier B hardening at boot: hash-migrate any plaintext api_keys in
+    # the config FILE (the in-memory normalizer already hashes), then
+    # enforce log retention.
+    _migrate_plaintext_keys()
+    _enforce_log_retention()
     if _VERIFY_SCHED_TASK is None or _VERIFY_SCHED_TASK.done():
         _VERIFY_SCHED_TASK = asyncio.create_task(_verify_scheduler_loop())
+
+
+def _migrate_plaintext_keys() -> None:
+    """One-time rewrite: api_keys entries carrying a plaintext `key` in
+    the config FILE are replaced by their sha256 `key_hash` (the
+    plaintext is removed from disk). Idempotent — no entries with
+    plaintext → no write. Auth is unaffected: presented tokens are
+    hashed and compared either way."""
+    try:
+        cfg = get_gateway_config()
+        if not cfg.path.is_file():
+            return
+        raw = json.loads(cfg.path.read_text(encoding="utf-8"))
+        entries = raw.get("api_keys") if isinstance(raw, dict) else None
+        if not isinstance(entries, list):
+            return
+        changed = 0
+        for e in entries:
+            if isinstance(e, dict) and str(e.get("key") or "").strip():
+                e["key_hash"] = _sha256_hex(str(e["key"]).strip())
+                e.pop("key", None)
+                changed += 1
+        if not changed:
+            return
+
+        def _mut(r: dict) -> None:
+            r["api_keys"] = entries
+
+        _mutate_config(_mut, f"api-key-hash-migration ({changed} keys)")
+        logger.info("migrated %d api_keys to hashed-at-rest", changed)
+    except Exception:  # noqa: BLE001 — boot hardening must not block
+        logger.warning("api-key hash migration failed", exc_info=True)
+
+
+def _enforce_log_retention() -> None:
+    """Delete gateway-log-YYYY-MM.jsonl / gateway-rollup-YYYY-MM.json
+    older than log_retention_months (0 = keep forever). Runs at startup
+    and at month rollover."""
+    try:
+        cfg = get_gateway_config()
+        months = int(getattr(cfg, "log_retention_months", 0) or 0)
+        if months <= 0:
+            return
+        current = _month_key()
+        cutoff = (int(current[:4]) * 12 + int(current[5:7])) - months
+        import glob as _glob
+        for pattern in ("gateway-log-*.jsonl", "gateway-rollup-*.json",
+                        "gateway-log-*.jsonl.migrated"):
+            for p in _glob.glob(str(_LOG_PATH.parent / pattern)):
+                name = Path(p).name
+                # extract YYYY-MM
+                digits = "".join(ch for ch in name if ch.isdigit())
+                if len(digits) < 6:
+                    continue
+                try:
+                    y, m = int(digits[:4]), int(digits[4:6])
+                except ValueError:
+                    continue
+                if y * 12 + m < cutoff:
+                    Path(p).unlink(missing_ok=True)
+                    logger.info("log retention: removed %s", name)
+    except Exception:  # noqa: BLE001 — housekeeping must not block
+        logger.warning("log retention failed", exc_info=True)
 
 
 @app.get("/admin/verify")
@@ -3846,7 +3945,7 @@ async def admin_remote_models(name: str) -> Response:
         return _error(400, f"backend {name!r} is not an openai-type "
                            f"cloud backend", param="backend")
     key_env = str(backend.get("api_key_env") or "").strip()
-    api_key = cloud._env_or_keyring(key_env)
+    api_key = cloud.resolve_backend_key(backend)
     if key_env and not api_key:
         return _error(502, f"api key env var {key_env!r} is not set and the "
                            f"OS keyring has no '{key_env}' entry",
@@ -3887,7 +3986,9 @@ class ApiKeyPayload(BaseModel):
 @app.get("/admin/keys")
 async def admin_keys() -> Response:
     """Virtual key inventory + live usage (the consuming key's identity
-    rides in every request log line; usage sums the current month)."""
+    rides in every request log line; usage sums the current month).
+    Keys are hashed at rest — only a 16-char hash prefix shows here; the
+    full key is returned exactly once at creation."""
     cfg = get_gateway_config()
     cfg.maybe_reload()
     month = _month_key()
@@ -3897,7 +3998,7 @@ async def admin_keys() -> Response:
         rows.append({
             "id": kid, "owner": e.get("owner") or "",
             "note": e.get("note") or "",
-            "key": e.get("key") or "",
+            "key_hash": str(e.get("key_hash") or "")[:16],
             "monthly_token_budget": int(e.get("monthly_token_budget") or 0),
             "monthly_usd_budget": float(e.get("monthly_usd_budget") or 0),
             "models": list(e.get("models") or []),
@@ -3934,7 +4035,8 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
                            "surface", param="gateway_keys")
     entry: dict[str, Any] = {
         "id": kid,
-        "key": f"vk-{secrets.token_urlsafe(24)}",
+        # hashed at rest; the plaintext returns exactly ONCE below
+        "key_hash": _sha256_hex(f"vk-{secrets.token_urlsafe(24)}"),
         "owner": payload.owner.strip(),
         "note": payload.note.strip(),
         "monthly_token_budget": max(0, int(payload.monthly_token_budget or 0)),
@@ -3943,6 +4045,9 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
                    if str(m).strip()],
         "rate_limit_rpm": max(0, int(payload.rate_limit_rpm or 0)),
     }
+    # mint the plaintext key whose hash we stored
+    plaintext = f"vk-{secrets.token_urlsafe(24)}"
+    entry["key_hash"] = _sha256_hex(plaintext)
 
     def _upsert(raw: dict) -> None:
         lst = [k for k in (raw.get("api_keys") or [])
@@ -3951,9 +4056,8 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
         raw["api_keys"] = lst
 
     _mutate_config(_upsert, f"api-key-create {kid}")
-    # The full key returns ONCE here (it also lives in the config JSON —
-    # the admin owns the machine and /admin/config exposes it anyway).
-    return {"created": kid, "key": entry["key"],
+    # The full key returns ONCE here; only its hash is stored.
+    return {"created": kid, "key": plaintext,
             "monthly_token_budget": entry["monthly_token_budget"],
             "monthly_usd_budget": entry["monthly_usd_budget"]}
 

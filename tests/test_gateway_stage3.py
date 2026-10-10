@@ -1342,13 +1342,13 @@ def test_admin_keys_create_and_revoke(wired, gguf):
         assert r.status_code == 200, r.text
         key = r.json()["key"]
         assert key.startswith("vk-")
-        # listing shows it with budgets
+        # listing shows it with budgets — HASHED (no plaintext anywhere)
         r2 = client.get("/admin/keys", headers=h)
         assert r2.status_code == 200
         entries = r2.json()["api_keys"]
         assert [e["id"] for e in entries] == ["prog-a"]
         assert entries[0]["monthly_token_budget"] == 1000
-        assert entries[0]["key"] == key
+        assert entries[0]["key_hash"] and "key" not in entries[0]
         # the fresh key authenticates /v1 (healthz requires a key now)
         r3 = client.get("/healthz", headers={"Authorization": f"Bearer {key}"})
         assert r3.status_code == 200
@@ -1848,3 +1848,161 @@ def test_tls_config_parse():
         p2.write_text("{}", encoding="utf-8")
         cfg2 = gw_config.GatewayConfig(p2)
     assert cfg2.tls == {"enabled": False, "certfile": "", "keyfile": ""}
+
+
+# ── tier B: key hashing at rest, key sources, retention, audit sink ────────
+
+def test_keys_hashed_at_rest(wired, gguf, monkeypatch):
+    """Config-file plaintext normalizes to key_hash; created keys never
+    touch disk in plaintext; auth works via hash comparison."""
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _secured_config(gguf, api_keys=[
+        {"id": "legacy", "key": "vk-legacy-plain"}])  # plaintext in config
+    cfgfile, cfg, _ = wired(cfgd)
+    # normalized: no plaintext, hash present
+    assert "key" not in cfg.api_keys["legacy"]
+    assert len(cfg.api_keys["legacy"]["key_hash"]) == 64
+    _patch_cloud(monkeypatch, _FakeCloud())
+    with TestClient(gw_app.app) as client:
+        # the legacy plaintext STILL authenticates (hash of presentation
+        # matches the stored hash)
+        r = client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer vk-legacy-plain"}, json={
+            "model": "groq:cloud-fast",
+            "messages": [{"role": "user", "content": "legacy key works"}]})
+        assert r.status_code == 200, r.text
+        # created keys: plaintext NEVER lands in the config file
+        h = {"Authorization": "Bearer admin-secret"}
+        r2 = client.post("/admin/keys", headers=h, json={"id": "fresh"})
+        assert r2.status_code == 200
+        newkey = r2.json()["key"]
+        assert newkey.startswith("vk-")
+    on_disk = cfgfile.read_text(encoding="utf-8")
+    assert "vk-legacy-plain" not in on_disk  # normalizer never wrote it
+    assert newkey not in on_disk  # created key: hash only
+    assert "key_hash" in on_disk
+
+
+def test_startup_hash_migration(wired, gguf):
+    """Plaintext keys in the CONFIG FILE are rewritten to hashes at boot
+    (_migrate_plaintext_keys) — idempotent, auth unaffected."""
+    cfgd = _secured_config(gguf)
+    cfgfile, _, _ = wired(cfgd)
+    # inject a plaintext entry directly into the file (pre-tier-B state)
+    raw = json.loads(cfgfile.read_text(encoding="utf-8"))
+    raw["api_keys"] = [{"id": "old", "key": "vk-old-plain", "owner": "O"}]
+    cfgfile.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    gw_app._migrate_plaintext_keys()
+    migrated = json.loads(cfgfile.read_text(encoding="utf-8"))
+    assert "key" not in migrated["api_keys"][0]
+    assert len(migrated["api_keys"][0]["key_hash"]) == 64
+    # idempotent: second run is a no-op (no more plaintext)
+    gw_app._migrate_plaintext_keys()
+    migrated2 = json.loads(cfgfile.read_text(encoding="utf-8"))
+    assert migrated2 == migrated
+    # and the migrated key authenticates
+    cfg = gw_config.GatewayConfig(cfgfile)
+    assert "old" in cfg.api_keys
+    token_hash_ok = gw_app._resolve_bearer(
+        cfg, "vk-old-plain") == "old"
+    assert token_hash_ok
+
+
+def test_gateway_keys_hashed_form(wired, gguf):
+    """gateway_keys entries may be sha256 hex — admin auth via hash."""
+    cfgd = _secured_config(gguf)
+    cfgd["gateway_keys"] = [gw_app._sha256_hex("admin-hashed-secret")]
+    wired(cfgd)
+    with TestClient(gw_app.app) as client:
+        r = client.get("/admin/stats", headers={
+            "Authorization": "Bearer admin-hashed-secret"})
+        assert r.status_code == 200
+        r2 = client.get("/admin/stats", headers={
+            "Authorization": "Bearer wrong"})
+        assert r2.status_code == 401
+
+
+def test_api_key_file_and_cmd_sources(wired, gguf, monkeypatch, tmp_path):
+    """Key resolution chain: env → file → command → keyring (tier B)."""
+    import sys as _sys
+    monkeypatch.delenv("GATEWAY_TEST_KEY_UNSET", raising=False)
+    # file-based key (Docker/K8s secret / Vault Agent template)
+    keyfile = tmp_path / "hf_secret.txt"
+    keyfile.write_text("file-secret-key\n", encoding="utf-8")
+    # command-based key (vault CLI / aws secretsmanager pattern)
+    cmdfile = tmp_path / "fetch_key.py"
+    cmdfile.write_text("print('cmd-secret-key')\n", encoding="utf-8")
+    b_file = {"type": "openai", "base_url": "https://x.example/v1",
+              "api_key_env": "GATEWAY_TEST_KEY_UNSET",
+              "api_key_file": str(keyfile), "models": {"m": "x"}}
+    b_cmd = {"type": "openai", "base_url": "https://x.example/v1",
+             "api_key_env": "GATEWAY_TEST_KEY_UNSET",
+             "api_key_cmd": f'"{_sys.executable}" "{cmdfile}"',
+             "models": {"m": "x"}}
+    assert gw_cloud.resolve_backend_key(b_file) == "file-secret-key"
+    assert gw_cloud.resolve_backend_key(b_cmd) == "cmd-secret-key"
+    # env always wins over file/cmd
+    monkeypatch.setenv("GATEWAY_TEST_KEY_UNSET", "env-secret-key")
+    assert gw_cloud.resolve_backend_key(b_file) == "env-secret-key"
+    assert gw_cloud.resolve_backend_key(b_cmd) == "env-secret-key"
+
+
+def test_log_retention_months(wired, gguf):
+    wired(_config(gguf))
+    d = gw_app._LOG_PATH.parent
+    # old month files + rollup + current month file
+    (d / "gateway-log-2020-01.jsonl").write_text("{}\n", encoding="utf-8")
+    (d / "gateway-rollup-2020-01.json").write_text("{}", encoding="utf-8")
+    (d / "gateway-log-2020-06.jsonl").write_text("{}\n", encoding="utf-8")
+    cur = gw_app._month_log_path(gw_app._month_key())
+    cur.write_text("{}\n", encoding="utf-8")
+
+    from types import SimpleNamespace
+    # retention 12 months: everything 2020 is gone (it's 2026)
+    monkey_ns = SimpleNamespace(
+        log_retention_months=12, path=d / "gw.json")
+    gw_app.get_gateway_config = lambda: monkey_ns  # type: ignore
+    try:
+        gw_app._enforce_log_retention()
+    finally:
+        # restore the real config getter
+        import importlib
+        real = importlib.import_module("gateway.config").get_gateway_config
+        gw_app.get_gateway_config = real  # type: ignore
+    assert not (d / "gateway-log-2020-01.jsonl").exists()
+    assert not (d / "gateway-rollup-2020-01.json").exists()
+    assert not (d / "gateway-log-2020-06.jsonl").exists()
+    assert cur.exists()  # current month always kept
+    # retention 0 = keep forever (no-op)
+    (d / "gateway-log-2020-01.jsonl").write_text("{}\n", encoding="utf-8")
+    monkey_ns2 = SimpleNamespace(
+        log_retention_months=0, path=d / "gw.json")
+    gw_app.get_gateway_config = lambda: monkey_ns2  # type: ignore
+    try:
+        gw_app._enforce_log_retention()
+    finally:
+        real = importlib.import_module("gateway.config").get_gateway_config
+        gw_app.get_gateway_config = real  # type: ignore
+    assert (d / "gateway-log-2020-01.jsonl").exists()
+
+
+def test_audit_webhook_shipping(wired, gguf, monkeypatch):
+    """audit.webhook_url set → every config mutation ships to the sink."""
+    shipped: list[dict] = []
+
+    async def _capture(url, payload):
+        shipped.append({"url": url, "payload": payload})
+
+    monkeypatch.setattr(gw_app, "_verify_webhook", _capture)
+    cfgd = _secured_config(gguf)
+    cfgd["audit"] = {"webhook_url": "https://siem.example/collect"}
+    wired(cfgd)
+    with TestClient(gw_app.app) as client:
+        h = {"Authorization": "Bearer admin-secret"}
+        client.post("/admin/keys", headers=h, json={"id": "sink-test"})
+    assert shipped, "audit webhook never fired"
+    entry = shipped[-1]
+    assert entry["url"] == "https://siem.example/collect"
+    assert entry["payload"]["type"] == "config_audit"
+    assert entry["payload"]["action"].startswith("api-key-create")
+    assert entry["payload"]["key"] == "admin"

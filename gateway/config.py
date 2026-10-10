@@ -150,6 +150,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # only makes sense with TLS enabled (or with a reverse proxy that
     # terminates TLS in front). certfile/keyfile are PEM paths.
     "tls": {"enabled": False, "certfile": "", "keyfile": ""},
+    # Log retention (tier B): delete gateway-log-YYYY-MM.jsonl and
+    # gateway-rollup-YYYY-MM.json files older than N months at startup
+    # and at month rollover. 0 = keep forever. NOTE: the gateway never
+    # logs prompt/response CONTENT — only metadata (model, backend, ms,
+    # tokens, cost, status, key, request id) — by design.
+    "log_retention_months": 0,
+    # Audit shipping (tier B): POST every config-audit entry to this
+    # webhook (SIEM/collector) in addition to config-audit.jsonl.
+    "audit": {"webhook_url": ""},
 }
 
 
@@ -413,6 +422,13 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
         else:  # openai-type cloud backend (executed in Stage 3)
             entry["base_url"] = str(b.get("base_url") or "").strip()
             entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
+            # Alternative key sources (tier B): read the key from a FILE
+            # (Docker/K8s secrets, Vault Agent rendered files) or from a
+            # COMMAND's stdout (vault CLI, aws secretsmanager, anything).
+            # Resolution order in cloud.resolve_backend_key:
+            # env var → api_key_file → api_key_cmd → OS keyring.
+            entry["api_key_file"] = str(b.get("api_key_file") or "").strip()
+            entry["api_key_cmd"] = str(b.get("api_key_cmd") or "").strip()
             # Monthly token budget (0 = off): the gateway counts usage from
             # its own request log (cache hits never bill — they log as
             # backend "cache") and refuses with 503 budget_exceeded once
@@ -452,13 +468,28 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _hash_key(raw: str) -> str:
+    """sha256 hex of a bearer key (for storage at rest)."""
+    import hashlib
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _looks_hashed(raw: str) -> bool:
+    """True when a stored key is already a sha256 hex digest (64 hex)."""
+    return bool(raw) and len(raw) == 64 and all(
+        c in "0123456789abcdef" for c in raw)
+
+
 def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
-    """api_keys: list of {id, key, owner?, note?, monthly_token_budget?,
-    monthly_usd_budget?, models?, rate_limit_rpm?} → {id: entry}.
-    models = allowlist (empty or ["*"] = everything; entries match the
-    requested name, a bare model, a "backend:model" pair, or a whole
-    backend name). rate_limit_rpm = requests/minute (0 = unlimited).
-    Invalid entries dropped."""
+    """api_keys: list of {id, key | key_hash, owner?, note?,
+    monthly_token_budget?, monthly_usd_budget?, models?, rate_limit_rpm?}
+    → {id: entry}.
+
+    KEYS ARE HASHED AT REST: a plaintext `key` is converted to
+    `key_hash` (sha256) at load time and the plaintext is dropped from
+    the normalized entry — auth compares hash(presented token). Existing
+    plaintext in the CONFIG FILE is migrated once at startup
+    (_migrate_plaintext_keys in app.py). Invalid entries dropped."""
     out: dict[str, dict[str, Any]] = {}
     if not isinstance(raw, list):
         return out
@@ -466,10 +497,14 @@ def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(k, dict):
             continue
         kid = str(k.get("id") or "").strip()
-        key = str(k.get("key") or "").strip()
-        if not kid or not key:
-            logger.warning("gateway config: api_keys entry needs id + key — dropped")
+        key_hash = str(k.get("key_hash") or "").strip()
+        plaintext = str(k.get("key") or "").strip()
+        if not kid or not (key_hash or plaintext):
+            logger.warning("gateway config: api_keys entry needs id + "
+                           "key/key_hash — dropped")
             continue
+        if not key_hash:
+            key_hash = _hash_key(plaintext)
         try:
             tok_b = max(0, int(k.get("monthly_token_budget") or 0))
         except (TypeError, ValueError):
@@ -485,7 +520,7 @@ def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
         models = [str(m).strip() for m in (k.get("models") or [])
                   if str(m).strip()]
         out[kid] = {
-            "id": kid, "key": key,
+            "id": kid, "key_hash": key_hash,
             "owner": str(k.get("owner") or "").strip(),
             "note": str(k.get("note") or "").strip(),
             "monthly_token_budget": tok_b,
@@ -675,6 +710,15 @@ class GatewayConfig:
             "certfile": str(tls.get("certfile") or "").strip(),
             "keyfile": str(tls.get("keyfile") or "").strip(),
         }
+        # Log retention (tier B): months to keep month files/rollups
+        try:
+            self.log_retention_months = max(0, int(
+                raw.get("log_retention_months") or 0))
+        except (TypeError, ValueError):
+            self.log_retention_months = 0
+        # Audit shipping (tier B)
+        audit = raw.get("audit") if isinstance(raw.get("audit"), dict) else {}
+        self.audit = {"webhook_url": str(audit.get("webhook_url") or "").strip()}
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""
