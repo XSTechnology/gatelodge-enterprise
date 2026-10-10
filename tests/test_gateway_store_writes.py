@@ -15,7 +15,9 @@ import gateway.models as gw_models
 from gateway.config import ConfigStore, FileConfigStore
 
 # shared fixtures/helpers (same directory; pytest inserts it in sys.path)
-from test_gateway_stage3 import gguf, _config  # noqa: F401
+from test_gateway_stage3 import gguf, _config, _seed_key_log  # noqa: F401
+
+from gateway.storage import InMemoryStorage, reset_storage, set_storage
 
 
 class RecordingConfigStore(ConfigStore):
@@ -180,3 +182,43 @@ def test_admin_config_put_writes_store(gguf, tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
     assert store.saves == 1
     assert store.raw["default_alias"] == "put-via-store"
+
+
+# ── D-1: shared backends never seed spend from the local log ───────────────
+
+class SharedInMemory(InMemoryStorage):
+    """A multi-replica stand-in: same mechanics, shared flag set."""
+
+    shared = True
+
+
+def test_scope_spend_shared_backend_skips_local_log(gguf, tmp_path,
+                                                    monkeypatch):
+    """A SHARED backend must not seed a spend scope from THIS process's
+    local log (it holds only this replica's requests — tier D would
+    undercount every other replica). The default backend still seeds
+    (regression)."""
+    cfgfile = tmp_path / "gateway_config.json"
+    cfgfile.write_text(json.dumps(_config(gguf)), encoding="utf-8")
+    cfg = gw_config.GatewayConfig(cfgfile)
+    monkeypatch.setattr(gw_config, "_CONFIG", cfg)
+    engine = gw_models.EmbeddedEngine(cfg)
+    monkeypatch.setattr(gw_models, "_ENGINE", engine)
+    monkeypatch.setattr(gw_app, "_LOG_PATH", tmp_path / "gateway_log.jsonl")
+    _seed_key_log("program-x", 1234)   # local log says 1234 tokens
+    try:
+        # default (single-process) backend: seeds from the local log
+        gw_app.reset_token_ledger()
+        seeded = gw_app._scope_spend("key:program-x")
+        assert seeded["tokens"] == 1234
+        # shared backend: starts at 0 — the local log is not truth
+        set_storage(SharedInMemory())
+        gw_app.reset_token_ledger()
+        fresh = gw_app._scope_spend("key:program-x")
+        assert fresh["tokens"] == 0
+        # and charges on the shared ledger accumulate from there
+        gw_app._charge_scope("key:program-x", 100, None)
+        charged = gw_app._scope_spend("key:program-x")
+        assert charged["tokens"] == 100
+    finally:
+        reset_storage()

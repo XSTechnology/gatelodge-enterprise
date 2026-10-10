@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 class StorageBackend(Protocol):
     """Namespace-keyed mutable state. Implementations MUST be safe for
     concurrent access from async code (single event loop in the core;
-    multi-replica backends handle their own locking)."""
+    multi-replica backends handle their own locking).
+
+    Implementations that share state across PROCESSES (Redis/DB —
+    tier D) set the class attribute ``shared = True``: the core uses it
+    to drop single-process assumptions (e.g. re-deriving per-key spend
+    from THIS process's local request log, which would undercount
+    every other replica). Defaults to False (absent = single-process)."""
 
     def get(self, ns: str, key: str) -> Any | None:
         """Get a value by namespace+key. None when absent."""
@@ -85,6 +91,8 @@ class StorageBackend(Protocol):
 class InMemoryStorage:
     """Dict-backed storage — the core default. Each namespace is a dict.
     NOT multi-process safe; single-process only (the core gateway)."""
+
+    shared = False  # single-process: local-log assumptions are safe
 
     def __init__(self) -> None:
         self._data: dict[str, dict[str, Any]] = {}

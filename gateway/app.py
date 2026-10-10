@@ -707,24 +707,30 @@ def _aggregate_lines(lines: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _scope_spend(scope: str) -> dict[str, float]:
     """{tokens, usd} this month for a spend scope — derived from the
-    current month's log, cached in memory; month rollover re-derives."""
+    current month's log, cached in memory; month rollover re-derives.
+
+    SHARED backends (multi-replica, tier D) never seed from the local
+    log: it holds only THIS replica's requests, so seeding would
+    undercount every other replica — the scope starts at 0 (accepted
+    cold-start drift; charges accumulate on the shared ledger)."""
     month = _month_key()
     led = _SPEND_LEDGER.get(scope)
     if led is not None and led.get("month") == month:
         return {"tokens": int(led.get("tokens") or 0),
                 "usd": float(led.get("usd") or 0.0)}
     _ensure_month_log()
-    kind, _, marker = scope.partition(":")
     tokens = 0
     usd = 0.0
-    for e in _iter_month_lines(month):
-        if kind == "backend":
-            if e.get("backend") != marker:
+    if not getattr(get_storage(), "shared", False):
+        kind, _, marker = scope.partition(":")
+        for e in _iter_month_lines(month):
+            if kind == "backend":
+                if e.get("backend") != marker:
+                    continue
+            elif e.get("key") != marker:
                 continue
-        elif e.get("key") != marker:
-            continue
-        tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
-        usd += float(e.get("cost_usd") or 0.0)
+            tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
+            usd += float(e.get("cost_usd") or 0.0)
     _SPEND_LEDGER[scope] = {"month": month, "tokens": tokens, "usd": usd}
     return {"tokens": tokens, "usd": usd}
 
