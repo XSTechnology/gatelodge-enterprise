@@ -1,72 +1,84 @@
-"""OpenAI-compatible HTTP surface — Stages 1-5 + streaming tool deltas: full gateway + console.
+"""LLM Gateway v1.0.0 — OpenAI-compatible multi-backend LLM front door.
 
-Implemented:
-  GET  /                     — single-page console (config / models /
-                              performance / logs panes); the static shell
-                              loads without a key, its API calls need one
-  GET  /v1/models            — aliases + backend models + auto-discovered
-                              GGUF stems from models_dir
-  POST /v1/chat/completions  — non-streaming AND streaming (SSE). Embedded
-                              engine (any GGUF stem in models_dir, multiple
-                              models concurrently) AND openai-type cloud
-                              backends. Alias chains execute with a hedge
-                              race; local_only aliases never construct a
-                              cloud client. Cloud max_tokens capped at 800.
-                              Over-capacity concurrent requests get 429 +
-                              Retry-After (queue.max_waiting).
-                              Streaming with tools: cloud forwarded as-is
-                              (native tool-call deltas); embedded buffers
-                              content deltas then emits a delta.tool_calls
-                              chunk at stream end (JSON-convention shim).
-  POST /v1/embeddings        — OpenAI embeddings. Embedded GGUFs configured
-                              under backends.<local>.embedding_models load
-                              as separate pooling instances (never
-                              auto-discovered); cloud backends pass through
-                              (dimensions forwarded, ignored for embedded).
-                              encoding_format float|base64 supported.
+A single-process gateway that routes LLM requests across local GGUFs,
+llama-server children, RunPod pods/serverless, and OpenAI-compatible
+cloud providers (including the HF Inference Providers router), with
+virtual keys, per-key governance, dollar cost tracking, guardrails,
+smart routing, batch processing, and an eval harness.
+
+Implemented API surface:
+  GET  /                     — single-page console (Models / Services /
+                              Cloud / Performance / Syslog / Parameters /
+                              API Keys / Health / Aliases / Governance)
+  GET  /v1/models            — aliases + smart routes + backend models +
+                              auto-discovered GGUF stems from models_dir
+  POST /v1/chat/completions  — non-streaming AND streaming (SSE). All
+                              backend types. Alias chains with hedge
+                              racing; smart routes (cheapest/fastest/
+                              round_robin/weighted); guardrails (request
+                              rules before the response cache, response
+                              rules on non-stream); per-key model
+                              allowlists + RPM rate limits + monthly
+                              token/USD budgets; response cache for
+                              simple repeated prompts; cost_usd in the
+                              response when the model is priced.
   POST /v1/completions       — legacy text completions: raw prompt in,
-                              text out (no chat template/tools/think-strip).
-                              All backend types serve it (embedded pools,
-                              llama-server children + pods natively, runpod
-                              runsync generate mode, cloud passthrough);
-                              executes the primary chain entry only.
-  llama-server backends      — type "llama-server". SUBPROCESS mode (no
-                              base_url): one managed child per model,
-                              spawned lazily, continuous batching across
-                              --parallel slots, native tools + streaming,
-                              idle_timeout_s reaper, killed on shutdown.
-                              REMOTE mode (base_url — RunPod or any
-                              llama-server over HTTP): OpenAI passthrough
-                              via the cloud client path (api_key_env).
-  runpod backends            — type "runpod" (api_key_env). SERVERLESS
-                              models ({endpoint_id, remote_id, transport}):
-                              "openai" (default) passes through the
-                              endpoint's /openai/v1 shim; "runsync" speaks
-                              the raw job protocol (Ollama-style workers —
-                              runsync + status polling, Ollama→OpenAI
-                              output mapping; streaming collects then
-                              emits). POD models ({gpu_type_ids, image,
-                              docker_args, ...} or pod_id pin):
-                              lifecycle-managed GPU pods — find-or-deploy
-                              on first request, health-polled via the
-                              pod's proxy.runpod.net URL, idle-stop then
-                              idle-terminate.
-  GET  /healthz              — backends, loaded instances (VRAM/ctx),
-                              GPUs with free VRAM, discovered model count
-  GET/POST /admin/aliases    — list / upsert / delete aliases (persisted to
-                              data/gateway_config.json, applied immediately)
-  GET/PUT /admin/config      — raw config editor (validated JSON object,
-                              written + hot-reloaded)
-  POST /admin/load           — preload an embedded instance (config model
-                              or discovered stem)
-  POST /admin/unload         — drop instances ({model} or {all: true})
-  GET  /admin/stats          — per-model latency/token/error aggregates +
-                              recent requests from gateway_log.jsonl
-  GET  /admin/events         — recent gateway log events (in-memory ring)
+                              text out. All backend types; primary chain
+                              entry only.
+  POST /v1/embeddings        — OpenAI embeddings. Embedded GGUFs under
+                              backends.<local>.embedding_models; cloud
+                              passthrough.
+  POST /v1/images/generations — OpenAI images passthrough for openai-type
+                              cloud backends (HF router is chat-only).
+  POST /v1/batches           — async batch: {model, requests:[{custom_id,
+                              messages}]} executes at concurrency 4
+                              through the full pipeline. GET /v1/batches
+                              (list), GET /v1/batches/{id} (status),
+                              GET /v1/batches/{id}/results (JSONL).
+  GET  /metrics              — Prometheus exposition: request counters
+                              by backend/model/key/status, latency, tokens,
+                              cost, guardrail blocks, cache gauges, uptime.
+  GET  /healthz              — backends, loaded instances, GPUs.
 
-Auth: bearer tokens from gateway_keys in the config (hot-reload). Empty
-list = open (localhost trust). Clients pass the key as the OpenAI api_key.
-All data endpoints (including /healthz) require it when configured.
+Admin surface (requires a gateway admin key when any keys are configured):
+  GET/POST /admin/aliases    — alias chains with hedge racing
+  GET/PUT /admin/config      — raw config editor (validated JSON, hot-reload)
+  GET/POST /admin/backends   — service definitions / backend CRUD
+  GET/POST /admin/models     — model inventory / model CRUD
+  GET/POST /admin/keys       — virtual key inventory + usage / create /
+                              revoke (keys hashed at rest, shown once)
+  GET  /admin/secrets        — API key status per backend (env/keyring)
+  GET  /admin/stats          — per-model + per-key aggregates (rollups +
+                              live month); budgets
+  GET  /admin/events         — recent gateway log events (in-memory ring)
+  GET  /admin/verify (GET)   — scheduled-verification state
+  POST /admin/verify         — active round-trip self-test per backend
+  GET  /admin/guardrails     — guardrail config + live violation counts
+  GET  /admin/routes         — smart-route config + live latency stats
+  GET  /admin/audit          — config mutation audit trail (newest first)
+  GET  /admin/evals          — saved eval runs
+  GET  /admin/evals/{name}   — latest eval report
+  POST /admin/evals/run      — golden-prompt eval across models (drift
+                              detection on re-run)
+  POST /admin/load           — preload an embedded instance
+  POST /admin/unload         — drop instances
+
+Auth: gateway_keys = ADMIN keys; api_keys = per-consumer virtual keys
+(hashed at rest). Any configured key enables bearer auth; virtual keys
+are limited to /v1/* + /metrics. Empty both = open (localhost trust).
+Every request is attributed to its key in the log, metrics, and budgets.
+Request IDs: inbound x-request-id honored, echoed on every response.
+
+Logging: month-scoped gateway-log-YYYY-MM.jsonl (legacy migrates once);
+closed months roll up to gateway-rollup-*.json. The gateway NEVER logs
+prompt/response content — metadata only. log_retention_months deletes
+old files. Config mutations land in config-audit.jsonl + optional
+webhook sink.
+
+Error policy: the gateway NEVER substitutes a local model when an
+external provider fails. Upstream 429 → our 429 + Retry-After; timeout
+→ 504; others → 502 with code=<class>. Network-class failures (connect)
+retry once on the same model. Streams carry error events with the class.
 
 Every request appends one JSONL line to data/gateway_log.jsonl:
 {ts, model, backend, stream, ms, usage, status}.
@@ -129,7 +141,7 @@ from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="0.6.1")
+app = FastAPI(title="LLM Gateway", version="1.0.0")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()

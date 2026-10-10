@@ -227,6 +227,8 @@ select.lc-in { width:auto; padding-right:4px; }
     <span class="cat-icon">🩺</span><span>Health &amp; Recovery</span></button>
   <button class="cat-btn" onclick="showPanel('aliases')" title="Alias chains with hedge racing">
     <span class="cat-icon">🧭</span><span>Aliases</span></button>
+  <button class="cat-btn" onclick="showPanel('governance')" title="Guardrails, smart routes, batch jobs, eval reports">
+    <span class="cat-icon">🛡️</span><span>Governance</span></button>
 </div>
 
 <div class="modal-overlay" id="modal">
@@ -324,7 +326,8 @@ function showPanel(name) {
   b.innerHTML = '<div class="loading">Loading…</div>';
   ({models: showModels, services: showServices, cloud: showCloud, perf: showPerf,
     syslog: showSyslog, params: showParams, keys: showKeys,
-    health: showHealth, aliases: showAliases}[name] || function(){})(
+    health: showHealth, aliases: showAliases,
+    governance: showGovernance}[name] || function(){})(
       {title: t, body: b});
 }
 function closeModal() {
@@ -4281,6 +4284,96 @@ function delAlias(name) {
   api('/admin/aliases', {method: 'POST', body: {name: name, delete: true}})
     .then(function () { notify('✓ deleted'); showPanel('aliases'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
+// ---------- Governance (tier E read-only: guardrails, routes, batches, evals) ----------
+function showGovernance(ui) {
+  ui.title.textContent = '🛡️ Governance';
+  Promise.all([
+    api('/admin/guardrails'),
+    api('/admin/routes'),
+    api('/admin/batches'),
+    api('/admin/evals')
+  ]).then(function (r) {
+    var g = r[0], routes = r[1], batches = r[2], evals = r[3];
+    var html = '';
+
+    // ── Guardrails ──
+    var gc = g.guardrails || {};
+    var viol = g.violations || {};
+    html += '<div class="widget"><h3>Guardrails ' +
+      (gc.enabled ? '<span class="badge ok">enabled</span>' : '<span class="badge warn">disabled</span>') + '</h3>';
+    html += '<div class="muted" style="margin-bottom:6px">Request/response filters + external policy engine. Configure via Parameters → raw config (guardrails section).</div>';
+    if ((gc.request_rules || []).length || (gc.response_rules || []).length) {
+      html += '<table><thead><tr><th>rule</th><th>type</th><th>direction</th><th>action</th><th class="num">violations</th></tr></thead><tbody>';
+      (gc.request_rules || []).forEach(function (r) {
+        html += '<tr><td><b>' + esc(r.name) + '</b></td><td>' + esc(r.type) + '</td><td>request</td><td>' + esc(r.action) + '</td><td class="num">' + (viol[r.name] || 0) + '</td></tr>';
+      });
+      (gc.response_rules || []).forEach(function (r) {
+        html += '<tr><td><b>' + esc(r.name) + '</b></td><td>' + esc(r.type) + '</td><td>response</td><td>' + esc(r.action) + '</td><td class="num">' + (viol[r.name] || 0) + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += '<div class="muted">No rules configured.</div>';
+    }
+    if (gc.webhook_url) {
+      html += '<div class="kv" style="margin-top:6px"><b>Policy engine:</b> <code>' + esc(gc.webhook_url) + '</code>' +
+        (gc.webhook_fail_open ? ' <span class="badge warn">fail-open</span>' : ' <span class="badge err">fail-closed</span>') + '</div>';
+    }
+    html += '</div>';
+
+    // ── Smart Routes ──
+    html += '<div class="widget"><h3>Smart Routes</h3>';
+    if ((routes.routes || []).length) {
+      html += '<table><thead><tr><th>route</th><th>strategy</th><th>candidates</th></tr></thead><tbody>';
+      routes.routes.forEach(function (rt) {
+        var cands = (rt.candidates || []).map(function (c) {
+          return esc(c.backend + ':' + c.model) +
+            ' <span class="muted">(' + Math.round(c.ewma_ms || 0) + 'ms, ' + c.selections + '×)</span>';
+        }).join('<br>');
+        html += '<tr><td><b>' + esc(rt.name) + '</b></td><td>' + esc(rt.strategy) + '</td><td style="font-size:0.75rem">' + cands + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += '<div class="muted">No smart routes configured. Add via Parameters (smart_routes section).</div>';
+    }
+    html += '</div>';
+
+    // ── Recent Batches ──
+    html += '<div class="widget"><h3>Recent Batches</h3>';
+    if ((batches.batches || []).length) {
+      html += '<table><thead><tr><th>id</th><th>model</th><th>status</th><th class="num">ok</th><th class="num">fail</th><th>created</th></tr></thead><tbody>';
+      batches.batches.slice(0, 10).forEach(function (b) {
+        var badge = b.status === 'completed' ? '<span class="badge ok">done</span>'
+          : '<span class="badge warn">' + esc(b.status) + '</span>';
+        html += '<tr><td><code>' + esc(b.id.slice(0, 18)) + '…</code></td><td>' + esc(b.model) + '</td><td>' + badge +
+          '</td><td class="num">' + b.completed + '</td><td class="num">' + b.failed + '</td><td class="muted">' + esc(b.created) + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += '<div class="muted">No batches submitted.</div>';
+    }
+    html += '<div class="muted" style="margin-top:4px">POST /v1/batches to submit async workloads.</div></div>';
+
+    // ── Eval Reports ──
+    html += '<div class="widget"><h3>Eval Reports</h3>';
+    if ((evals.evals || []).length) {
+      html += '<table><thead><tr><th>name</th><th>ts</th><th>models</th><th>results</th></tr></thead><tbody>';
+      evals.evals.slice(-10).reverse().forEach(function (ev) {
+        var s = ev.summary || {};
+        var parts = Object.keys(s).map(function (m) {
+          return esc(m.split(':').pop()) + ' ' + s[m].pass + '/' + (s[m].pass + s[m].fail);
+        });
+        html += '<tr><td><b>' + esc(ev.name) + '</b></td><td class="muted">' + esc(ev.ts) + '</td><td>' + esc((ev.models || []).join(', ')) + '</td><td>' + parts.join(' · ') + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    } else {
+      html += '<div class="muted">No eval runs. POST /admin/evals/run to start.</div>';
+    }
+    html += '</div>';
+
+    ui.body.innerHTML = html;
+  }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
 
 function errBox(e) { return '<div style="color:var(--danger);padding:12px;">✗ ' + esc(e.message) + '</div>'; }
