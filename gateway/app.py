@@ -3151,6 +3151,14 @@ async def list_batches() -> Response:
     return {"batches": rows}
 
 
+@app.get("/admin/batches")
+async def admin_list_batches() -> Response:
+    """Recent batches — admin-console view of the same registry as
+    GET /v1/batches (Governance pane; passes the admin gate when
+    auth is enabled)."""
+    return await list_batches()
+
+
 @app.get("/v1/batches/{batch_id}")
 async def get_batch(batch_id: str) -> Response:
     m = _BATCHES.get(batch_id)

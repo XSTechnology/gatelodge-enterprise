@@ -2253,6 +2253,9 @@ def test_batch_end_to_end(wired, gguf, monkeypatch):
         # list endpoint
         listing = client.get("/v1/batches").json()["batches"]
         assert any(b["id"] == batch_id for b in listing)
+        # admin-console view (Governance pane) lists the same registry
+        admin_listing = client.get("/admin/batches").json()["batches"]
+        assert any(b["id"] == batch_id for b in admin_listing)
 
 
 def test_batch_rejects_unknown_model(wired, gguf):
