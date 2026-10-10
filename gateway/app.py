@@ -1,4 +1,4 @@
-"""LLM Gateway v1.0.0 — OpenAI-compatible multi-backend LLM front door.
+"""LLM Gateway v1.2.0 — OpenAI-compatible multi-backend LLM front door.
 
 A single-process gateway that routes LLM requests across local GGUFs,
 llama-server children, RunPod pods/serverless, and OpenAI-compatible
@@ -152,7 +152,7 @@ from .storage import NamespaceDict, NamespaceSet, get_storage, reset_storage
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LLM Gateway", version="1.0.0")
+app = FastAPI(title="LLM Gateway", version="1.2.0")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
