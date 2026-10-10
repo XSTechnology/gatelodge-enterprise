@@ -699,43 +699,92 @@ def _normalize_aliases(raw: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+class ConfigStore:
+    """Config persistence — the enterprise-fork extension point.
+
+    Core: FileConfigStore (JSON file with mtime-based hot-reload).
+    Enterprise: DatabaseConfigStore (shared DB for multi-replica).
+    GatewayConfig delegates all I/O to the active store."""
+
+    def load(self) -> dict[str, Any] | None:
+        """Read the raw config. None when unreadable (keep previous)."""
+        raise NotImplementedError
+
+    def save(self, raw: dict[str, Any]) -> None:
+        """Persist the raw config."""
+        raise NotImplementedError
+
+    def version(self) -> Any:
+        """A change-detection token (mtime for files, a revision number
+        for DBs). None when the source doesn't exist."""
+        raise NotImplementedError
+
+
+class FileConfigStore(ConfigStore):
+    """JSON-file-backed config storage — the core default."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> dict[str, Any] | None:
+        if not self.path.is_file():
+            return None
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error("gateway config %s unreadable (%s)", self.path, e)
+            return None
+
+    def save(self, raw: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(raw, indent=2) + "\n",
+                             encoding="utf-8")
+
+    def version(self) -> Any:
+        try:
+            return self.path.stat().st_mtime if self.path.is_file() else None
+        except OSError:
+            return None
+
+
 class GatewayConfig:
-    """Parsed gateway_config.json; reloads when the file's mtime changes.
+    """Parsed gateway config; reloads when the store's version changes.
 
-    A broken/unreadable file keeps the last good values (defaults on first
-    load) — the gateway keeps serving instead of resetting to defaults.
-    """
+    A broken/unreadable source keeps the last good values (defaults on
+    first load) — the gateway keeps serving instead of resetting.
 
-    def __init__(self, path: Path | str | None = None):
-        self.path = Path(path) if path is not None else CONFIG_PATH
+    The store is swappable: pass a ConfigStore instance to use a
+    different backend (enterprise: DatabaseConfigStore). The default
+    is FileConfigStore at CONFIG_PATH."""
+
+    def __init__(self, path_or_store: Path | str | ConfigStore | None = None):
+        if isinstance(path_or_store, ConfigStore):
+            self.store = path_or_store
+            self.path = getattr(path_or_store, "path", CONFIG_PATH)
+        else:
+            self.path = (Path(path_or_store) if path_or_store is not None
+                         else CONFIG_PATH)
+            self.store = FileConfigStore(self.path)
         self._lock = threading.Lock()
-        self._mtime: float | None = None
+        self._version: Any = None
         self._apply(_default_raw())  # seed defaults before the first load
         self._load()
 
     # ── loading ──
 
     def _remember_mtime(self) -> None:
-        try:
-            self._mtime = self.path.stat().st_mtime if self.path.is_file() else None
-        except OSError:
-            pass
+        self._version = self.store.version()
 
     def _load(self) -> None:
-        if not self.path.is_file():
-            self._apply(_default_raw())
-            self._remember_mtime()
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error("gateway config %s unreadable (%s) — previous values kept",
-                         self.path, e)
+        data = self.store.load()
+        if data is None:
+            if not self.path.is_file() and not hasattr(self.store, "path"):
+                # first boot with no config — apply defaults
+                self._apply(_default_raw())
             self._remember_mtime()
             return
         if not isinstance(data, dict):
-            logger.error("gateway config %s: not a JSON object — previous values kept",
-                         self.path)
+            logger.error("gateway config: not a JSON object — previous values kept")
             self._remember_mtime()
             return
         # Top-level keys in the file replace defaults wholesale.
@@ -801,22 +850,19 @@ class GatewayConfig:
         self.smart_routes = _normalize_smart_routes(raw.get("smart_routes"))
 
     def maybe_reload(self) -> bool:
-        """Re-read the file when its mtime changed. True when reloaded."""
-        try:
-            mtime = self.path.stat().st_mtime if self.path.is_file() else None
-        except OSError:
-            return False
-        if mtime == self._mtime:
+        """Re-read when the store's version changed. True when reloaded."""
+        version = self.store.version()
+        if version == self._version:
             return False
         with self._lock:
-            if mtime == self._mtime:  # re-check under the lock
+            if self.store.version() == self._version:  # re-check under lock
                 return False
             self._load()
         return True
 
     def reload_now(self) -> None:
         """Unconditional reload (admin mutations want determinism, not
-        mtime-granularity luck)."""
+        version-granularity luck)."""
         with self._lock:
             self._load()
 

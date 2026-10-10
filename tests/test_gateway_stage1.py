@@ -179,9 +179,9 @@ def test_config_hot_reload_on_mtime_change(tmp_path):
     cfg = gw_config.GatewayConfig(f)
     assert cfg.port == 1
     f.write_text(json.dumps({"port": 2}), encoding="utf-8")
-    # defeat filesystem mtime granularity
+    # defeat filesystem mtime granularity (bump the store's version)
     import os
-    os.utime(f, ns=(0, int(cfg._mtime * 1e9) + 1_000_000_000))
+    os.utime(f, ns=(0, int(cfg._version * 1e9) + 1_000_000_000))
     assert cfg.maybe_reload() is True
     assert cfg.port == 2
     assert cfg.maybe_reload() is False  # unchanged → no reload
@@ -193,12 +193,12 @@ def test_config_broken_json_keeps_previous(tmp_path):
     cfg = gw_config.GatewayConfig(f)
     f.write_text("{ broken", encoding="utf-8")
     import os
-    os.utime(f, ns=(0, int(cfg._mtime * 1e9) + 1_000_000_000))
+    os.utime(f, ns=(0, int(cfg._version * 1e9) + 1_000_000_000))
     cfg.maybe_reload()
     assert cfg.port == 5  # previous values kept
     # fixing the file reloads cleanly
     f.write_text(json.dumps({"port": 6}), encoding="utf-8")
-    os.utime(f, ns=(0, int(cfg._mtime * 1e9) + 1_000_000_000))
+    os.utime(f, ns=(0, int(cfg._version * 1e9) + 1_000_000_000))
     assert cfg.maybe_reload() is True
     assert cfg.port == 6
 
@@ -282,7 +282,7 @@ def test_engine_registry_and_reload_on_config_change(wired, gguf):
         cfgd["backends"]["local"]["models"]["fast"]["ctx"] = 512
         cfgfile.write_text(json.dumps(cfgd), encoding="utf-8")
         import os
-        os.utime(cfgfile, ns=(0, int(cfg._mtime * 1e9) + 1_000_000_000))
+        os.utime(cfgfile, ns=(0, int(cfg._version * 1e9) + 1_000_000_000))
         cfg.maybe_reload()
         inst2 = engine._get_instance("fast")
         assert inst2 is not inst
