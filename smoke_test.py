@@ -4,18 +4,36 @@ Curls every endpoint class and asserts expected status codes. Run this
 after any deployment (start.bat, service install, exe) to confirm the
 gateway is healthy end-to-end. Zero-cost: no LLM calls (except healthz).
 
-Usage: python smoke_test.py [base_url]
+Usage: python smoke_test.py [base_url] [--key BEARER] [--ro-key BEARER]
   default base_url: http://127.0.0.1:8010
+  --key      bearer for every check (required when keys are configured)
+  --ro-key   an ops_readonly admin key: adds C-lite RBAC checks
+             (needs --key too — a full-admin key for the contrast row)
+  env fallbacks: GATEWAY_SMOKE_KEY / GATEWAY_SMOKE_RO_KEY
 """
+import os
 import sys
 import time
 
 import httpx
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8010"
+
+def _arg(flag: str) -> str:
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return ""
+
+
+BASE = (sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-")
+        else "http://127.0.0.1:8010")
+KEY = _arg("--key") or os.environ.get("GATEWAY_SMOKE_KEY", "")
+RO_KEY = _arg("--ro-key") or os.environ.get("GATEWAY_SMOKE_RO_KEY", "")
+HEADERS = {"Authorization": f"Bearer {KEY}"} if KEY else {}
 
 checks = [
-    # (name, method, path, expected_status, body)
+    # (name, method, path, expected_status, body[, headers])
     ("console shell", "GET", "/", 200, None),
     ("healthz", "GET", "/healthz", 200, None),
     ("v1/models", "GET", "/v1/models", 200, None),
@@ -38,20 +56,35 @@ checks = [
      {"model": "__nonexistent__", "messages": [{"role": "user", "content": "x"}]}),
 ]
 
+if RO_KEY and KEY:
+    # C-lite RBAC: the read-only key reads, cannot mutate or read raw
+    # config; the full-admin key still can.
+    ro = {"Authorization": f"Bearer {RO_KEY}"}
+    checks += [
+        ("rbac: ro GET stats", "GET", "/admin/stats", 200, None, ro),
+        ("rbac: ro GET config", "GET", "/admin/config", 403, None, ro),
+        ("rbac: ro POST reload", "POST", "/admin/reload", 403, None, ro),
+        ("rbac: full POST reload", "POST", "/admin/reload", 200, None,
+         HEADERS),
+    ]
+
 
 def main() -> int:
     passed = 0
     failed = 0
     t0 = time.perf_counter()
-    print(f"Gatelodge smoke test — {BASE}")
+    print(f"Gatelodge smoke test — {BASE}"
+          + (f" (bearer {'set' if KEY else 'not set'})" if KEY else ""))
     print("-" * 50)
     with httpx.Client(timeout=15) as c:
-        for name, method, path, expected, body in checks:
+        for check in checks:
+            name, method, path, expected, body = check[:5]
+            headers = check[5] if len(check) > 5 else HEADERS
             try:
                 if method == "GET":
-                    r = c.get(f"{BASE}{path}")
+                    r = c.get(f"{BASE}{path}", headers=headers)
                 else:
-                    r = c.post(f"{BASE}{path}", json=body)
+                    r = c.post(f"{BASE}{path}", json=body, headers=headers)
                 ok = r.status_code == expected
                 mark = "✓" if ok else "✗"
                 detail = "" if ok else f" (got {r.status_code}, want {expected})"

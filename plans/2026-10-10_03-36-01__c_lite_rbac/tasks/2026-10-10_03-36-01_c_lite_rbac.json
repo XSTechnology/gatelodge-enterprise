@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[c-lite-1] Create gateway_enterprise package: rbac.py with ROLES policy table, allowed() matcher, AdminRoleMap version-cached parser + lint warnings — self (core design, everything builds on it)",
+    "id": "c-lite-1",
+    "status": "completed"
+  },
+  {
+    "content": "[c-lite-2] gateway_enterprise/links.py: rbac_link per plan flow + 403 rbac_forbidden shape + best-effort audit append to config-audit.jsonl — self (depends on c-lite-1 API)",
+    "id": "c-lite-2",
+    "status": "completed"
+  },
+  {
+    "content": "[c-lite-3] Wire pipeline in enterprise_main.py ([resolve, rbac, admin_gate, rate_limit], sso slot reserved) + docstring update — self (tiny, depends on c-lite-2)",
+    "id": "c-lite-3",
+    "status": "completed"
+  },
+  {
+    "content": "[c-lite-4] tests/test_enterprise_rbac.py: 14 canary-style cases per plan test list (real wiring, restore in finally) — self (must match the exact API of 1-2)",
+    "id": "c-lite-4",
+    "status": "completed"
+  },
+  {
+    "content": "[c-lite-5] smoke_test.py --key/--ro-key extension + merge dev admin keys+roles into data/gateway_config.json (8011, preserve existing backends/aliases) — self (fork-owned files, must match dev key values used in verification)",
+    "id": "c-lite-5",
+    "status": "in_progress"
+  },
+  {
+    "content": "[c-lite-6] Full suite + live verification on 8011 (startup log, smoke with --key, curl matrix, hot-reload flip), single commit, update project context — self (synthesis of all tasks)",
+    "id": "c-lite-6",
+    "status": "pending"
+  }
+]

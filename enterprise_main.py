@@ -13,7 +13,8 @@ Seam recipe (fill in as the tiers land):
     from gateway_enterprise.redis_storage import RedisStorage
     set_storage(RedisStorage(url="redis://..."))
 
-    # tier C — SSO/OIDC + RBAC in front of the admin gate
+    # tier C — SSO/OIDC in front of the admin gate. sso_link is still
+    # pending (tier C); C-lite's rbac_link is WIRED in main() below.
     from gateway.auth import (AuthPipeline, set_auth_pipeline,
                               resolve_key_link, admin_gate_link,
                               rate_limit_link)
@@ -35,8 +36,25 @@ from __future__ import annotations
 
 
 def main() -> None:
-    # ── enterprise seam wiring lands HERE (before serving) ──────────
-    # Until the implementations above exist, the core defaults serve.
+    # ── enterprise seam wiring (before serving) ────────────────────
+    # The core's main() configures logging, but the wiring below logs
+    # BEFORE it runs — configure logging here first (same format; the
+    # core's basicConfig call then becomes a no-op).
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    # C-lite LANDED: role-scoped admin keys. rbac_link enforces the
+    # role→admin-surface mapping from the config's admin_key_roles
+    # section (see gateway_enterprise/rbac.py). sso_link (tier C)
+    # slots in before rbac_link when it lands.
+    from gateway.auth import (AuthPipeline, admin_gate_link,
+                              rate_limit_link, resolve_key_link,
+                              set_auth_pipeline)
+    from gateway_enterprise.links import rbac_link
+    set_auth_pipeline(AuthPipeline([resolve_key_link, rbac_link,
+                                    admin_gate_link, rate_limit_link]))
 
     from gateway.__main__ import main as core_main
     core_main()
