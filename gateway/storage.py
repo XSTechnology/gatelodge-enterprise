@@ -23,6 +23,7 @@ Enterprise swaps the backend:
 """
 from __future__ import annotations
 
+import collections
 import logging
 from typing import Any, Protocol, runtime_checkable
 
@@ -160,3 +161,78 @@ def reset_storage() -> None:
     """Reset to a fresh InMemoryStorage (tests)."""
     global _BACKEND
     _BACKEND = InMemoryStorage()
+
+
+# ── dict/set facades over a namespace ──────────────────────────────────────
+
+class NamespaceDict(collections.abc.MutableMapping):
+    """A dict facade over ONE storage namespace. Module-level state can
+    ride the swappable backend without changing any access site —
+    `d[k]`, `d.get`, `in d`, `.items()`, `.clear()` all delegate to
+    get_storage(). Values must be storage-shaped (JSON-serializable).
+
+    NOTE on in-place mutation: `d[k]["field"] += 1` mutates the fetched
+    value — visible under InMemoryStorage (same object) but INVISIBLE to
+    a remote backend (no set() is called). Correct code reads, copies,
+    and writes back. Sites that must remain backend-correct do this;
+    tests mutate in place only under the default backend."""
+
+    def __init__(self, ns: str) -> None:
+        self._ns = ns
+
+    def __getitem__(self, key: str) -> Any:
+        k = str(key)
+        st = get_storage()
+        if not st.contains(self._ns, k):
+            raise KeyError(key)
+        return st.get(self._ns, k)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        get_storage().set(self._ns, str(key), value)
+
+    def __delitem__(self, key: str) -> None:
+        k = str(key)
+        st = get_storage()
+        if not st.contains(self._ns, k):
+            raise KeyError(key)
+        st.delete(self._ns, k)
+
+    def __iter__(self):
+        return iter(get_storage().keys(self._ns))
+
+    def __len__(self) -> int:
+        return get_storage().len(self._ns)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        v = get_storage().get(self._ns, str(key))
+        return default if v is None else v
+
+    def clear(self) -> None:
+        get_storage().clear(self._ns)
+
+
+class NamespaceSet(collections.abc.MutableSet):
+    """A set facade over one storage namespace (membership markers —
+    values are stored as True). Same backend-swap semantics as
+    NamespaceDict."""
+
+    def __init__(self, ns: str) -> None:
+        self._ns = ns
+
+    def __contains__(self, key: object) -> bool:
+        return get_storage().contains(self._ns, str(key))
+
+    def __iter__(self):
+        return iter(get_storage().keys(self._ns))
+
+    def __len__(self) -> int:
+        return get_storage().len(self._ns)
+
+    def add(self, key: str) -> None:
+        get_storage().set(self._ns, str(key), True)
+
+    def discard(self, key: str) -> None:
+        get_storage().delete(self._ns, str(key))
+
+    def clear(self) -> None:
+        get_storage().clear(self._ns)

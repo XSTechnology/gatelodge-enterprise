@@ -1015,3 +1015,15 @@ def get_gateway_config() -> GatewayConfig:
     if _CONFIG is None:
         _CONFIG = GatewayConfig()
     return _CONFIG
+
+
+def set_config_store(store: ConfigStore) -> GatewayConfig:
+    """Swap the singleton's config store (the sanctioned injection —
+    enterprise: DatabaseConfigStore for a shared-DB, multi-replica
+    deployment). Rebuilds the config from the new store; hot-reload
+    picks up the new store's version token from then on. Call at
+    startup, BEFORE serving. Returns the new singleton."""
+    global _CONFIG
+    _CONFIG = GatewayConfig(store)
+    logger.info("config store swapped to %s", type(store).__name__)
+    return _CONFIG

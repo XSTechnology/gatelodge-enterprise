@@ -132,12 +132,23 @@ from . import modelsearch
 from . import providers
 from . import runpod
 from . import upload
+# Auth seam: the middleware runs the ACTIVE pipeline (default below);
+# enterprise swaps it via set_auth_pipeline(). _REQUEST_KEY_ID /
+# _REQUEST_ID are defined in auth.py — imported here so the whole app
+# shares ONE ContextVar object per name.
+from .auth import (AuthPipeline, get_auth_pipeline, set_auth_pipeline,
+                   _REQUEST_KEY_ID, _REQUEST_ID, _resolve_bearer,
+                   _sha256_hex)
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
                      RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
                      get_engine, installed_ggufs)
+# Storage seam: module state globals below are NamespaceDict/NamespaceSet
+# facades over the swappable backend — set_storage(RedisStorage(...))
+# moves them to shared state with zero further core changes.
+from .storage import NamespaceDict, NamespaceSet, get_storage, reset_storage
 
 logger = logging.getLogger(__name__)
 
@@ -348,37 +359,11 @@ def _exec_error_response(e: BaseException, requested: str,
 # ── Bearer auth (gateway_keys = ADMIN keys; api_keys = per-consumer
 # virtual keys with usage attribution). Empty both = open localhost trust. ──
 
-# Per-request key identity (set by the auth middleware, read by the
-# logger/budget machinery — a ContextVar avoids threading a key param
-# through every _log_request call site).
-_REQUEST_KEY_ID = contextvars.ContextVar("gw_request_key", default="")
-
-
-def _sha256_hex(raw: str) -> str:
-    import hashlib
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _resolve_bearer(cfg, token: str) -> str:
-    """Bearer token → key_id: 'admin' for gateway_keys (plaintext OR
-    sha256-hex form), the api_keys id for a virtual key (hash compared,
-    constant-time). '' when unknown. Keys are HASHED AT REST — the
-    presented token is hashed and compared, never stored."""
-    import hmac as _hmac
-    if not token:
-        return ""
-    token_hash = _sha256_hex(token)
-    for k in (cfg.gateway_keys or []):
-        k = str(k)
-        if k == token:
-            return "admin"
-        if len(k) == 64 and _hmac.compare_digest(k, token_hash):
-            return "admin"
-    for entry in (cfg.api_keys or {}).values():
-        if _hmac.compare_digest(str(entry.get("key_hash") or ""),
-                                token_hash):
-            return str(entry.get("id") or "")
-    return ""
+# Per-request key identity (_REQUEST_KEY_ID) and request IDs
+# (_REQUEST_ID) are ContextVars imported from .auth — the single
+# definition. The auth middleware itself now delegates to the ACTIVE
+# AuthPipeline (auth.py); bearer resolution (_resolve_bearer) and key
+# hashing (_sha256_hex) also live there and are imported above.
 
 
 # ── request IDs + Prometheus metrics (tier A) ──────────────────────────────
@@ -389,9 +374,12 @@ def _resolve_bearer(cfg, token: str) -> str:
 # Prometheus text format at GET /metrics. Label cardinality is capped —
 # unknown model names from bad requests collapse into an "other" bucket.
 
-_REQUEST_ID = contextvars.ContextVar("gw_request_id", default="")
+# _REQUEST_ID is imported from .auth — the single definition.
 _START_TIME = time.time()
 
+# Prometheus counters stay PER-PROCESS by design (each replica is
+# scraped separately; aggregation belongs to the scraper). They do NOT
+# ride the storage backend.
 _METRIC_LABELS: dict[str, tuple[str, ...]] = {
     "gateway_requests_total": ("backend", "model", "key", "status"),
     "gateway_request_ms_sum": ("backend", "model"),
@@ -478,29 +466,17 @@ async def prometheus_metrics() -> Response:
 
 
 # ── per-key rate limiting (requests/minute, sliding window) ────────────────
-# Admin keys and open mode are unlimited. In-memory only — a restart
+# Admin keys and open mode are unlimited. The window state rides the
+# swappable storage backend (namespace "rate_windows"); the limiter
+# itself lives in auth.py (rate_limit_link). A restart / backend swap
 # clears the window (one minute of slack, acceptable for an RPM limiter).
 
-_RATE_WINDOWS: dict[str, collections.deque] = {}
+_RATE_WINDOWS = NamespaceDict("rate_windows")
 
 
 def reset_rate_windows() -> None:
-    """Drop in-memory rate windows (tests)."""
+    """Drop rate windows (tests)."""
     _RATE_WINDOWS.clear()
-
-
-def _key_rate_limit(key_id: str, rpm: int) -> float:
-    """Record a request for key_id against its rpm limit. Returns 0.0
-    when allowed, else the seconds until the oldest request leaves the
-    60s window (Retry-After)."""
-    now = time.monotonic()
-    win = _RATE_WINDOWS.setdefault(key_id, collections.deque())
-    while win and now - win[0] > 60.0:
-        win.popleft()
-    if len(win) >= rpm:
-        return max(0.0, 60.0 - (now - win[0]))
-    win.append(now)
-    return 0.0
 
 
 def _rid_response(resp: Response, rid: str) -> Response:
@@ -517,53 +493,17 @@ async def _bearer_auth(request: Request, call_next):
     rid = ((request.headers.get("x-request-id") or "").strip())[:64] \
         or uuid.uuid4().hex[:16]
     _REQUEST_ID.set(rid)
-    keys = cfg.gateway_keys
-    vkeys = cfg.api_keys
-    if keys or vkeys:
-        if request.method == "GET" and request.url.path == "/":
-            _REQUEST_KEY_ID.set("")  # static console shell — its API
-            # calls still require the key (the page prompts for it)
-            return _rid_response(await call_next(request), rid)
-        auth = request.headers.get("authorization") or ""
-        token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        key_id = _resolve_bearer(cfg, token)
-        if not key_id:
-            return _rid_response(JSONResponse(
-                status_code=401,
-                content={"error": {
-                    "message": "missing or invalid API key",
-                    "type": "invalid_request_error", "param": None,
-                    "code": "invalid_api_key"}}), rid)
-        if (key_id != "admin"
-                and request.url.path.startswith("/admin")):
-            # Virtual keys are CONSUMER keys — admin surface needs an
-            # admin key (gateway_keys). Prevents a program key from
-            # reading config, stats, or minting keys.
-            return _rid_response(JSONResponse(
-                status_code=403,
-                content={"error": {
-                    "message": "admin endpoints require a gateway admin key",
-                    "type": "invalid_request_error", "param": None,
-                    "code": "admin_key_required"}}), rid)
-        # Per-key RPM (sliding 60s window) on the serving surface
-        if key_id != "admin" and request.url.path.startswith("/v1/"):
-            entry = (cfg.api_keys or {}).get(key_id) or {}
-            rpm = int(entry.get("rate_limit_rpm") or 0)
-            if rpm > 0:
-                retry_after = _key_rate_limit(key_id, rpm)
-                if retry_after > 0:
-                    return _rid_response(JSONResponse(
-                        status_code=429,
-                        content={"error": {
-                            "message": (f"key {key_id!r}: rate limit "
-                                        f"({rpm} requests/minute)"),
-                            "type": "rate_limit_error", "param": None,
-                            "code": "rate_limited"}},
-                        headers={"Retry-After": str(int(retry_after) + 1)}),
-                        rid)
-        _REQUEST_KEY_ID.set(key_id)
+    if request.method == "GET" and request.url.path == "/":
+        _REQUEST_KEY_ID.set("")  # static console shell — its API
+        # calls still require the key (the page prompts for it)
         return _rid_response(await call_next(request), rid)
-    _REQUEST_KEY_ID.set("")
+    # Auth runs through the ACTIVE pipeline (default: bearer resolve →
+    # admin gate → per-key RPM, all in auth.py). Enterprise swaps the
+    # pipeline via set_auth_pipeline() — SSO/OIDC + RBAC links — with
+    # zero core changes. The pipeline sets _REQUEST_KEY_ID on success.
+    blocked = await get_auth_pipeline().run(request, cfg)
+    if blocked is not None:
+        return _rid_response(blocked, rid)
     return _rid_response(await call_next(request), rid)
 
 
@@ -637,8 +577,10 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
 # (openai-type token budgets) and "key:<id>" (per-consumer token/USD
 # budgets). Cache hits log backend="cache" and never bill upstream.
 
-_SPEND_LEDGER: dict[str, dict[str, Any]] = {}   # scope → {month, tokens, usd}
-_SPEND_ALERTED: set[str] = set()                # "scope:month" 80% alerts
+# Spend state rides the storage backend (shared when the enterprise
+# swaps in RedisStorage; dict/set semantics preserved via the facades).
+_SPEND_LEDGER = NamespaceDict("spend_ledger")    # scope → {month, tokens, usd}
+_SPEND_ALERTED = NamespaceSet("spend_alerted")   # "scope:month" 80% alerts
 _LOG_MIGRATED: bool = False
 _LOG_MONTH_STATE: str | None = None
 
@@ -794,8 +736,13 @@ def _charge_scope(scope: str, tokens: int, usd: float | None) -> None:
     if led is None or led.get("month") != _month_key():
         _scope_spend(scope)  # initialize from the log
         led = _SPEND_LEDGER.get(scope) or {}
-    led["tokens"] = int(led.get("tokens") or 0) + int(tokens)
-    led["usd"] = float(led.get("usd") or 0.0) + float(usd or 0.0)
+    # read-modify-write (never in-place mutation): a swapped backend
+    # (Redis/DB) only sees explicit sets.
+    _SPEND_LEDGER[scope] = {
+        "month": led.get("month") or _month_key(),
+        "tokens": int(led.get("tokens") or 0) + int(tokens),
+        "usd": float(led.get("usd") or 0.0) + float(usd or 0.0),
+    }
 
 
 def _token_budget_used(backend_name: str) -> int:
@@ -1619,15 +1566,17 @@ async def _first_success(tasks: list[asyncio.Task],
 # breaker-tracked — only primaries pay the per-request hedge cost. ──
 
 _COLD_BREAK_S = 120.0
-_COLD_UNTIL: dict[str, float] = {}
+# Breaker state rides the storage backend ("cold_breakers"); EPOCH
+# stamps so a shared backend compares correctly across replicas.
+_COLD_UNTIL = NamespaceDict("cold_breakers")
 
 
 def _breaker_open(key: str) -> bool:
-    return time.monotonic() < _COLD_UNTIL.get(key, 0.0)
+    return time.time() < _COLD_UNTIL.get(key, 0.0)
 
 
 def _breaker_mark(key: str) -> None:
-    _COLD_UNTIL[key] = time.monotonic() + _COLD_BREAK_S
+    _COLD_UNTIL[key] = time.time() + _COLD_BREAK_S
 
 
 def _breaker_clear(key: str) -> None:
@@ -1714,7 +1663,10 @@ async def _exec_chain(cfg, entries: list[tuple[str, str]], hedge_s: float,
 # scope); streaming never caches. Sizing/kill switch: config
 # response_cache {enabled, ttl_s, max} — hot-reloadable.
 
-_RESPONSE_CACHE: dict[str, dict[str, Any]] = {}
+# Cache entries ride the storage backend (namespace "response_cache")
+# — a shared backend means replicas share cached answers. "ts" is an
+# EPOCH stamp so TTLs are comparable across processes.
+_RESPONSE_CACHE = NamespaceDict("response_cache")
 _CACHE_TIME_KEYWORDS = ("time", "date", "today", "now", "current",
                         "weather", "forecast", "latest", "news")
 
@@ -1816,8 +1768,10 @@ async def chat_completions(body: ChatRequest) -> Response:
     if ckey:
         rc_ttl = float(rc_cfg.get("ttl_s") or 3600)
         hit = _RESPONSE_CACHE.get(ckey)
-        if hit and (time.monotonic() - hit["ts"]) < rc_ttl:
-            hit["hits"] = int(hit.get("hits", 0)) + 1
+        if hit and (time.time() - hit["ts"]) < rc_ttl:
+            # read-modify-write the hit counter (backend-visible)
+            _RESPONSE_CACHE[ckey] = {**hit,
+                                     "hits": int(hit.get("hits", 0)) + 1}
             resp = dict(hit["resp"])
             _log_request(requested, "cache", body.stream, 0,
                          resp.get("usage") or {}, 200)
@@ -1879,7 +1833,8 @@ async def chat_completions(body: ChatRequest) -> Response:
                                       "ms": ms})
         if ckey:
             # Store under the cache (bounded; oldest evicted). A max of 0
-            # disables storage while leaving lookups inert.
+            # disables storage while leaving lookups inert. Epoch ts —
+            # comparable across replicas on a shared backend.
             rc_max = int(rc_cfg.get("max") or 100)
             if rc_max > 0:
                 if len(_RESPONSE_CACHE) >= rc_max:
@@ -1887,7 +1842,7 @@ async def chat_completions(body: ChatRequest) -> Response:
                                  key=lambda kv: kv[1]["ts"])
                     _RESPONSE_CACHE.pop(oldest[0], None)
                 _RESPONSE_CACHE[ckey] = {"resp": dict(resp),
-                                         "ts": time.monotonic(), "hits": 0}
+                                         "ts": time.time(), "hits": 0}
         _log_request(requested, winner, body.stream, ms,
                      resp.get("usage") or {}, 200,
                      cost_usd=resp.get("cost_usd"))
@@ -2694,7 +2649,8 @@ async def images_generations(request: Request) -> Response:
 
 # ── tier E: guardrails ─────────────────────────────────────────────────────
 
-_GUARDRAIL_VIOLATIONS: dict[str, int] = {}   # rule name → total violations
+# Violation counters ride the storage backend (shared across replicas).
+_GUARDRAIL_VIOLATIONS = NamespaceDict("guardrail_violations")
 
 # Built-in prompt-injection heuristics (v1: pattern-based; the webhook
 # policy engine handles anything deeper)
@@ -2879,9 +2835,12 @@ async def admin_guardrails() -> Response:
 
 # ── tier E: smart routing ──────────────────────────────────────────────────
 
-_ROUTE_LATENCY: dict[str, dict[str, float]] = {}   # "b:m" → {ewma_ms, n}
-_ROUTE_SELECTIONS: dict[str, dict[str, int]] = {}  # route → {b:m: count}
-_ROUTE_RR: dict[str, int] = {}                     # round-robin counters
+# Routing trackers ride the storage backend (latency EWMA + selection
+# counts are shared across replicas; round-robin counters become a
+# shared turnstile).
+_ROUTE_LATENCY = NamespaceDict("route_latency")    # "b:m" → {ewma_ms, n}
+_ROUTE_SELECTIONS = NamespaceDict("route_selections")  # route → {b:m: count}
+_ROUTE_RR = NamespaceDict("route_rr")              # round-robin counters
 
 
 def reset_route_state() -> None:
@@ -2892,11 +2851,14 @@ def reset_route_state() -> None:
 
 
 def _record_route_latency(backend: str, model: str, ms: float) -> None:
-    """EWMA latency per backend:model — feeds the 'fastest' strategy."""
+    """EWMA latency per backend:model — feeds the 'fastest' strategy.
+    Read-modify-write (backend-visible, never in-place mutation)."""
     key = f"{backend}:{model}"
-    st = _ROUTE_LATENCY.setdefault(key, {"ewma_ms": ms, "n": 0})
-    st["n"] += 1
-    st["ewma_ms"] = st["ewma_ms"] * 0.7 + ms * 0.3
+    st = _ROUTE_LATENCY.get(key) or {"ewma_ms": ms, "n": 0}
+    _ROUTE_LATENCY[key] = {
+        "ewma_ms": float(st.get("ewma_ms") or 0.0) * 0.7 + ms * 0.3,
+        "n": int(st.get("n") or 0) + 1,
+    }
 
 
 def _candidate_price(cfg, cand: dict) -> float:
@@ -2940,9 +2902,10 @@ def _resolve_smart_route(cfg, name: str) -> dict | None:
         i = _ROUTE_RR.get(name, 0)
         pick = candidates[i % len(candidates)]
         _ROUTE_RR[name] = i + 1
-    _ROUTE_SELECTIONS.setdefault(name, {})
     key = f"{pick.get('backend')}:{pick.get('model')}"
-    _ROUTE_SELECTIONS[name][key] = _ROUTE_SELECTIONS[name].get(key, 0) + 1
+    sel = _ROUTE_SELECTIONS.get(name) or {}
+    sel[key] = int(sel.get(key) or 0) + 1
+    _ROUTE_SELECTIONS[name] = sel
     return pick
 
 
@@ -3023,7 +2986,10 @@ class _GuardrailBlocked(Exception):
 # budgets, cost tracking, guardrails, response cache all apply).
 # Results: data/batch-<id>.jsonl; manifest in memory + on disk.
 
-_BATCHES: dict[str, dict[str, Any]] = {}
+# Batch registry rides the storage backend (a shared backend shows the
+# batch list cluster-wide; results JSONL + the manifest still persist
+# under data/).
+_BATCHES = NamespaceDict("batches")
 _BATCH_CONCURRENCY = 4
 _BATCHES_MANIFEST = None  # lazily data/batches.json
 
@@ -3084,10 +3050,12 @@ async def _run_batch(batch_id: str, model: str,
         logger.warning("batch results write failed", exc_info=True)
     m = _BATCHES.get(batch_id)
     if m:
-        m["status"] = "completed"
-        m["completed"] = sum(1 for r in results if r["status"] == "completed")
-        m["failed"] = sum(1 for r in results if r["status"] == "failed")
-        m["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        m = {**m,
+             "status": "completed",
+             "completed": sum(1 for r in results if r["status"] == "completed"),
+             "failed": sum(1 for r in results if r["status"] == "failed"),
+             "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        _BATCHES[batch_id] = m
         _batch_save_manifest()
     logger.info("batch %s done: %d ok, %d failed", batch_id,
                 m["completed"] if m else 0, m["failed"] if m else 0)
@@ -4222,7 +4190,9 @@ async def admin_verify(request: Request) -> Response:
 # and alerts (event ring + optional webhook POST) on the OK→FAIL
 # transition once the threshold is crossed — plus a recovery notice.
 
-_VERIFY_STATE: dict[str, dict[str, Any]] = {}  # "backend:model" → {fails, alerting}
+# Consecutive-failure tracking rides the storage backend (shared alert
+# state across replicas — only one replica alerts on a transition).
+_VERIFY_STATE = NamespaceDict("verify_state")  # "backend:model" → {fails, alerting}
 _VERIFY_LAST_RUN: str = ""
 _VERIFY_SCHED_TASK: asyncio.Task | None = None
 
@@ -4271,14 +4241,17 @@ async def _process_verify_results(cfg, results: list[dict[str, Any]]) -> None:
                        {"type": "verify_recovered", "target": key})
             _VERIFY_STATE[key] = {"fails": 0, "alerting": False}
             continue
-        st = _VERIFY_STATE.setdefault(key, {"fails": 0, "alerting": False})
-        st["fails"] = int(st.get("fails") or 0) + 1
-        if st["fails"] >= threshold and not st.get("alerting"):
-            st["alerting"] = True
-            _alert(f"verify: {key} failing {st['fails']}x — {detail[:120]}",
+        # read-modify-write (backend-visible, never in-place mutation)
+        st = _VERIFY_STATE.get(key) or {"fails": 0, "alerting": False}
+        fails = int(st.get("fails") or 0) + 1
+        alerting = bool(st.get("alerting"))
+        if fails >= threshold and not alerting:
+            alerting = True
+            _alert(f"verify: {key} failing {fails}x — {detail[:120]}",
                    {"type": "verify_failing", "target": key,
-                    "consecutive_failures": st["fails"],
+                    "consecutive_failures": fails,
                     "detail": detail[:200]})
+        _VERIFY_STATE[key] = {"fails": fails, "alerting": alerting}
 
 
 async def _verify_scheduler_loop() -> None:

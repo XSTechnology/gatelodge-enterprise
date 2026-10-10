@@ -1,61 +1,65 @@
 """Composable auth middleware — the enterprise-fork extension point.
 
-The core auth pipeline is: bearer resolution → rate limit → admin gate.
+The app's middleware delegates EVERY request to the ACTIVE pipeline
+(get_auth_pipeline()). The core default pipeline is:
+
+    resolve_key_link   — bearer → key_id; 401 when keys are configured
+                         and the token doesn't match; open mode passes
+    admin_gate_link    — /admin/* requires an admin key (403 otherwise)
+    rate_limit_link    — per-key RPM sliding window (429 on over-limit)
+
 Each link is a standalone function that either passes (returns None) or
-short-circuits (returns a JSONResponse). The middleware assembles them
-in order. The enterprise fork inserts additional links (SSO/OIDC token
-validation, RBAC permission checks, tenant resolution) between the
-existing ones WITHOUT modifying the core.
+short-circuits (returns a JSONResponse). The middleware wraps short-
+circuits with the request-id header and never calls the endpoint.
 
-Link contract:
-    async def link(request, cfg, key_id) -> JSONResponse | None
-        - Returns None to pass to the next link
-        - Returns a JSONResponse to short-circuit (the caller wraps it
-          with the request ID header)
+Link contract (sync OR async — async links are awaited):
+    def link(cfg, request, key_id) -> JSONResponse | None | Awaitable[...]
+Links may update the request identity via _REQUEST_KEY_ID (resolve
+does); the pipeline re-reads it between links.
 
-The core pipeline:
-    _resolve_key_link     — bearer token → key_id ('' when unknown)
-    _rate_limit_link      — per-key RPM check (429 on over-limit)
-    _admin_gate_link      — /admin/* requires an admin key (403 otherwise)
+Enterprise usage — insert SSO/OIDC and RBAC links, zero core changes:
 
-Enterprise insertion points:
-    AFTER _resolve_key_link, BEFORE _rate_limit_link:
-        SSO/OIDC validation, tenant resolution
-    AFTER _rate_limit_link, BEFORE _admin_gate_link:
-        RBAC permission checks (role-scoped admin keys)
-
-Usage:
-    from .auth import AuthPipeline, resolve_key_link, rate_limit_link, admin_gate_link
-
-    # Core (default):
-    pipeline = AuthPipeline([resolve_key_link, rate_limit_link, admin_gate_link])
-
-    # Enterprise:
+    from gateway.auth import (AuthPipeline, resolve_key_link,
+                              admin_gate_link, rate_limit_link,
+                              set_auth_pipeline)
     from gateway_enterprise.auth import sso_link, rbac_link
-    pipeline = AuthPipeline([
+
+    set_auth_pipeline(AuthPipeline([
         resolve_key_link, sso_link, rbac_link,
-        rate_limit_link, admin_gate_link,
-    ])
+        admin_gate_link, rate_limit_link,
+    ]))
+
+State: per-key rate windows ride the swappable StorageBackend
+(namespace "rate_windows") — a shared backend (RedisStorage) gives
+multi-replica rate limiting for free. Timestamps are EPOCH seconds so
+stamps from different processes are comparable.
+
+Identity: the request ContextVars live HERE (single definition).
+gateway/app.py imports _REQUEST_KEY_ID/_REQUEST_ID from this module —
+do not redefine them elsewhere: contextvars with the same NAME are
+still distinct objects, and two definitions silently stop sharing
+state.
 """
 from __future__ import annotations
 
 import asyncio
-import collections
 import contextvars
 import hashlib
 import hmac
-import json
 import logging
 import time
-import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from .storage import get_storage
+
 logger = logging.getLogger(__name__)
 
-# ContextVars set by the pipeline, read by the rest of the gateway
+# Request identity ContextVars — set by the auth pipeline (key) and the
+# middleware (request id); read by logging, budgets, metrics, cost.
+# THE definition — app.py imports these (see module docstring).
 _REQUEST_KEY_ID = contextvars.ContextVar("gw_request_key", default="")
 _REQUEST_ID = contextvars.ContextVar("gw_request_id", default="")
 
@@ -64,30 +68,32 @@ def _sha256_hex(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-# ── Core auth links ────────────────────────────────────────────────────────
+# ── core auth links ────────────────────────────────────────────────────────
 
 def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     """Link 1: resolve the bearer token to a key_id.
 
     Any configured key (gateway_keys = admin, api_keys = virtual)
-    enables bearer auth. gateway_keys accept plaintext OR sha256-hex.
-    Virtual keys are hash-compared (constant-time).
+    enables bearer auth; gateway_keys accept plaintext OR sha256-hex.
+    Virtual keys are hash-compared (constant-time). When NO keys are
+    configured (open mode) everything passes with key_id=''.
 
-    Sets _REQUEST_KEY_ID on success; returns 401 on failure.
-    """
+    Sets _REQUEST_KEY_ID; returns 401 when keys are configured and the
+    token is missing/unknown."""
+    if not (cfg.gateway_keys or cfg.api_keys):
+        _REQUEST_KEY_ID.set("")  # open mode — no keys configured
+        return None
     auth = request.headers.get("authorization") or ""
     token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-
     resolved = _resolve_bearer(cfg, token)
+    _REQUEST_KEY_ID.set(resolved)
     if not resolved:
-        _REQUEST_KEY_ID.set("")
         return JSONResponse(
             status_code=401,
             content={"error": {
                 "message": "missing or invalid API key",
                 "type": "invalid_request_error", "param": None,
                 "code": "invalid_api_key"}})
-    _REQUEST_KEY_ID.set(resolved)
     return None
 
 
@@ -111,9 +117,46 @@ def _resolve_bearer(cfg, token: str) -> str:
     return ""
 
 
+def admin_gate_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
+    """Link 2: /admin/* requires an admin key (gateway_keys). Virtual
+    keys are CONSUMER keys — 403 on the admin surface. Open mode (no
+    keys configured) keeps /admin open."""
+    if key_id == "admin":
+        return None
+    if not request.url.path.startswith("/admin"):
+        return None
+    if not key_id:
+        return None  # open mode — /admin stays open
+    return JSONResponse(
+        status_code=403,
+        content={"error": {
+            "message": "admin endpoints require a gateway admin key",
+            "type": "invalid_request_error", "param": None,
+            "code": "admin_key_required"}})
+
+
+def _key_rate_limit(key_id: str, rpm: int) -> float:
+    """Record a request for key_id against its rpm limit. Returns 0.0
+    when allowed, else the seconds until the oldest admitted request
+    leaves the 60s window (Retry-After). Denied requests are NOT
+    recorded (the window counts admissions). Window state rides the
+    storage backend (namespace "rate_windows"); EPOCH timestamps so a
+    shared backend sees comparable stamps across replicas."""
+    now = time.time()
+    st = get_storage()
+    win = [t for t in (st.get("rate_windows", key_id) or [])
+           if now - t <= 60.0]
+    if len(win) >= rpm:
+        return max(0.0, 60.0 - (now - win[0]))
+    win.append(now)
+    st.set("rate_windows", key_id, win)
+    return 0.0
+
+
 def rate_limit_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
-    """Link 2: per-key RPM (requests/minute, sliding 60s window).
-    Admin keys and open mode are unlimited. Returns 429 on over-limit."""
+    """Link 3: per-key RPM (requests/minute, sliding 60s window) on the
+    serving surface. Admin keys and open mode are unlimited. Returns 429
+    on over-limit."""
     if not key_id or key_id == "admin":
         return None
     if not request.url.path.startswith("/v1/"):
@@ -122,12 +165,7 @@ def rate_limit_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     rpm = int(entry.get("rate_limit_rpm") or 0)
     if rpm <= 0:
         return None
-    # NOTE: the rate window lives in app.py's _RATE_WINDOWS; this link
-    # delegates to the module-level _key_rate_limit function there.
-    # The indirection is deliberate: the storage backend is swappable,
-    # and the link doesn't care where the window lives.
-    from . import app as _app
-    retry_after = _app._key_rate_limit(key_id, rpm)
+    retry_after = _key_rate_limit(key_id, rpm)
     if retry_after > 0:
         return JSONResponse(
             status_code=429,
@@ -140,40 +178,28 @@ def rate_limit_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     return None
 
 
-def admin_gate_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
-    """Link 3: /admin/* requires an admin key (gateway_keys). Virtual
-    keys are CONSUMER keys — 403 on the admin surface."""
-    if key_id == "admin":
-        return None
-    if not request.url.path.startswith("/admin"):
-        return None
-    if not key_id:
-        return None  # open mode (no keys configured) — /admin stays open
-    return JSONResponse(
-        status_code=403,
-        content={"error": {
-            "message": "admin endpoints require a gateway admin key",
-            "type": "invalid_request_error", "param": None,
-            "code": "admin_key_required"}})
+# ── pipeline assembly ──────────────────────────────────────────────────────
 
-
-# ── Pipeline assembly ──────────────────────────────────────────────────────
-
-AuthLink = Callable[[Any, Request, str], JSONResponse | None]
+AuthLink = Callable[[Any, Request, str], Any]
 
 
 class AuthPipeline:
     """Ordered chain of auth links. Each link receives (cfg, request,
-    key_id) and either passes (None) or short-circuits (JSONResponse).
-    The first non-None response wins; the request never reaches the
-    endpoint.
+    key_id) and either passes (None) or short-circuits (a JSONResponse,
+    or an awaitable of one for async links). The first non-None response
+    wins; the request never reaches the endpoint.
 
     Enterprise constructs a different pipeline with additional links —
     the core pipeline is the DEFAULT, not a hardcoded path."""
 
     def __init__(self, links: list[AuthLink] | None = None):
-        self.links = links or [resolve_key_link, rate_limit_link,
-                               admin_gate_link]
+        # Default order matches the historical middleware exactly:
+        # authenticate → admin gate → rate limit. (/admin and /v1 are
+        # disjoint prefixes, so core-link order is behavior-neutral —
+        # but keep it stable: enterprise links may care, e.g. an RBAC
+        # link must see the resolved key_id.)
+        self.links = links or [resolve_key_link, admin_gate_link,
+                               rate_limit_link]
 
     async def run(self, request: Request, cfg) -> JSONResponse | None:
         """Run all links in order. Returns the first short-circuit
@@ -181,24 +207,28 @@ class AuthPipeline:
         key_id = _REQUEST_KEY_ID.get()  # may be pre-set by an earlier link
         for link in self.links:
             result = link(cfg, request, key_id)
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                result = await result
             if result is not None:
                 return result
             key_id = _REQUEST_KEY_ID.get()  # links may update it
         return None
 
 
-# The core pipeline (module-level for import by the middleware)
+# The core pipeline (module-level singleton the middleware runs)
 _core_pipeline = AuthPipeline()
 
 
 def get_auth_pipeline() -> AuthPipeline:
-    """The active auth pipeline. Core: resolve → rate limit → admin gate.
-    Enterprise: set_auth_pipeline(AuthPipeline([...extended links...]))."""
+    """The active auth pipeline. Core default: resolve → admin gate →
+    rate limit. Enterprise: set_auth_pipeline(AuthPipeline([...]))."""
     return _core_pipeline
 
 
 def set_auth_pipeline(pipeline: AuthPipeline) -> None:
-    """Swap the auth pipeline (enterprise: add SSO/RBAC links)."""
+    """Swap the auth pipeline (enterprise: add SSO/RBAC links). Takes
+    effect on the NEXT request — the middleware runs whatever is
+    active."""
     global _core_pipeline
     _core_pipeline = pipeline
     logger.info("auth pipeline swapped (%d links)", len(pipeline.links))
