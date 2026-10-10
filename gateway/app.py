@@ -86,6 +86,7 @@ import hashlib
 import itertools
 import json
 import logging
+import random
 import re
 import secrets
 import struct
@@ -386,6 +387,7 @@ _METRIC_LABELS: dict[str, tuple[str, ...]] = {
     "gateway_tokens_total": ("backend", "model"),
     "gateway_cost_usd_total": ("backend",),
     "gateway_requests_by_key_total": ("key",),
+    "gateway_guardrail_blocks_total": ("rule",),
 }
 _METRICS: dict[str, dict[tuple, float]] = {n: {} for n in _METRIC_LABELS}
 _METRIC_CARDINALITY_CAP = 1000
@@ -416,13 +418,15 @@ def _metrics_text() -> str:
         "gateway_tokens_total": "Total tokens by backend/model.",
         "gateway_cost_usd_total": "Estimated provider cost (USD) by backend.",
         "gateway_requests_by_key_total": "Requests by consuming key.",
+        "gateway_guardrail_blocks_total": "Guardrail rule violations.",
     }
     types = {"gateway_requests_total": "counter",
              "gateway_request_ms_sum": "counter",
              "gateway_request_ms_count": "counter",
              "gateway_tokens_total": "counter",
              "gateway_cost_usd_total": "counter",
-             "gateway_requests_by_key_total": "counter"}
+             "gateway_requests_by_key_total": "counter",
+             "gateway_guardrail_blocks_total": "counter"}
     out: list[str] = []
     for name, label_names in _METRIC_LABELS.items():
         out.append(f"# HELP {name} {helps[name]}")
@@ -1067,6 +1071,25 @@ async def list_models() -> dict[str, Any]:
             "chain": chain,
             "hedge_s": float(alias.get("hedge_s") or 0),
             "local_only": bool(alias.get("local_only")),
+        })
+
+    # ── smart routes (tier E) ────────────────────────────────────────
+    for name, route in (getattr(cfg, "smart_routes", None) or {}).items():
+        candidates = route.get("candidates") or []
+        if not candidates:
+            continue
+        first = candidates[0]
+        _add({
+            "id": name,
+            "object": "model",
+            "created": 0,
+            "owned_by": "smart-route",
+            "capabilities": ["chat", "completions", "smart_routing"],
+            "backend_type": f"smart:{route.get('strategy') or 'round_robin'}",
+            "status": "available",
+            "local": False,
+            "candidates": [f"{c.get('backend')}:{c.get('model')}"
+                           for c in candidates if isinstance(c, dict)],
         })
 
     # ── backend models ───────────────────────────────────────────────
@@ -1742,12 +1765,14 @@ async def chat_completions(body: ChatRequest) -> Response:
     try:
         plan = cfg.resolve_chain(requested)
     except GatewayConfigError as e:
-        # Auto-discovery: any GGUF in models_dir is servable by its stem
-        # (aliases and config models already had their chance above).
-        if requested and EmbeddedEngine.resolve_gguf(requested, cfg.models_dir):
+        # Smart route? (aliases and backend models always win)
+        plan = _smart_route_fallback(cfg, requested)
+        if plan is None and requested and EmbeddedEngine.resolve_gguf(
+                requested, cfg.models_dir):
+            # Auto-discovery: any GGUF in models_dir is servable by its stem
             plan = {"entries": [(cfg.local_backend_name() or "local", requested)],
                     "hedge_s": 0.0, "local_only": False}
-        else:
+        if plan is None:
             _log_request(requested, "", body.stream,
                          int((time.perf_counter() - t0) * 1000), {}, 400)
             return _error(400, str(e), param="model", code="model_not_found")
@@ -1760,6 +1785,15 @@ async def chat_completions(body: ChatRequest) -> Response:
         _log_request(requested, "", body.stream,
                      int((time.perf_counter() - t0) * 1000), {}, 403)
         return denied
+
+    # Request guardrails (before the cache — a blocked prompt never
+    # serves a cached answer; streams included)
+    blocked = apply_request_guardrails(cfg, requested, body.messages)
+    if blocked is not None:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 400,
+                     err="guardrail")
+        return blocked
 
     # Response cache: simple repeated prompts answer from memory. Never
     # for local_only aliases (privacy guarantee) or when disabled in config.
@@ -1817,6 +1851,18 @@ async def chat_completions(body: ChatRequest) -> Response:
         except Exception as e:
             return _exec_error_response(e, requested, body.stream, t0)
         ms = int((time.perf_counter() - t0) * 1000)
+        # smart-routing latency bookkeeping (feeds the 'fastest' strategy)
+        _record_route_latency(winner, model_key, ms)
+        # response guardrails (non-stream only — streams are not buffered)
+        _content = str((((resp.get("choices") or [{}])[0])
+                        .get("message") or {}).get("content") or "")
+        _content, _blocked = apply_response_guardrails(cfg, _content)
+        if _blocked is not None:
+            _log_request(requested, winner, body.stream, ms, {}, 400,
+                         err="guardrail")
+            return _blocked
+        if _content:
+            resp["choices"][0]["message"]["content"] = _content
         resp.setdefault("served_by", {"backend": winner, "model": model_key,
                                       "ms": ms})
         if ckey:
@@ -2282,10 +2328,12 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     try:
         plan = cfg.resolve_chain(requested)
     except GatewayConfigError as e:
-        if requested and EmbeddedEngine.resolve_gguf(requested, cfg.models_dir):
+        plan = _smart_route_fallback(cfg, requested)
+        if (plan is None and requested
+                and EmbeddedEngine.resolve_gguf(requested, cfg.models_dir)):
             plan = {"entries": [(cfg.local_backend_name() or "local", requested)],
                     "hedge_s": 0.0, "local_only": False}
-        else:
+        if plan is None:
             _log_request(requested, "", body.stream,
                          int((time.perf_counter() - t0) * 1000), {}, 400)
             return _error(400, str(e), param="model", code="model_not_found")
@@ -2299,6 +2347,18 @@ async def legacy_completions(body: CompletionRequest) -> Response:
         _log_request(requested, "", body.stream,
                      int((time.perf_counter() - t0) * 1000), {}, 403)
         return denied
+
+    # Request guardrails (completions: prompt is raw text)
+    blocked = apply_request_guardrails(
+        cfg, requested, [{"role": "user", "content": body.prompt}
+                         if isinstance(body.prompt, str)
+                         else {"role": "user",
+                               "content": " ".join(body.prompt)}])
+    if blocked is not None:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 400,
+                     err="guardrail")
+        return blocked
 
     # Per-key monthly budgets (tokens + USD)
     over = _key_budget_gate(cfg)
@@ -2618,6 +2678,640 @@ async def images_generations(request: Request) -> Response:
     _log_request(requested, backend_name, False,
                  int((time.perf_counter() - t0) * 1000), {}, 200)
     return JSONResponse(data)
+
+
+# ── tier E: guardrails ─────────────────────────────────────────────────────
+
+_GUARDRAIL_VIOLATIONS: dict[str, int] = {}   # rule name → total violations
+
+# Built-in prompt-injection heuristics (v1: pattern-based; the webhook
+# policy engine handles anything deeper)
+_INJECTION_PATTERNS = [
+    r"(?i)ignore\s+(all\s+)?(previous|prior|above|earlier)\s+"
+    r"(instructions|prompts?|rules|messages)",
+    r"(?i)disregard\s+(the\s+)?(above|previous|prior|earlier)",
+    r"(?i)forget\s+(everything|all|your)\s+"
+    r"(above|previous|prior|instructions|training)",
+    r"(?i)you\s+are\s+now\s+(a|an)\s+",
+    r"(?i)(reveal|show|print|repeat|output)\s+(your|the)\s+"
+    r"(system\s+)?(prompt|instructions|rules)",
+    r"(?i)(developer|DAN)\s+mode|jailbreak",
+    r"<\|?(im_start|im_end|system)\|>",
+]
+
+_GUARDRAIL_COMPILED: dict[str, "re.Pattern"] = {}
+
+
+def _guardrail_re(pattern: str):
+    if pattern not in _GUARDRAIL_COMPILED:
+        try:
+            _GUARDRAIL_COMPILED[pattern] = re.compile(pattern)
+        except re.error:
+            return None
+    return _GUARDRAIL_COMPILED[pattern]
+
+
+def reset_guardrail_state() -> None:
+    """Drop violation counters (tests)."""
+    _GUARDRAIL_VIOLATIONS.clear()
+
+
+def _rule_violated(rule: dict, text: str) -> str | None:
+    """Check one rule against text; returns the violation reason or None."""
+    rtype = rule.get("type")
+    if rtype == "pattern":
+        rx = _guardrail_re(rule.get("pattern") or "")
+        if rx and rx.search(text):
+            return rule.get("message") or f"matched pattern {rule['name']!r}"
+    elif rtype == "prompt_injection":
+        for pat in _INJECTION_PATTERNS:
+            rx = _guardrail_re(pat)
+            if rx and rx.search(text):
+                return (rule.get("message")
+                        or f"prompt-injection pattern matched: {pat[:50]}")
+    elif rtype == "json":
+        try:
+            json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return rule.get("message") or "response is not valid JSON"
+    return None
+
+
+def _messages_text(messages: list) -> str:
+    """Concatenate all text content of a message list (for scanning)."""
+    parts: list[str] = []
+    for m in messages or []:
+        if isinstance(m, dict):
+            c = m.get("content")
+            if isinstance(c, str):
+                parts.append(c)
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and isinstance(b.get("text"), str):
+                        parts.append(b["text"])
+    return "\n".join(parts)
+
+
+def _guardrail_hit(rule_name: str) -> None:
+    _GUARDRAIL_VIOLATIONS[rule_name] = _GUARDRAIL_VIOLATIONS.get(rule_name, 0) + 1
+    _metric_inc("gateway_guardrail_blocks_total", (rule_name,))
+
+
+def apply_request_guardrails(cfg, model: str,
+                             messages: list) -> Response | None:
+    """Pre-execution guardrails: request rules over the concatenated
+    message text + the external policy webhook. Returns a 400 response
+    when a block-action rule fires; None when the request may proceed.
+    Runs BEFORE the response cache (a blocked prompt never serves a
+    cached answer)."""
+    g = cfg.guardrails or {}
+    if not g.get("enabled"):
+        return None
+    text = _messages_text(messages)
+    for rule in g.get("request_rules") or []:
+        why = _rule_violated(rule, text)
+        if why:
+            _guardrail_hit(rule["name"])
+            if rule.get("action") == "block":
+                logger.warning("guardrail %s blocked request: %s",
+                               rule["name"], why[:120])
+                return _error(400, f"guardrail {rule['name']!r}: {why}",
+                              err_type="guardrail_violation",
+                              code=rule["name"])
+            # log/redact actions on REQUESTS = observe only
+    url = g.get("webhook_url")
+    if url:
+        payload = {"direction": "request", "model": model,
+                   "key": _REQUEST_KEY_ID.get() or "(open)",
+                   "text": text[:8000]}
+        verdict = _guardrail_webhook(url, g, payload)
+        if verdict is not None and not verdict[0]:
+            _guardrail_hit("webhook")
+            logger.warning("guardrail webhook blocked request: %s",
+                           verdict[1][:120])
+            return _error(400, f"guardrail webhook: {verdict[1]}",
+                          err_type="guardrail_violation", code="webhook")
+    return None
+
+
+def apply_response_guardrails(cfg, content: str) -> tuple[str, Response | None]:
+    """Post-generation guardrails: response rules over the reply text.
+    Returns (possibly redacted content, error-response-or-None). Block
+    rules return a 400 — the generation is discarded (that is the point).
+    Only applied to NON-STREAMING responses (streams are not buffered)."""
+    g = cfg.guardrails or {}
+    if not g.get("enabled"):
+        return content, None
+    for rule in g.get("response_rules") or []:
+        why = _rule_violated(rule, content)
+        if why:
+            _guardrail_hit(rule["name"])
+            action = rule.get("action")
+            if action == "redact" and rule.get("type") == "pattern":
+                rx = _guardrail_re(rule.get("pattern") or "")
+                if rx:
+                    content = rx.sub(rule.get("replacement") or "[REDACTED]",
+                                     content)
+                    logger.info("guardrail %s redacted response content",
+                                rule["name"])
+            elif action == "block":
+                logger.warning("guardrail %s blocked response: %s",
+                               rule["name"], why[:120])
+                return content, _error(
+                    400, f"guardrail {rule['name']!r}: {why}",
+                    err_type="guardrail_violation", code=rule["name"])
+            # log action: observed only
+    url = g.get("webhook_url")
+    if url:
+        payload = {"direction": "response",
+                   "key": _REQUEST_KEY_ID.get() or "(open)",
+                   "text": content[:8000]}
+        verdict = _guardrail_webhook(url, g, payload)
+        if verdict is not None and not verdict[0]:
+            _guardrail_hit("webhook")
+            return content, _error(
+                400, f"guardrail webhook: {verdict[1]}",
+                err_type="guardrail_violation", code="webhook")
+    return content, None
+
+
+def _guardrail_webhook(url: str, g: dict,
+                       payload: dict) -> tuple[bool, str] | None:
+    """Call the external policy engine. Returns (allow, reason) or None
+    on failure (fail-open) / disabled. Sync httpx — guardrail calls sit
+    in the request path and must be fast."""
+    try:
+        r = httpx.post(url, json=payload,
+                       timeout=float(g.get("webhook_timeout_s") or 10))
+        if r.status_code == 200:
+            d = r.json()
+            return (bool(d.get("allow", True)),
+                    str(d.get("reason") or "denied by policy"))
+        return None if g.get("webhook_fail_open", True) else (False, f"webhook HTTP {r.status_code}")
+    except Exception:  # noqa: BLE001 — fail-open per config
+        if g.get("webhook_fail_open", True):
+            logger.warning("guardrail webhook unreachable — fail-open",
+                           exc_info=True)
+            return None
+        return (False, "webhook unreachable (fail-closed)")
+
+
+@app.get("/admin/guardrails")
+async def admin_guardrails() -> Response:
+    """Guardrail configuration + live violation counts."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    return {"guardrails": cfg.guardrails,
+            "violations": dict(_GUARDRAIL_VIOLATIONS)}
+
+
+# ── tier E: smart routing ──────────────────────────────────────────────────
+
+_ROUTE_LATENCY: dict[str, dict[str, float]] = {}   # "b:m" → {ewma_ms, n}
+_ROUTE_SELECTIONS: dict[str, dict[str, int]] = {}  # route → {b:m: count}
+_ROUTE_RR: dict[str, int] = {}                     # round-robin counters
+
+
+def reset_route_state() -> None:
+    """Drop routing trackers (tests)."""
+    _ROUTE_LATENCY.clear()
+    _ROUTE_SELECTIONS.clear()
+    _ROUTE_RR.clear()
+
+
+def _record_route_latency(backend: str, model: str, ms: float) -> None:
+    """EWMA latency per backend:model — feeds the 'fastest' strategy."""
+    key = f"{backend}:{model}"
+    st = _ROUTE_LATENCY.setdefault(key, {"ewma_ms": ms, "n": 0})
+    st["n"] += 1
+    st["ewma_ms"] = st["ewma_ms"] * 0.7 + ms * 0.3
+
+
+def _candidate_price(cfg, cand: dict) -> float:
+    """Cheapest-strategy score: avg in+out $/Mtok from cached pricing."""
+    b = cfg.backends.get(cand.get("backend")) or {}
+    wire = str((b.get("models") or {}).get(cand.get("model"))
+               or cand.get("model") or "")
+    p = (cfg.model_prices or {}).get(cand.get("backend"), {}).get(wire)
+    if not p:
+        return float("inf")
+    return (float(p.get("in") or 0) + float(p.get("out") or 0)) / 2
+
+
+def _resolve_smart_route(cfg, name: str) -> dict | None:
+    """Smart route name → chosen candidate {backend, model, weight}.
+    Aliases and backend models always win (checked by the caller first).
+    Returns None when the name is not a smart route."""
+    route = (getattr(cfg, "smart_routes", None) or {}).get(name)
+    if not route:
+        return None
+    candidates = route.get("candidates") or []
+    if not candidates:
+        return None
+    strategy = route.get("strategy") or "round_robin"
+    if strategy == "cheapest":
+        priced = [c for c in candidates if _candidate_price(cfg, c) < float("inf")]
+        pool = priced or candidates
+        pick = min(pool, key=lambda c: _candidate_price(cfg, c))
+    elif strategy == "fastest":
+        if not any(f"{c['backend']}:{c['model']}" in _ROUTE_LATENCY
+                   for c in candidates):
+            pick = candidates[0]  # cold start — explore the first
+        else:
+            pick = min(candidates, key=lambda c: _ROUTE_LATENCY.get(
+                f"{c['backend']}:{c['model']}", {}).get("ewma_ms", float("inf")))
+    elif strategy in ("weighted", "canary"):
+        weights = [max(0.0, float(c.get("weight") or 1.0))
+                   for c in candidates]
+        pick = random.choices(candidates, weights=weights, k=1)[0]
+    else:  # round_robin
+        i = _ROUTE_RR.get(name, 0)
+        pick = candidates[i % len(candidates)]
+        _ROUTE_RR[name] = i + 1
+    _ROUTE_SELECTIONS.setdefault(name, {})
+    key = f"{pick.get('backend')}:{pick.get('model')}"
+    _ROUTE_SELECTIONS[name][key] = _ROUTE_SELECTIONS[name].get(key, 0) + 1
+    return pick
+
+
+def _smart_route_fallback(cfg, requested: str) -> dict | None:
+    """Build a single-entry plan when `requested` names a smart route."""
+    pick = _resolve_smart_route(cfg, requested)
+    if pick is None:
+        return None
+    return {"entries": [(str(pick["backend"]), str(pick["model"]))],
+            "hedge_s": 0.0, "local_only": False}
+
+
+@app.get("/admin/routes")
+async def admin_routes() -> Response:
+    """Smart-route config + live stats (latency EWMA, selection counts)."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    routes = []
+    for name, r in (cfg.smart_routes or {}).items():
+        cands = []
+        for c in r.get("candidates") or []:
+            key = f"{c['backend']}:{c['model']}"
+            cands.append({
+                "backend": c["backend"], "model": c["model"],
+                "weight": c.get("weight", 1.0),
+                "ewma_ms": round(_ROUTE_LATENCY.get(key, {}).get("ewma_ms", 0)),
+                "selections": _ROUTE_SELECTIONS.get(name, {}).get(key, 0),
+            })
+        routes.append({"name": name, "strategy": r.get("strategy"),
+                       "candidates": cands})
+    return {"routes": routes}
+
+
+# ── tier E: shared internal executor (batch + evals) ──────────────────────
+
+async def _exec_chat_internal(cfg, model: str, messages: list,
+                              timeout_s: float = 300.0) -> dict[str, Any]:
+    """One chat completion through the full internal pipeline: smart
+    routes, request guardrails, chain execution (with backend budgets,
+    cost tracking, key attribution via the ambient ContextVar), response
+    guardrails. Raises on failure — callers decide how to record it.
+    Used by the Batch API and the eval harness; the HTTP endpoints have
+    their own richer paths (cache, streaming, queue admission)."""
+    plan = None
+    try:
+        plan = cfg.resolve_chain(model)
+    except GatewayConfigError:
+        plan = _smart_route_fallback(cfg, model)
+    if plan is None:
+        raise GatewayConfigError(f"unknown model {model!r}")
+    blocked = apply_request_guardrails(cfg, model, messages)
+    if blocked is not None:
+        raise _GuardrailBlocked(str(blocked.body, "utf-8", "replace")
+                                if isinstance(blocked.body, bytes)
+                                else str(blocked.body))
+    body = ChatRequest(model=model, messages=messages)
+    resp, winner, model_key = await asyncio.wait_for(
+        _exec_chain(cfg, plan["entries"], plan["hedge_s"], body, model),
+        timeout=timeout_s)
+    content = str((((resp.get("choices") or [{}])[0])
+                   .get("message") or {}).get("content") or "")
+    content, blocked = apply_response_guardrails(cfg, content)
+    if blocked is not None:
+        raise _GuardrailBlocked("response guardrail")
+    if content:
+        resp["choices"][0]["message"]["content"] = content
+    return resp
+
+
+class _GuardrailBlocked(Exception):
+    """Raised by _exec_chat_internal when a guardrule blocks (the JSON
+    body of the 400 is the message)."""
+
+
+# ── tier E: Batch API ──────────────────────────────────────────────────────
+# POST /v1/batches {model, requests: [{custom_id, messages}]} → async
+# execution at concurrency 4 through the full pipeline (auth context,
+# budgets, cost tracking, guardrails, response cache all apply).
+# Results: data/batch-<id>.jsonl; manifest in memory + on disk.
+
+_BATCHES: dict[str, dict[str, Any]] = {}
+_BATCH_CONCURRENCY = 4
+_BATCHES_MANIFEST = None  # lazily data/batches.json
+
+
+def reset_batch_state() -> None:
+    """Drop in-memory batch registry (tests)."""
+    _BATCHES.clear()
+
+
+def _batches_manifest_path() -> Path:
+    return _LOG_PATH.parent / "batches.json"
+
+
+def _batch_save_manifest() -> None:
+    try:
+        p = _batches_manifest_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        keep = sorted(_BATCHES.values(),
+                      key=lambda b: b.get("created", ""), reverse=True)[:50]
+        p.write_text(json.dumps(keep, indent=1), encoding="utf-8")
+    except OSError:
+        logger.warning("batch manifest write failed", exc_info=True)
+
+
+async def _run_batch(batch_id: str, model: str,
+                     requests: list[dict]) -> None:
+    sem = asyncio.Semaphore(_BATCH_CONCURRENCY)
+    cfg = get_gateway_config()
+
+    async def _one(req: dict, idx: int) -> dict:
+        cid = str(req.get("custom_id") or f"req-{idx}")
+        async with sem:
+            try:
+                resp = await _exec_chat_internal(
+                    cfg, model, req.get("messages") or [])
+                return {"custom_id": cid, "status": "completed",
+                        "response": resp}
+            except _GuardrailBlocked as e:
+                return {"custom_id": cid, "status": "failed",
+                        "error": {"message": f"guardrail: {e}",
+                                  "code": "guardrail_violation"}}
+            except Exception as e:  # noqa: BLE001 — one bad request
+                kind = (cloud.classify_error(e)
+                        if not isinstance(e, GatewayConfigError) else "client")
+                return {"custom_id": cid, "status": "failed",
+                        "error": {"message": str(e)[:300], "code": kind}}
+
+    results = await asyncio.gather(*[_one(r, i)
+                                     for i, r in enumerate(requests)])
+    # results file
+    try:
+        p = _LOG_PATH.parent / f"batch-{batch_id}.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
+    except OSError:
+        logger.warning("batch results write failed", exc_info=True)
+    m = _BATCHES.get(batch_id)
+    if m:
+        m["status"] = "completed"
+        m["completed"] = sum(1 for r in results if r["status"] == "completed")
+        m["failed"] = sum(1 for r in results if r["status"] == "failed")
+        m["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _batch_save_manifest()
+    logger.info("batch %s done: %d ok, %d failed", batch_id,
+                m["completed"] if m else 0, m["failed"] if m else 0)
+
+
+@app.post("/v1/batches")
+async def create_batch(request: Request) -> Response:
+    """Submit an async batch: {model, requests: [{custom_id, messages}]}.
+    Sub-requests execute at concurrency 4 through the FULL pipeline
+    (this key's identity, budgets, allowlists, guardrails, cost
+    tracking). Poll GET /v1/batches/{id}; results at .../results."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "invalid JSON body")
+    model = str(body.get("model") or "").strip()
+    requests = body.get("requests")
+    if not model:
+        return _error(400, "model is required", param="model")
+    if not isinstance(requests, list) or not requests:
+        return _error(400, "requests must be a non-empty array",
+                      param="requests")
+    if len(requests) > 500:
+        return _error(400, "max 500 requests per batch", param="requests")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    # resolve model (chain or smart route) + allowlist check up front
+    plan = None
+    try:
+        plan = cfg.resolve_chain(model)
+    except GatewayConfigError:
+        plan = _smart_route_fallback(cfg, model)
+    if plan is None:
+        _log_request(model, "", False, 0, {}, 400)
+        return _error(400, f"unknown model {model!r}", param="model",
+                      code="model_not_found")
+    denied = _key_model_gate(cfg, model, plan["entries"])
+    if denied is not None:
+        return denied
+    batch_id = f"batch-{uuid.uuid4().hex[:12]}"
+    _BATCHES[batch_id] = {
+        "id": batch_id, "model": model, "status": "in_progress",
+        "total": len(requests), "completed": 0, "failed": 0,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "creator": _REQUEST_KEY_ID.get() or "(open)",
+    }
+    _batch_save_manifest()
+    asyncio.create_task(_run_batch(batch_id, model, requests))
+    logger.info("batch %s submitted: %d requests for %s",
+                batch_id, len(requests), model)
+    return {"id": batch_id, "model": model, "status": "in_progress",
+            "total": len(requests),
+            "created": _BATCHES[batch_id]["created"]}
+
+
+@app.get("/v1/batches")
+async def list_batches() -> Response:
+    """Recent batches (in-memory registry, newest first)."""
+    rows = sorted(_BATCHES.values(),
+                  key=lambda b: b.get("created", ""), reverse=True)[:50]
+    return {"batches": rows}
+
+
+@app.get("/v1/batches/{batch_id}")
+async def get_batch(batch_id: str) -> Response:
+    m = _BATCHES.get(batch_id)
+    if not m:
+        return _error(404, f"batch {batch_id!r} not found "
+                           f"(registry is in-memory; results files persist "
+                           f"in the data dir)", param="batch_id",
+                      code="batch_not_found")
+    return m
+
+
+@app.get("/v1/batches/{batch_id}/results")
+async def get_batch_results(batch_id: str) -> Response:
+    m = _BATCHES.get(batch_id)
+    if not m or m.get("status") != "completed":
+        return _error(404, f"batch {batch_id!r} not found or not completed",
+                      param="batch_id", code="batch_not_found")
+    p = _LOG_PATH.parent / f"batch-{batch_id}.jsonl"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return _error(404, "results file missing", code="batch_not_found")
+    return Response(text, media_type="application/jsonl")
+
+
+# ── tier E: eval harness ───────────────────────────────────────────────────
+# POST /admin/evals/run {name, models: [...], prompts: [{id, messages,
+# expect_contains?, expect_not_contains?, expect_json?}]} → executes each
+# prompt × model through the internal pipeline, evaluates assertions,
+# saves a report to data/evals/<name>-<ts>.json, and diffs against the
+# previous run of the same name (drift: assertions that flipped).
+
+def _evals_dir() -> Path:
+    return _LOG_PATH.parent / "evals"
+
+
+@app.post("/admin/evals/run")
+async def admin_evals_run(request: Request) -> Response:
+    """Run a golden-prompt eval across models. Each prompt × model goes
+    through the full internal pipeline; assertions: expect_contains[],
+    expect_not_contains[], expect_json. Reports persist under
+    data/evals/; re-running the same name reports drift (assertions that
+    flipped since the previous run)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "invalid JSON body")
+    name = str(body.get("name") or "").strip()
+    models = [str(m).strip() for m in (body.get("models") or []) if str(m).strip()]
+    prompts = body.get("prompts")
+    if not name or not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name):
+        return _error(400, "eval name: letters/digits/dots/dashes, max 40",
+                      param="name")
+    if not models:
+        return _error(400, "models is required (non-empty array)",
+                      param="models")
+    if not isinstance(prompts, list) or not prompts:
+        return _error(400, "prompts is required (non-empty array)",
+                      param="prompts")
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+
+    # previous run (for drift)
+    prev = _eval_latest_results(name)
+
+    results: list[dict[str, Any]] = []
+    for model in models:
+        for p in prompts:
+            pid = str(p.get("id") or f"p{len(results)}")
+            t0 = time.perf_counter()
+            row: dict[str, Any] = {"model": model, "prompt_id": pid,
+                                   "pass": False, "failed_assertions": [],
+                                   "latency_ms": None,
+                                   "content_excerpt": ""}
+            try:
+                resp = await _exec_chat_internal(cfg, model,
+                                                 p.get("messages") or [])
+                content = str((((resp.get("choices") or [{}])[0])
+                               .get("message") or {}).get("content") or "")
+                row["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+                row["content_excerpt"] = content[:120]
+                failed = []
+                for s in (p.get("expect_contains") or []):
+                    if str(s) not in content:
+                        failed.append(f"expect_contains:{s[:40]}")
+                for s in (p.get("expect_not_contains") or []):
+                    if str(s) in content:
+                        failed.append(f"expect_not_contains:{s[:40]}")
+                if p.get("expect_json"):
+                    try:
+                        json.loads(content)
+                    except (json.JSONDecodeError, TypeError):
+                        failed.append("expect_json")
+                row["failed_assertions"] = failed
+                row["pass"] = not failed
+            except Exception as e:  # noqa: BLE001 — eval records failures
+                row["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+                row["failed_assertions"] = [f"error:{type(e).__name__}"]
+            results.append(row)
+
+    # summary per model
+    summary = {}
+    for model in models:
+        rows = [r for r in results if r["model"] == model]
+        summary[model] = {
+            "pass": sum(1 for r in rows if r["pass"]),
+            "fail": sum(1 for r in rows if not r["pass"]),
+            "avg_ms": round(sum(r["latency_ms"] or 0 for r in rows)
+                            / len(rows)) if rows else 0,
+        }
+    # drift vs previous run (same name): (model, prompt_id) pass flips
+    drift = []
+    if prev:
+        prev_map = {(r["model"], r["prompt_id"]): r["pass"] for r in prev}
+        for r in results:
+            key = (r["model"], r["prompt_id"])
+            if key in prev_map and prev_map[key] != r["pass"]:
+                drift.append({"model": r["model"], "prompt_id": r["prompt_id"],
+                              "change": ("pass→fail" if not r["pass"]
+                                         else "fail→pass")})
+    report = {"name": name, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "models": models, "results": results, "summary": summary,
+              "drift": drift}
+    try:
+        d = _evals_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}-{int(time.time() * 1000)}.json").write_text(
+            json.dumps(report, indent=1), encoding="utf-8")
+    except OSError:
+        logger.warning("eval report write failed", exc_info=True)
+    return report
+
+
+def _eval_latest_results(name: str) -> list | None:
+    """Results array of the most recent saved report for `name`."""
+    try:
+        files = sorted(_evals_dir().glob(f"{name}-*.json"))
+        if not files:
+            return None
+        return json.loads(files[-1].read_text(encoding="utf-8")).get("results")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+@app.get("/admin/evals")
+async def admin_evals_list() -> Response:
+    """Saved eval runs (name, timestamp, pass counts)."""
+    out = []
+    try:
+        for p in sorted(_evals_dir().glob("*.json")):
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                out.append({"name": d.get("name"), "ts": d.get("ts"),
+                            "models": d.get("models"),
+                            "summary": d.get("summary")})
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        pass
+    return {"evals": out[-50:]}
+
+
+@app.get("/admin/evals/{name}")
+async def admin_evals_get(name: str) -> Response:
+    """The most recent report for an eval name."""
+    files = sorted(_evals_dir().glob(f"{name}-*.json"))
+    if not files:
+        return _error(404, f"no eval runs named {name!r}", param="name",
+                      code="eval_not_found")
+    try:
+        return json.loads(files[-1].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return _error(502, f"report unreadable: {e}")
 
 
 # ── GET /healthz ───────────────────────────────────────────────────────────

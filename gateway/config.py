@@ -599,6 +599,83 @@ def _normalize_model_prices(raw: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _normalize_guardrails(raw: Any) -> dict[str, Any]:
+    """guardrails: {enabled, request_rules, response_rules, webhook_url,
+    webhook_timeout_s, webhook_fail_open}. Rule types: pattern (regex),
+    prompt_injection (built-in heuristics), json (response must parse).
+    Actions: block (400 guardrail_violation), redact (response rules —
+    replace matches), log (observe only). The optional webhook is an
+    external policy engine: POST {direction, model, key, text} →
+    {allow: bool, reason}; fail-open by default."""
+    g = raw if isinstance(raw, dict) else {}
+
+    def _rules(lst: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for r in (lst or []):
+            if not isinstance(r, dict):
+                continue
+            rtype = str(r.get("type") or "").strip()
+            if rtype not in ("pattern", "prompt_injection", "json"):
+                continue
+            out.append({
+                "name": str(r.get("name") or rtype)[:60],
+                "type": rtype,
+                "pattern": str(r.get("pattern") or ""),
+                "action": str(r.get("action") or "block").strip(),
+                "replacement": str(r.get("replacement") or "[REDACTED]"),
+                "message": str(r.get("message") or ""),
+            })
+        return out
+
+    try:
+        whto = max(1.0, float(g.get("webhook_timeout_s") or 10))
+    except (TypeError, ValueError):
+        whto = 10.0
+    return {
+        "enabled": bool(g.get("enabled", False)),
+        "request_rules": _rules(g.get("request_rules")),
+        "response_rules": _rules(g.get("response_rules")),
+        "webhook_url": str(g.get("webhook_url") or "").strip(),
+        "webhook_timeout_s": whto,
+        "webhook_fail_open": bool(g.get("webhook_fail_open", True)),
+    }
+
+
+def _normalize_smart_routes(raw: Any) -> dict[str, dict[str, Any]]:
+    """smart_routes: {name: {strategy, candidates}} — the tier E router.
+    Strategies: cheapest (via model_prices), fastest (via live latency
+    EWMA), round_robin, weighted/canary (weight fields). Candidates:
+    [{backend, model, weight?}]. A smart route name resolves when the
+    name matches NO alias or backend model (aliases win)."""
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, r in raw.items():
+        if not isinstance(r, dict):
+            continue
+        cands = []
+        for c in (r.get("candidates") or []):
+            if not isinstance(c, dict):
+                continue
+            b = str(c.get("backend") or "").strip()
+            m = str(c.get("model") or "").strip()
+            if not b or not m:
+                continue
+            try:
+                w = max(0.0, float(c.get("weight") or 1.0))
+            except (TypeError, ValueError):
+                w = 1.0
+            cands.append({"backend": b, "model": m, "weight": w})
+        if not cands:
+            continue
+        strategy = str(r.get("strategy") or "round_robin").strip()
+        if strategy not in ("cheapest", "fastest", "round_robin",
+                            "weighted", "canary"):
+            strategy = "round_robin"
+        out[str(name)] = {"strategy": strategy, "candidates": cands}
+    return out
+
+
 def _normalize_aliases(raw: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     if not isinstance(raw, dict):
@@ -719,6 +796,9 @@ class GatewayConfig:
         # Audit shipping (tier B)
         audit = raw.get("audit") if isinstance(raw.get("audit"), dict) else {}
         self.audit = {"webhook_url": str(audit.get("webhook_url") or "").strip()}
+        # Guardrails + smart routes (tier E)
+        self.guardrails = _normalize_guardrails(raw.get("guardrails"))
+        self.smart_routes = _normalize_smart_routes(raw.get("smart_routes"))
 
     def maybe_reload(self) -> bool:
         """Re-read the file when its mtime changed. True when reloaded."""
