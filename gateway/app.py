@@ -707,24 +707,30 @@ def _aggregate_lines(lines: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _scope_spend(scope: str) -> dict[str, float]:
     """{tokens, usd} this month for a spend scope — derived from the
-    current month's log, cached in memory; month rollover re-derives."""
+    current month's log, cached in memory; month rollover re-derives.
+
+    SHARED backends (multi-replica, tier D) never seed from the local
+    log: it holds only THIS replica's requests, so seeding would
+    undercount every other replica — the scope starts at 0 (accepted
+    cold-start drift; charges accumulate on the shared ledger)."""
     month = _month_key()
     led = _SPEND_LEDGER.get(scope)
     if led is not None and led.get("month") == month:
         return {"tokens": int(led.get("tokens") or 0),
                 "usd": float(led.get("usd") or 0.0)}
     _ensure_month_log()
-    kind, _, marker = scope.partition(":")
     tokens = 0
     usd = 0.0
-    for e in _iter_month_lines(month):
-        if kind == "backend":
-            if e.get("backend") != marker:
+    if not getattr(get_storage(), "shared", False):
+        kind, _, marker = scope.partition(":")
+        for e in _iter_month_lines(month):
+            if kind == "backend":
+                if e.get("backend") != marker:
+                    continue
+            elif e.get("key") != marker:
                 continue
-        elif e.get("key") != marker:
-            continue
-        tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
-        usd += float(e.get("cost_usd") or 0.0)
+            tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
+            usd += float(e.get("cost_usd") or 0.0)
     _SPEND_LEDGER[scope] = {"month": month, "tokens": tokens, "usd": usd}
     return {"tokens": tokens, "usd": usd}
 
@@ -3395,22 +3401,29 @@ async def admin_audit() -> Response:
 
 
 def _mutate_config(mutator, action: str = "config-mutation") -> None:
-    """Read-modify-write data/gateway_config.json (created from the built-in
-    defaults when absent), then force the process config to reload.
-    Every mutation lands in the audit trail with the caller's action."""
+    """Read-modify-write the ACTIVE config store (built-in defaults when
+    it has no config yet), then force the process config to reload.
+    Every mutation lands in the audit trail with the caller's action.
+
+    The write is optimistic-concurrent (tier D): the store version
+    observed at read time rides the save; on a lost race (another
+    writer — admin console or replica — committed first) the whole
+    read-modify-write retries ONCE against fresh state, then raises.
+    Two writers must never silently clobber each other."""
     cfg = get_gateway_config()
-    if cfg.path.is_file():
-        try:
-            raw = json.loads(cfg.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = default_config_raw()
+    for attempt in (1, 2):
+        version = cfg.store.version()
+        raw = cfg.store.load()
         if not isinstance(raw, dict):
             raw = default_config_raw()
+        mutator(raw)
+        if cfg.store.save(raw, expected_version=version):
+            break
+        logger.warning("config write race (attempt %d/2) — re-reading "
+                       "fresh state", attempt)
     else:
-        raw = default_config_raw()
-    mutator(raw)
-    cfg.path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        raise RuntimeError("config mutation lost the write race twice — "
+                           "reload the config and retry")
     cfg.reload_now()
     _audit_config(action)
 
@@ -3968,17 +3981,15 @@ async def console() -> Response:
 
 @app.get("/admin/config")
 async def admin_get_config() -> Response:
-    """Raw config text for the console editor (defaults when no file)."""
+    """Raw config text for the console editor (defaults when the store
+    has none). Reads through the ACTIVE store — file or database —
+    never around it via cfg.path."""
     cfg = get_gateway_config()
-    text = None
-    if cfg.path.is_file():
-        try:
-            text = cfg.path.read_text(encoding="utf-8")
-        except OSError:
-            text = None
-    if text is None:
-        text = json.dumps(default_config_raw(), indent=2)
-    return {"path": str(cfg.path), "text": text}
+    raw = cfg.store.load()
+    text = (json.dumps(raw, indent=2) if isinstance(raw, dict)
+            else json.dumps(default_config_raw(), indent=2))
+    return {"path": str(getattr(cfg.store, "path", "(config store)")),
+            "text": text}
 
 
 class ConfigPayload(BaseModel):
@@ -3989,7 +4000,10 @@ class ConfigPayload(BaseModel):
 
 @app.put("/admin/config")
 async def admin_put_config(payload: ConfigPayload) -> Response:
-    """Save the raw config text (validated as a JSON object) + reload now."""
+    """Save the raw config text (validated as a JSON object) through the
+    ACTIVE store + reload now. Wholesale replace — last write wins (the
+    read-modify-write mutations go through _mutate_config, which is
+    optimistic-concurrent)."""
     try:
         data = json.loads(payload.text)
     except json.JSONDecodeError as e:
@@ -3997,8 +4011,7 @@ async def admin_put_config(payload: ConfigPayload) -> Response:
     if not isinstance(data, dict):
         return _error(400, "config must be a JSON object", param="text")
     cfg = get_gateway_config()
-    cfg.path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.path.write_text(payload.text, encoding="utf-8")
+    cfg.store.save(data)
     cfg.reload_now()
     _audit_config("raw-config-put")
     return {"ok": True,
@@ -4298,15 +4311,13 @@ async def _start_verify_scheduler() -> None:
 
 def _migrate_plaintext_keys() -> None:
     """One-time rewrite: api_keys entries carrying a plaintext `key` in
-    the config FILE are replaced by their sha256 `key_hash` (the
-    plaintext is removed from disk). Idempotent — no entries with
+    the stored config are replaced by their sha256 `key_hash` (the
+    plaintext is removed from the store). Idempotent — no entries with
     plaintext → no write. Auth is unaffected: presented tokens are
     hashed and compared either way."""
     try:
         cfg = get_gateway_config()
-        if not cfg.path.is_file():
-            return
-        raw = json.loads(cfg.path.read_text(encoding="utf-8"))
+        raw = cfg.store.load()
         entries = raw.get("api_keys") if isinstance(raw, dict) else None
         if not isinstance(entries, list):
             return
