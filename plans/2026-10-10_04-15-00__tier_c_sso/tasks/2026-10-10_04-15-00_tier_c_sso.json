@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[tier-c-1] gateway_enterprise/identity.py: _SSO_IDENTITY ContextVar + get/set helpers (single definition) — self (tiny, everything imports it)",
+    "id": "tier-c-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[tier-c-2] gateway_enterprise/sso.py: SSOConfig parser, looks_like_oidc heuristic, introspect() async httpx, resolve_sso_role rules, storage-backed introspection cache — self (core module, links depend on its API)",
+    "id": "tier-c-2",
+    "status": "pending"
+  },
+  {
+    "content": "[tier-c-3] links.py: resolve_link dispatch wrapper (OIDC-shaped → SSO, else core resolve) + rbac_link identity-first role/audit extension — self (depends on tier-c-2 API)",
+    "id": "tier-c-3",
+    "status": "pending"
+  },
+  {
+    "content": "[tier-c-4] enterprise_main.py: swap resolve_key_link → resolve_link in wiring, keyring-load client_secret_env, fix docstring recipe ordering note — self (tiny, depends on tier-c-3)",
+    "id": "tier-c-4",
+    "status": "pending"
+  },
+  {
+    "content": "[tier-c-5] tests/test_enterprise_sso.py: ~14 cases per plan (monkeypatched introspection transport, no real HTTP) — self (must match exact APIs of 2-3)",
+    "id": "tier-c-5",
+    "status": "pending"
+  },
+  {
+    "content": "[tier-c-6] scripts/stub_idp.py dev stub + live verification on 8011 (curl matrix, cache check, no-sso regression), full suite, commit, context update — self (synthesis)",
+    "id": "tier-c-6",
+    "status": "pending"
+  }
+]

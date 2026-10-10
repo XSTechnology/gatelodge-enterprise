@@ -13,15 +13,16 @@ Seam recipe (fill in as the tiers land):
     from gateway_enterprise.redis_storage import RedisStorage
     set_storage(RedisStorage(url="redis://..."))
 
-    # tier C — SSO/OIDC in front of the admin gate. sso_link is still
-    # pending (tier C); C-lite's rbac_link is WIRED in main() below.
+    # tier C — SSO/OIDC admin auth (LANDED; wired in main() below).
+    # NOTE: SSO is NOT a link after the core resolve_key_link — the
+    # core resolver 401s unknown tokens before any later link runs.
+    # The enterprise resolve_link REPLACES it in the pipeline and
+    # dispatches OIDC-shaped bearers to SSO validation.
     from gateway.auth import (AuthPipeline, set_auth_pipeline,
-                              resolve_key_link, admin_gate_link,
-                              rate_limit_link)
-    from gateway_enterprise.links import sso_link, rbac_link
-    set_auth_pipeline(AuthPipeline([resolve_key_link, sso_link,
-                                    rbac_link, admin_gate_link,
-                                    rate_limit_link]))
+                              admin_gate_link, rate_limit_link)
+    from gateway_enterprise.links import rbac_link, resolve_link
+    set_auth_pipeline(AuthPipeline([resolve_link, rbac_link,
+                                    admin_gate_link, rate_limit_link]))
 
     # tier D — shared config
     from gateway import config as gw_config
@@ -34,6 +35,28 @@ serving behavior changes (never trust an unwired seam).
 """
 from __future__ import annotations
 
+import os
+
+
+def _load_sso_secret() -> None:
+    """sso.client_secret_env → OS keyring fallback (boot bridge, same
+    convention as the core's api_key_env bridge in gateway/__main__).
+    Runs once at startup — changing client_secret_env in the config
+    needs a restart. Never logs values."""
+    try:
+        import keyring
+        from gateway.config import get_gateway_config
+        raw = get_gateway_config().store.load()
+        sso = raw.get("sso") if isinstance(raw, dict) else None
+        sso = sso if isinstance(sso, dict) else {}
+        name = str(sso.get("client_secret_env") or "").strip()
+        if name and not os.environ.get(name):
+            val = keyring.get_password("Workshop", name)
+            if val:
+                os.environ[name] = val
+    except Exception:  # noqa: BLE001 — locked/missing keyring is fine
+        pass
+
 
 def main() -> None:
     # ── enterprise seam wiring (before serving) ────────────────────
@@ -45,15 +68,17 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    # C-lite LANDED: role-scoped admin keys. rbac_link enforces the
-    # role→admin-surface mapping from the config's admin_key_roles
-    # section (see gateway_enterprise/rbac.py). sso_link (tier C)
-    # slots in before rbac_link when it lands.
+    _load_sso_secret()
+
+    # C-lite LANDED: role-scoped admin keys (rbac_link — the
+    # role→admin-surface mapping from admin_key_roles).
+    # Tier C LANDED: SSO/OIDC admin auth (resolve_link — replaces the
+    # core resolver; dispatches OIDC-shaped bearers to introspection,
+    # delegates everything else untouched). See gateway_enterprise/.
     from gateway.auth import (AuthPipeline, admin_gate_link,
-                              rate_limit_link, resolve_key_link,
-                              set_auth_pipeline)
-    from gateway_enterprise.links import rbac_link
-    set_auth_pipeline(AuthPipeline([resolve_key_link, rbac_link,
+                              rate_limit_link, set_auth_pipeline)
+    from gateway_enterprise.links import rbac_link, resolve_link
+    set_auth_pipeline(AuthPipeline([resolve_link, rbac_link,
                                     admin_gate_link, rate_limit_link]))
 
     from gateway.__main__ import main as core_main
