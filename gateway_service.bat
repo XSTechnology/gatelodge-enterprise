@@ -1,5 +1,5 @@
 @echo off
-rem LLM Gateway service wrapper — restart loop with 5s backoff.
+rem Gatelodge service wrapper — restart loop with 5s backoff.
 rem
 rem Installed by scripts\install_autostart.ps1 as a LOGON-trigger
 rem scheduled task running as the current user. Logon (not AtStartup/

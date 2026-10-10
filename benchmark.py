@@ -1,4 +1,4 @@
-"""benchmark.py — LLM Gateway overhead measurement.
+"""benchmark.py — Gatelodge overhead measurement.
 
 Measures the delta between calling a cloud provider directly vs through
 the gateway (non-cached: unique prompts defeat the response cache).
@@ -54,7 +54,7 @@ async def bench_route(client: httpx.AsyncClient, url: str, model: str,
 
 
 async def main() -> None:
-    print(f"LLM Gateway overhead benchmark — {ROUNDS} rounds, unique prompts")
+    print(f"Gatelodge overhead benchmark — {ROUNDS} rounds, unique prompts")
     print(f"  gateway: {BASE}   model: {MODEL}\n")
 
     async with httpx.AsyncClient(timeout=120, verify=False) as client:

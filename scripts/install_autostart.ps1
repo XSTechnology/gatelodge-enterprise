@@ -1,5 +1,5 @@
-# LLM Gateway auto-start installer (tier A service packaging).
-# Creates a LOGON-trigger scheduled task "LLM Gateway" running as the
+# Gatelodge auto-start installer (tier A service packaging).
+# Creates a LOGON-trigger scheduled task "Gatelodge" running as the
 # CURRENT user (no elevation needed) that launches gateway_service.bat
 # (restart-loop wrapper). ExecutionTimeLimit is disabled — the default
 # 72-hour task kill would murder a long-running gateway.
@@ -11,7 +11,7 @@
 #
 # Usage:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_autostart.ps1
 $ErrorActionPreference = "Stop"
-$taskName = "LLM Gateway"
+$taskName = "Gatelodge"
 $repo = Split-Path -Parent $PSScriptRoot
 $bat = Join-Path $repo "gateway_service.bat"
 if (-not (Test-Path $bat)) { throw "gateway_service.bat not found: $bat" }

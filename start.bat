@@ -1,5 +1,5 @@
 @echo off
-rem LLM Gateway — serves http://127.0.0.1:8010/v1 (OpenAI-compatible)
+rem Gatelodge — serves http://127.0.0.1:8010/v1 (OpenAI-compatible)
 rem Config: data\gateway_config.json (hot-reloadable). Models: data\models.
 rem Auth: gateway_keys in the config (empty = open). Stop with Ctrl+C.
 cd /d "%~dp0"

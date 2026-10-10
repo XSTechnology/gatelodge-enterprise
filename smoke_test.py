@@ -1,4 +1,4 @@
-"""smoke_test.py — LLM Gateway release smoke test.
+"""smoke_test.py — Gatelodge release smoke test.
 
 Curls every endpoint class and asserts expected status codes. Run this
 after any deployment (start.bat, service install, exe) to confirm the
@@ -43,7 +43,7 @@ def main() -> int:
     passed = 0
     failed = 0
     t0 = time.perf_counter()
-    print(f"LLM Gateway smoke test — {BASE}")
+    print(f"Gatelodge smoke test — {BASE}")
     print("-" * 50)
     with httpx.Client(timeout=15) as c:
         for name, method, path, expected, body in checks:
