@@ -203,6 +203,45 @@ wheels = [
 ]
 
 [[package]]
+name = "gatelodge"
+version = "1.2.1"
+source = { virtual = "." }
+dependencies = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "huggingface-hub" },
+    { name = "keyring" },
+    { name = "llama-cpp-python" },
+    { name = "openai" },
+    { name = "pydantic" },
+    { name = "uvicorn" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "huggingface-hub", specifier = ">=1.32.0" },
+    { name = "keyring", specifier = ">=25.7.0" },
+    { name = "llama-cpp-python", url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" },
+    { name = "openai", specifier = ">=1.60" },
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "uvicorn", specifier = ">=0.30" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -550,45 +589,6 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.22.0" },
 ]
 provides-extras = ["server", "test", "dev", "all"]
-
-[[package]]
-name = "llm-gateway"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "huggingface-hub" },
-    { name = "keyring" },
-    { name = "llama-cpp-python" },
-    { name = "openai" },
-    { name = "pydantic" },
-    { name = "uvicorn" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "huggingface-hub", specifier = ">=1.32.0" },
-    { name = "keyring", specifier = ">=25.7.0" },
-    { name = "llama-cpp-python", url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" },
-    { name = "openai", specifier = ">=1.60" },
-    { name = "pydantic", specifier = ">=2.9" },
-    { name = "uvicorn", specifier = ">=0.30" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-]
 
 [[package]]
 name = "markupsafe"

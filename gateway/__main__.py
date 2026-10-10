@@ -1,4 +1,4 @@
-"""python -m gateway — run the LLM gateway.
+"""python -m gateway — run the Gatelodge gateway.
 
 Plain HTTP on the configured bind:port (default 127.0.0.1:8010) — the
 OpenAI client ecosystem targets http://localhost:8010/v1. Config lives
@@ -70,7 +70,7 @@ def main() -> None:
         scheme = "https"
 
     logger = logging.getLogger("gateway")
-    logger.info("LLM gateway starting on %s://%s:%d (models_dir: %s; models: %s)",
+    logger.info("Gatelodge starting on %s://%s:%d (models_dir: %s; models: %s)",
                 scheme, cfg.bind, cfg.port, cfg.models_dir,
                 ", ".join(cfg.local_models()) or "none")
     uvicorn.run(app, host=cfg.bind, port=cfg.port, log_level="info",
