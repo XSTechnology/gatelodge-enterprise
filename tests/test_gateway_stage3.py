@@ -153,6 +153,10 @@ def wired(tmp_path, monkeypatch):
         engine = gw_models.EmbeddedEngine(cfg)
         monkeypatch.setattr(gw_models, "_ENGINE", engine)
         monkeypatch.setattr(gw_app, "_LOG_PATH", tmp_path / "gateway_log.jsonl")
+        # audit chain head is per-process: reset when the log path moves
+        # (the head re-reads from the new file's tail on first write —
+        # chains stay per-file and tests stay isolated)
+        gw_app._AUDIT_CHAIN_HEAD = None
         return cfgfile, cfg, engine
     return _wire
 

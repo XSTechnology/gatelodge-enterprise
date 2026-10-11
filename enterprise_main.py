@@ -65,6 +65,21 @@ def _wire_tier_d() -> None:
             dsn=dsn, seed_file=gw_config.CONFIG_PATH))
 
 
+def _wire_scim() -> None:
+    """Mount the SCIM provisioning surface (gateway_enterprise/scim.py)
+    via the router seam when scim.enabled — boot-time mounting (section
+    changes need a restart; the token_hash hot-reloads per request)."""
+    from gateway import config as gw_config
+    from gateway.app import set_extra_router
+    raw = gw_config.get_gateway_config().store.load()
+    scim = raw.get("scim") if isinstance(raw, dict) else None
+    scim = scim if isinstance(scim, dict) else {}
+    if not scim.get("enabled"):
+        return
+    from gateway_enterprise.scim import build_router
+    set_extra_router(build_router(), prefix="/scim")
+
+
 def main() -> None:
     # ── enterprise seam wiring (before serving) ────────────────────
     # The core's main() configures logging, but the wiring below logs
@@ -78,6 +93,9 @@ def main() -> None:
     # Tier D: multi-replica shared state (the commercial tier —
     # governance itself is core now). No env vars = no-op.
     _wire_tier_d()
+
+    # v1.4: SCIM provisioning (router seam) — no-op unless scim.enabled.
+    _wire_scim()
 
     # The core's default pipeline (resolve_link → rbac_link →
     # admin_gate → rate_limit) carries governance; the core's boot
