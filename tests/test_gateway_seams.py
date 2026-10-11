@@ -195,3 +195,65 @@ def test_config_store_injection(tmp_path):
         assert gw_config.get_gateway_config().default_alias == "from-b-v2"
     finally:
         gw_config._CONFIG = original
+
+
+# ── extra-router seam (the fourth seam) ────────────────────────────────────
+
+def _probe_router():
+    from fastapi import APIRouter
+    r = APIRouter()
+
+    @r.get("/hello")
+    def _hello():
+        return {"surface": "probe"}
+
+    return r
+
+
+def test_extra_router_mounts_and_owns_auth(wired, gguf):
+    """set_extra_router mounts an enterprise surface whose routes SERVE
+    (through the same middleware — request ids echo) while SKIPPING the
+    core auth pipeline: its bearer is not a gateway credential (the
+    SCIM shape). With gateway keys configured, a bare request to the
+    mounted route still succeeds — the ROUTER owns its auth."""
+    wired(_secured_config(gguf))   # keys configured → pipeline active
+    gw_app.set_extra_router(_probe_router(), prefix="/probe")
+    try:
+        with TestClient(gw_app.app) as client:
+            r = client.get("/probe/hello")       # NO bearer at all
+            assert r.status_code == 200, r.text
+            assert r.json() == {"surface": "probe"}
+            assert r.headers.get("x-request-id")  # middleware still wraps
+            # outside the prefix, the core pipeline is untouched
+            r2 = client.get("/admin/stats")
+            assert r2.status_code == 401
+    finally:
+        gw_app.set_extra_router(None, prefix="/probe")
+
+
+def test_extra_router_replace_semantics(wired, gguf):
+    """A second call swaps the previous router: the new prefix serves,
+    and the STALE prefix falls back under the core pipeline (401 with
+    keys configured — the pipeline short-circuits before routing)."""
+    from fastapi import APIRouter
+    wired(_secured_config(gguf))
+    gw_app.set_extra_router(_probe_router(), prefix="/probe")
+    r2 = APIRouter()
+
+    @r2.get("/other")
+    def _other():
+        return {"surface": "two"}
+
+    gw_app.set_extra_router(r2, prefix="/second")
+    try:
+        with TestClient(gw_app.app) as client:
+            assert client.get("/second/other").status_code == 200
+            # the stale prefix no longer bypasses the pipeline — with
+            # keys configured that means 401 (with or without a bogus
+            # bearer), never the mounted route again
+            assert client.get("/probe/hello").status_code == 401
+            assert client.get("/probe/hello",
+                              headers={"Authorization": "Bearer x"}
+                              ).status_code == 401
+    finally:
+        gw_app.set_extra_router(None, prefix="/second")

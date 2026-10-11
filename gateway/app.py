@@ -155,6 +155,39 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Gatelodge", version="1.3.0")
 
+# ── extra-router seam — the fourth enterprise extension point ──────────────
+# Mount an additional APIRouter (enterprise: SCIM, later the MCP
+# gateway). Core provides ONLY the insertion point — it mounts nothing
+# itself. The mounted routes join the same middleware stack (request
+# ids, logging) but OWN their authentication: the core auth pipeline
+# does not gate the registered prefix, because enterprise-surface
+# bearers (an IdP's SCIM token) are not gateway credentials.
+_EXTRA_ROUTER_MARK: int | None = None
+_EXTRA_ROUTER_PREFIXES: list[str] = []
+
+
+def set_extra_router(router, *, prefix: str) -> None:
+    """Mount an enterprise APIRouter at ``prefix`` (leading/trailing
+    slashes normalized). Requests under the prefix skip the core auth
+    pipeline — the router's endpoints are responsible for their own
+    authentication scheme (RFC 7644 §2 for SCIM, etc.).
+
+    Replace semantics: a second call swaps the previous extra router
+    out; ``set_extra_router(None, prefix=...)`` removes it (tests use
+    this for cleanup). Call at startup, before serving."""
+    global _EXTRA_ROUTER_MARK
+    prefix = "/" + prefix.strip("/")
+    if _EXTRA_ROUTER_MARK is not None:
+        app.router.routes = app.router.routes[:_EXTRA_ROUTER_MARK]
+        _EXTRA_ROUTER_PREFIXES.clear()
+        _EXTRA_ROUTER_MARK = None
+    if router is None:
+        return
+    _EXTRA_ROUTER_MARK = len(app.router.routes)
+    _EXTRA_ROUTER_PREFIXES.append(prefix)
+    app.include_router(router, prefix=prefix)
+
+
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
 
@@ -500,6 +533,12 @@ async def _bearer_auth(request: Request, call_next):
         _REQUEST_KEY_ID.set("")  # static console shell — its API
         # calls still require the key (the page prompts for it)
         return _rid_response(await call_next(request), rid)
+    # extra-router seam: mounted enterprise surfaces (SCIM, …) own
+    # their authentication — the core pipeline does not gate their
+    # registered prefix (their bearers are not gateway credentials).
+    for _p in _EXTRA_ROUTER_PREFIXES:
+        if request.url.path.startswith(_p):
+            return _rid_response(await call_next(request), rid)
     # Auth runs through the ACTIVE pipeline (default: bearer resolve →
     # admin gate → per-key RPM, all in auth.py). Enterprise swaps the
     # pipeline via set_auth_pipeline() — SSO/OIDC + RBAC links — with
