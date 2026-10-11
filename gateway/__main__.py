@@ -13,6 +13,7 @@ bridge runs once at startup).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -86,6 +87,33 @@ def main() -> None:
         scheme = "https"
 
     logger = logging.getLogger("gateway")
+
+    # Control-plane split (v2.1): admin_port configured → TWO
+    # listeners around the SAME app — the serving port (data plane)
+    # and the admin port (/admin/*, console, /healthz) on admin_bind.
+    # Isolation is the network itself (Kong/Envoy posture); restart
+    # to change (listeners bind at boot).
+    if getattr(cfg, "admin_port", None) and cfg.admin_port != cfg.port:
+        from .app import admin_scope_app, serving_scope_app
+
+        async def _serve_both() -> None:
+            serving = uvicorn.Server(uvicorn.Config(
+                serving_scope_app(), host=cfg.bind, port=cfg.port,
+                log_level="info", **ssl_kwargs))
+            admin = uvicorn.Server(uvicorn.Config(
+                admin_scope_app(), host=cfg.admin_bind,
+                port=cfg.admin_port, log_level="info", **ssl_kwargs))
+            logger.info(
+                "Gatelodge starting on %s://%s:%d (serving) + "
+                "%s://%s:%d (admin) (models_dir: %s; models: %s)",
+                scheme, cfg.bind, cfg.port, scheme, cfg.admin_bind,
+                cfg.admin_port, cfg.models_dir,
+                ", ".join(cfg.local_models()) or "none")
+            await asyncio.gather(serving.serve(), admin.serve())
+
+        asyncio.run(_serve_both())
+        return
+
     logger.info("Gatelodge starting on %s://%s:%d (models_dir: %s; models: %s)",
                 scheme, cfg.bind, cfg.port, cfg.models_dir,
                 ", ".join(cfg.local_models()) or "none")

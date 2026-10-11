@@ -102,6 +102,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -828,6 +829,37 @@ class GatewayConfig:
     def _apply(self, raw: dict[str, Any]) -> None:
         self.port = int(raw.get("port") or 8010)
         self.bind = str(raw.get("bind") or "127.0.0.1")
+        # Control-plane split (v2.1): admin_port set → /admin/* + the
+        # console serve ONLY on that port (admin_bind, localhost by
+        # default — the Kong/Envoy posture); the serving port loses
+        # them entirely (network isolation, not just auth). None = the
+        # single-port behavior of every prior release. Restart to
+        # change (listeners bind at boot).
+        ap = raw.get("admin_port")
+        self.admin_port = int(ap) if ap else None
+        self.admin_bind = str(raw.get("admin_bind") or "127.0.0.1")
+        # Boot-context env overrides (container convention, like
+        # GATELODGE_REDIS_URL): env WINS over the file and is re-applied
+        # on every hot-reload — the operator can still edit everything
+        # else in the file without the ports snapping back.
+        try:
+            env_port = os.environ.get("GATELODGE_PORT", "").strip()
+            if env_port:
+                self.port = int(env_port)
+        except ValueError:
+            pass
+        env_bind = os.environ.get("GATELODGE_BIND", "").strip()
+        if env_bind:
+            self.bind = env_bind
+        try:
+            env_admin_port = os.environ.get("GATELODGE_ADMIN_PORT", "").strip()
+            if env_admin_port:
+                self.admin_port = int(env_admin_port)
+        except ValueError:
+            pass
+        env_admin_bind = os.environ.get("GATELODGE_ADMIN_BIND", "").strip()
+        if env_admin_bind:
+            self.admin_bind = env_admin_bind
         self.models_dir = _resolve_dir(raw.get("models_dir"))
         self.gateway_keys = [str(k) for k in (raw.get("gateway_keys") or [])]
         self.default_alias = str(raw.get("default_alias") or "").strip()

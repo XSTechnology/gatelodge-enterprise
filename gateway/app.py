@@ -212,6 +212,65 @@ def add_extra_router(router, *, prefix: str) -> None:
     app.include_router(router, prefix=prefix)
 
 
+# ── control-plane split (v2.1): port-scoped ASGI shims ─────────────────────
+# When admin_port is configured, __main__ serves TWO listeners around the
+# SAME app: the serving port (data plane — /v1, /healthz, /metrics, the
+# enterprise surfaces) and the admin port (/admin/*, the console, /healthz)
+# on admin_bind (localhost by default). Isolation is the NETWORK, not auth
+# logic — the Kong/Envoy posture. Blocked paths 404 ("not hosted on this
+# port") rather than 403 (no existence leak).
+
+_ADMIN_PREFIXES = ("/admin", "/teams", "/scim")   # control surfaces stay
+# OFF the public serving port when the split is active; /mcp is DATA
+# plane (agent clients) and stays on the serving port.
+_ADMIN_PATHS = ("/admin", "/teams", "/scim", "/")
+
+
+async def _asgi_404(scope, receive, send) -> None:
+    body = b'{"error":{"message":"not found on this port","type":'
+    body += b'"invalid_request_error","param":null,"code":null}}'
+    headers = [(b"content-type", b"application/json"),
+               (b"content-length", str(len(body)).encode())]
+    await send({"type": "http.response.start", "status": 404,
+                "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+def _path_blocked(path: str, prefixes: tuple[str, ...]) -> bool:
+    for p in prefixes:
+        if path == p or path.startswith(p + "/") or (p == "/" and path == "/"):
+            return True
+    return False
+
+
+def serving_scope_app():
+    """The app as served on the DATA port under the split: /admin/*,
+    /teams, /scim and the console shell are not hosted here."""
+    async def _shim(scope, receive, send):
+        if scope["type"] == "http" and _path_blocked(
+                scope.get("path") or "", _ADMIN_PATHS):
+            await _asgi_404(scope, receive, send)
+            return
+        await app(scope, receive, send)
+    return _shim
+
+
+def admin_scope_app():
+    """The app as served on the ADMIN port: ONLY /admin/*, the console
+    shell and /healthz — the data plane (/v1, /mcp) is not hosted
+    here."""
+    async def _shim(scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path") or ""
+            allowed = (path == "/healthz" or path == "/"
+                       or path.startswith("/admin"))
+            if not allowed:
+                await _asgi_404(scope, receive, send)
+                return
+        await app(scope, receive, send)
+    return _shim
+
+
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
 
@@ -3609,6 +3668,8 @@ async def healthz() -> dict[str, Any]:
         "tracing": tracing.healthz_status(),
         "bind": cfg.bind,
         "port": cfg.port,
+        "admin": ({"bind": cfg.admin_bind, "port": cfg.admin_port}
+                  if getattr(cfg, "admin_port", None) else None),
         "models_dir": cfg.models_dir,
         "backends": {name: {"type": b.get("type"),
                             "configured_models": len(b.get("models") or {})}
