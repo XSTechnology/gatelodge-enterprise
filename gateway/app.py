@@ -256,14 +256,16 @@ def serving_scope_app():
 
 
 def admin_scope_app():
-    """The app as served on the ADMIN port: ONLY /admin/*, the console
-    shell and /healthz — the data plane (/v1, /mcp) is not hosted
-    here."""
+    """The app as served on the ADMIN port: ONLY the control plane —
+    /admin/*, /teams, /scim, the console shell and /healthz — the data
+    plane (/v1, /mcp) is not hosted here."""
     async def _shim(scope, receive, send):
         if scope["type"] == "http":
             path = scope.get("path") or ""
             allowed = (path == "/healthz" or path == "/"
-                       or path.startswith("/admin"))
+                       or path.startswith("/admin")
+                       or path.startswith("/teams")
+                       or path.startswith("/scim"))
             if not allowed:
                 await _asgi_404(scope, receive, send)
                 return
