@@ -2010,6 +2010,16 @@ async def chat_completions(body: ChatRequest) -> Response:
         except Exception as e:
             return _exec_error_response(e, requested, body.stream, t0)
         ms = int((time.perf_counter() - t0) * 1000)
+        # Charge NON-openai winners here (v2.0 fix): the cloud branch
+        # charges inside _exec_entry, but embedded/llama-server/runpod
+        # returned uncharged — key/session/team ledgers relied on the
+        # lazy log-seed, which caches 0 forever when a budget gate
+        # queries the scope before the first log line lands (exactly
+        # what the team pre-gate does). Streaming still rides the
+        # log-seed (pre-existing, noted).
+        if (cfg.backends.get(winner) or {}).get("type") != "openai":
+            _charge_request(cfg, winner, resp.get("usage") or {},
+                            resp.get("cost_usd"))
         # smart-routing latency bookkeeping (feeds the 'fastest' strategy)
         _record_route_latency(winner, model_key, ms)
         # response guardrails (non-stream only — streams are not buffered)

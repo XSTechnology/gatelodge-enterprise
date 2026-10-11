@@ -18,7 +18,7 @@ from gateway.auth import _REQUEST_KEY_ID, _REQUEST_TEAM
 from gateway.storage import reset_storage
 
 from test_gateway_stage3 import (gguf, wired, _config,  # noqa: F401
-                                 _secured_config)
+                                 _secured_config, _with_fake_llama)
 
 
 def _team_config(gguf):
@@ -105,3 +105,30 @@ def test_log_request_stamps_team(wired, gguf):  # noqa: F811
     lines = [json.loads(l) for l in
              path.read_text(encoding="utf-8").strip().splitlines()]
     assert "team" not in lines[-1]
+
+
+def test_embedded_path_charges_key_scope(wired, gguf):  # noqa: F811
+    """v2.0 fix: embedded/llama-server/runpod chat winners charge the
+    key ledger AT REQUEST TIME (they used to return uncharged — the
+    lazy log-seed masked it until a budget gate cached 0 first). The
+    strong form: seed the ledger to 0 BEFORE the request, then prove
+    the CHARGE (not a log re-seed) lands."""
+    wired(_team_config(gguf))
+    try:
+        gw_app._scope_spend("key:program-x")     # cache 0 first — the
+        # exact live failure mode (a budget gate querying early)
+
+        def fn(records):
+            from fastapi.testclient import TestClient
+            with TestClient(gw_app.app) as client:
+                r = client.post("/v1/chat/completions", headers={
+                    "Authorization": "Bearer vk-team"},
+                    json={"model": "local:fast",
+                          "messages": [{"role": "user",
+                                        "content": "charge me"}]})
+                assert r.status_code == 200, r.text
+                assert r.json()["usage"]["total_tokens"] == 5
+        _with_fake_llama(fn)
+        assert gw_app._scope_spend("key:program-x")["tokens"] == 5
+    finally:
+        reset_storage()
