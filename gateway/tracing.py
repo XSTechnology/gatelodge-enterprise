@@ -365,6 +365,27 @@ def current_trace_id() -> str | None:
     return s.trace_id if s else None
 
 
+def add_span(name: str, kind: int = KIND_INTERNAL,
+             attrs: dict[str, Any] | None = None,
+             parent: Span | None = None) -> None:
+    """Standalone span for non-request work (v2.0: enterprise MCP tool
+    calls ride the ACTIVE request span when present). No-op when
+    tracing is off; never raises."""
+    if not _config.get("enabled"):
+        return
+    try:
+        p = parent or _CURRENT_SPAN.get()
+        span = Span(p.trace_id if p else _new_id(16), _new_id(8),
+                    p.span_id if p else None, name, kind)
+        for k, v in (attrs or {}).items():
+            span.set(k, v)
+        span.end()
+        _counters["spans_created"] += 1
+        enqueue(span)
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
 def add_llm_span(model: str, backend: str, ms: int, usage: dict[str, Any],
                  status: int, cache_hit: bool = False,
                  cost_usd: float | None = None) -> None:

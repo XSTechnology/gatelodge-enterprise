@@ -62,6 +62,30 @@ def test_sampling_deterministic():
     assert a == tracing._sampled(TID, 0.5)
 
 
+def test_add_span_standalone_and_parented():
+    payloads = []
+    tracing.set_tracing({"enabled": True, "endpoint": "http://127.0.0.1:9"},
+                        exporter=payloads.append)
+    tracing.add_span("mcp tool fs.read", attrs={"mcp.server": "fs",
+                                                "mcp.status": "ok"})
+    tracing.flush()
+    spans = [s for p in payloads
+             for s in p["resourceSpans"][0]["scopeSpans"][0]["spans"]]
+    assert spans and spans[0]["name"] == "mcp tool fs.read"
+    assert "parentSpanId" not in spans[0]      # standalone = own trace
+
+    # parented: rides the ACTIVE request span's trace
+    parent = tracing.request_span("POST", "/mcp", None)
+    tracing.add_span("mcp tool fs.read", parent=parent)
+    tracing.finish_request_span(parent, 200)
+    tracing.flush()
+    spans = [s for p in payloads
+             for s in p["resourceSpans"][0]["scopeSpans"][0]["spans"]]
+    child = [s for s in spans if s["name"] == "mcp tool fs.read"][-1]
+    assert child["parentSpanId"] == parent.span_id
+    assert child["traceId"] == parent.trace_id
+
+
 # ── OTLP payload shape ─────────────────────────────────────────────────────
 
 def _one_span_payload():
