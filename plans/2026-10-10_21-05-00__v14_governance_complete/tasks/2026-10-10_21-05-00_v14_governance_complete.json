@@ -1,36 +1,21 @@
 [
   {
-    "content": "[v14-1] UPSTREAM: set_extra_router seam; e1aff98; fork c1749ac — DONE",
+    "content": "[v14-1..4] seam + chained audit + session hook + SCIM — DONE (e1aff98/5dcd44d/57f429e/8e459f6)",
     "id": "v14-1",
     "status": "completed"
   },
   {
-    "content": "[v14-2] UPSTREAM: hash-chained audit; 5dcd44d; live tamper check passed — DONE",
-    "id": "v14-2",
-    "status": "completed"
-  },
-  {
-    "content": "[v14-3] UPSTREAM: session charge hook; 57f429e; fork suite 559 — DONE",
-    "id": "v14-3",
-    "status": "completed"
-  },
-  {
-    "content": "[v14-4] FORK: gateway_enterprise/scim.py via the seam (RFC 7644 Users CRUD → api_keys, own bearer scim.token_hash, scim- id prefix guard, _mutate_config for audit+CAS) + enterprise_main wiring + canary tests + live verify — self",
-    "id": "v14-4",
+    "content": "[v14-5] FORK: session_budget_link — enterprise link (inert without section), monthly session:<id> spend gate vs default_tokens + per_tenant[owner], 429 mirrors key budget gate, enterprise pipeline wiring restored, canaries incl. shared-storage two-client — self",
+    "id": "v14-5",
     "status": "in_progress"
   },
   {
-    "content": "[v14-5] FORK: session_budget_link (storage-backed pre-gate, raw session_budgets section) + canaries incl. shared-window two-client — self",
-    "id": "v14-5",
-    "status": "pending"
-  },
-  {
-    "content": "[v14-6] UPSTREAM: cloud credential chains (auth: sigv4 / auth: adc, token caching) + mocked-chain tests — self",
+    "content": "[v14-6] UPSTREAM: cloud credential chains — auth: adc (google.auth lazy, cached token via httpx.Auth) + auth: sigv4 (env-var chain, per-request signer) in cloud.py, config passthrough, unit tests w/ fake fetchers — self",
     "id": "v14-6",
     "status": "pending"
   },
   {
-    "content": "[v14-7] v1.4.0 tag both repos; SOC2 evidence period starts — self",
+    "content": "[v14-7] v1.4.0: version bumps both repos, tags, SOC2 inventory gap-update, context — self",
     "id": "v14-7",
     "status": "pending"
   }

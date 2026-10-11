@@ -97,6 +97,17 @@ def main() -> None:
     # v1.4: SCIM provisioning (router seam) — no-op unless scim.enabled.
     _wire_scim()
 
+    # v1.4: session budgets — the ENTERPRISE link (inert without the
+    # session_budgets section; the core carries the charge hook). The
+    # enterprise pipeline = core governance + the session gate.
+    from gateway.auth import (AuthPipeline, admin_gate_link,
+                              rate_limit_link, resolve_link, rbac_link,
+                              set_auth_pipeline)
+    from gateway_enterprise.session_budget import session_budget_link
+    set_auth_pipeline(AuthPipeline([
+        resolve_link, rbac_link, session_budget_link,
+        admin_gate_link, rate_limit_link]))
+
     # The core's default pipeline (resolve_link → rbac_link →
     # admin_gate → rate_limit) carries governance; the core's boot
     # bridges provider keys AND sso.client_secret_env from the OS
