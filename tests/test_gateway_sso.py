@@ -3,13 +3,19 @@
 Same discipline as tests/test_gateway_rbac.py: the REAL governed
 pipeline (with resolve_link) is
 swapped in and SERVING behavior asserted. The introspection transport
-is monkeypatched (gateway.sso.introspect) — no real HTTP.
+is monkeypatched (gateway.sso.introspect) and so is the JWKS fetch
+(gateway.sso._jwks_fetch) — no real HTTP anywhere.
 """
 import hashlib
 import json
 import logging
+import time
 
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
 from fastapi.testclient import TestClient
+from jwt.algorithms import RSAAlgorithm
+import jwt as pyjwt
 
 import gateway.app as gw_app
 import gateway.config as gw_config
@@ -477,3 +483,239 @@ def test_identity_contextvar_roundtrip():
     assert ident["role"] == "full_admin" and ident["via"] == "sso"
     set_identity(None)
     assert get_identity() is None
+
+
+# ── local JWT validation (JWKS) ────────────────────────────────────────────
+
+def _gen_rsa():
+    priv = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return priv, priv.public_key()
+
+
+_PRIV1, _PUB1 = _gen_rsa()   # keyset A (kid k1)
+_PRIV2, _PUB2 = _gen_rsa()   # keyset B (kid k2 — the rotated key)
+
+
+def _jwk(pub, kid: str) -> dict:
+    k = RSAAlgorithm.to_jwk(pub, as_dict=True)
+    k["kid"] = kid
+    k["alg"] = "RS256"
+    return k
+
+
+JWKS_A = {"keys": [_jwk(_PUB1, "k1")]}
+JWKS_B = {"keys": [_jwk(_PUB2, "k2")]}
+
+
+def _mint_jwt(priv, kid="k1", claims_over=None, alg="RS256", key=None):
+    claims = {"sub": "jwt-user", "email": "jwt@corp.example",
+              "groups": ["gatelodge-full-admins"],
+              "exp": int(time.time()) + 3600,
+              "iss": "https://idp.test"}
+    claims.update(claims_over or {})
+    return pyjwt.encode(claims, key if key is not None else priv,
+                        algorithm=alg, headers={"kid": kid})
+
+
+class FakeJWKS:
+    """gateway.sso._jwks_fetch replacement: serves a configurable
+    keyset, counts fetches, can fail."""
+
+    def __init__(self, keyset=None, fail=False):
+        self.keyset = keyset or JWKS_A
+        self.fail = fail
+        self.calls = 0
+
+    async def __call__(self, url, timeout_s):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("jwks endpoint down")
+        return self.keyset
+
+
+@pytest.fixture()
+def jwks(monkeypatch):
+    """Clean JWKS cache + a controllable keyset transport."""
+    gw_sso._JWKS_CACHE.clear()
+    fake = FakeJWKS()
+    monkeypatch.setattr(gw_sso, "_jwks_fetch", fake)
+    yield fake
+    gw_sso._JWKS_CACHE.clear()
+
+
+def _jwks_config(gguf, **sso_over):
+    monkeypatch_section = _sso_section(jwks_url="https://idp.test/jwks.json",
+                                       **sso_over)
+    return _sso_config(gguf, sso=monkeypatch_section)
+
+
+def test_jwks_fast_path_never_calls_idp(wired, gguf, monkeypatch, jwks):
+    """A valid JWT validates FULLY LOCALLY: one JWKS fetch, ZERO
+    introspections — and the second request rides the token cache
+    (still zero IdP calls, no new keyset fetch)."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf))
+    idp = FakeIdP(ADMIN_CLAIMS)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok = _mint_jwt(_PRIV1)
+        with TestClient(gw_app.app) as client:
+            r1 = client.get("/admin/stats", headers=auth(tok))
+            assert r1.status_code == 200, r1.text
+            r2 = client.post("/admin/reload", headers=auth(tok))
+            assert r2.status_code == 200, r2.text
+        assert idp.calls == 0        # no introspection round-trip
+        assert jwks.calls == 1       # keyset fetched once, then cached
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_expired_falls_back_to_introspection(wired, gguf, monkeypatch,
+                                                  jwks):
+    """Local validation fails on expiry → introspection decides
+    (inactive here) → 401. The fallback is the source of truth."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf))
+    idp = FakeIdP(active=False)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok = _mint_jwt(_PRIV1, claims_over={"exp": int(time.time()) - 30})
+        with TestClient(gw_app.app) as client:
+            r = client.get("/admin/stats", headers=auth(tok))
+            assert r.status_code == 401
+        assert idp.calls == 1        # fell back, IdP said inactive
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_wrong_audience_falls_back(wired, gguf, monkeypatch, jwks):
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf, audience="gatelodge-api"))
+    idp = FakeIdP(active=False)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok = _mint_jwt(_PRIV1, claims_over={"aud": "other-api"})
+        with TestClient(gw_app.app) as client:
+            r = client.get("/admin/stats", headers=auth(tok))
+            assert r.status_code == 401
+        assert idp.calls == 1
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_unknown_kid_refresh_throttled(wired, gguf, monkeypatch, jwks):
+    """An unknown kid triggers ONE keyset refresh; a second unknown-kid
+    token inside the throttle window does NOT hammer the IdP's JWKS
+    endpoint (kid-spray must not become a DoS vector). Both requests
+    fall back to introspection."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf))
+    idp = FakeIdP(active=False)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok = _mint_jwt(_PRIV1, kid="attacker-kid")
+        with TestClient(gw_app.app) as client:
+            for _ in range(2):
+                r = client.get("/admin/stats", headers=auth(tok))
+                assert r.status_code == 401
+        assert jwks.calls == 1       # refreshed once, then throttled
+        assert idp.calls == 2        # both fell back to introspection
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_kid_rotation_refreshes(wired, gguf, monkeypatch, jwks):
+    """Key rotation: a token with a NEW kid (unknown to the cached
+    keyset, past the throttle window) triggers a refresh and then
+    validates locally — still zero introspections."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf))
+    idp = FakeIdP(ADMIN_CLAIMS)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok1 = _mint_jwt(_PRIV1, kid="k1")
+        with TestClient(gw_app.app) as client:
+            assert client.get("/admin/stats",
+                              headers=auth(tok1)).status_code == 200
+        # the IdP rotates: the keyset now carries only k2
+        jwks.keyset = JWKS_B
+        # age the cached keyset past the unknown-kid refresh throttle
+        for ent in gw_sso._JWKS_CACHE.values():
+            ent["fetched_at"] -= gw_sso._JWKS_MIN_REFRESH_S + 1.0
+        tok2 = _mint_jwt(_PRIV2, kid="k2")
+        with TestClient(gw_app.app) as client:
+            r = client.get("/admin/stats", headers=auth(tok2))
+            assert r.status_code == 200, r.text
+        assert idp.calls == 0        # rotation handled locally
+        assert jwks.calls == 2       # initial fetch + rotation refresh
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_fetch_failure_uses_introspection(wired, gguf, monkeypatch,
+                                               jwks):
+    """JWKS endpoint down but introspection up → auth still works
+    (introspection is the resilient path, not a single point of
+    failure)."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf))
+    jwks.fail = True
+    idp = FakeIdP(ADMIN_CLAIMS)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok = _mint_jwt(_PRIV1)
+        with TestClient(gw_app.app) as client:
+            r = client.get("/admin/stats", headers=auth(tok))
+            assert r.status_code == 200, r.text
+        assert idp.calls == 1
+        assert jwks.calls == 1       # it tried, failed, fell back
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_hmac_alg_confusion_rejected(wired, gguf, monkeypatch, jwks):
+    """A token referencing a REAL kid but signed with a shared-secret
+    HMAC (the classic alg-confusion attack) is never locally
+    validated — it falls to introspection, which rejects it."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_jwks_config(gguf))
+    idp = FakeIdP(active=False)
+    monkeypatch.setattr(gw_sso, "introspect", idp)
+    _wire_enterprise()
+    try:
+        tok = _mint_jwt(None, kid="k1", alg="HS256",
+                        key="attacker-shared-secret")
+        with TestClient(gw_app.app) as client:
+            r = client.get("/admin/stats", headers=auth(tok))
+            assert r.status_code == 401
+        assert idp.calls == 1        # rejected locally, IdP agreed
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()
+
+
+def test_jwks_config_parsing(monkeypatch):
+    """jwks_url/jwks_cache_ttl_s parse; explicit 0 ttl is honored
+    (the `value or default` falsy-swallow lesson)."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    base = {"enabled": True, "introspection_url": "https://x/y",
+            "client_id": "cid", "client_secret_env": "TEST_SSO_SECRET"}
+    st = gw_sso._parse_sso({"sso": {**base, "jwks_url": "https://x/jwks",
+                                     "jwks_cache_ttl_s": 0}})
+    assert st.jwks_url == "https://x/jwks"
+    assert st.jwks_cache_ttl_s == 0.0
+    st2 = gw_sso._parse_sso({"sso": dict(base)})
+    assert st2.jwks_url == ""                    # absent = introspect only
+    assert st2.jwks_cache_ttl_s == 300.0         # default
