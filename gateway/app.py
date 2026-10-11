@@ -3398,27 +3398,128 @@ async def healthz() -> dict[str, Any]:
 
 # ── Admin: alias CRUD + instance control (Stage 4) ─────────────────────────
 
-def _audit_config(action: str) -> None:
-    """Append-only audit of config mutations (who / when / what) —
-    config-audit.jsonl next to the request log. Ships to the configured
-    audit webhook (SIEM) when set (tier B)."""
-    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-           "key": _REQUEST_KEY_ID.get() or "(open)",
-           "action": action[:200]}
+# ── hash-chained audit (v1.4: tamper-evident config-audit.jsonl) ───────────
+# Every audit record carries prev (the previous record's hash; "genesis"
+# for the first) and hash (sha256 of the record incl. prev, canonical
+# JSON). The chain head is per-process and re-read from the file tail on
+# first write, so chains continue across restarts. Chains are PER-REPLICA
+# by design (audit files are per-replica; the SIEM webhook remains the
+# cross-replica aggregate). Legacy (pre-v1.4) records are counted by the
+# verifier but not verified; the chain restarts at genesis after them.
+
+_AUDIT_CHAIN_HEAD: str | None = None
+_AUDIT_GENESIS = "genesis"
+
+
+def _audit_hash(rec: dict) -> str:
+    """Canonical record hash: sha256 over sorted-keys JSON."""
+    return hashlib.sha256(
+        json.dumps(rec, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _audit_tail_hash(p) -> str:
+    """The hash of the file's last chained record — the chain continues
+    across restarts. Genesis when absent/empty/ending on a legacy
+    record. Reads only the file tail; a partial first line from the
+    windowed read is discarded."""
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            window = 8192
+            f.seek(max(0, size - window))
+            skipped = size > window
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = [l for l in tail.strip().splitlines() if l.strip()]
+        if skipped and lines:
+            lines = lines[1:]   # the first line may be cut mid-record
+        if not lines:
+            return _AUDIT_GENESIS
+        rec = json.loads(lines[-1])
+        return str(rec.get("hash") or _AUDIT_GENESIS)
+    except Exception:  # noqa: BLE001 — unreadable tail → fresh chain
+        return _AUDIT_GENESIS
+
+
+def append_audit_record(rec: dict) -> dict | None:
+    """THE audit chokepoint: append one tamper-evident record to
+    config-audit.jsonl and return the chained record (None on failure —
+    auditing must never break the caller). Both writers use this:
+    config mutations (_audit_config) and RBAC denials
+    (gateway.auth._audit_deny)."""
+    global _AUDIT_CHAIN_HEAD
     try:
         p = _LOG_PATH.parent / "config-audit.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
+        prev = _AUDIT_CHAIN_HEAD
+        if prev is None:
+            prev = _audit_tail_hash(p)
+        chained = dict(rec)
+        chained["prev"] = prev
+        chained["hash"] = _audit_hash(chained)
         with _log_lock:
             with open(p, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+                f.write(json.dumps(chained) + "\n")
+        _AUDIT_CHAIN_HEAD = chained["hash"]
+        return chained
+    except Exception:  # noqa: BLE001
+        logger.warning("audit append failed", exc_info=True)
+        return None
+
+
+def verify_audit_chain() -> dict:
+    """Walk config-audit.jsonl and verify the hash chain: each chained
+    record's hash must match its content, and prev must equal the
+    previous record's hash. Legacy (pre-v1.4) records are counted but
+    not verified. Returns {lines, chained, legacy, breaks, valid} —
+    surfaced by GET /admin/audit (SOC2 CC7.1 tamper evidence)."""
+    p = _LOG_PATH.parent / "config-audit.jsonl"
+    breaks: list[dict] = []
+    chained = legacy = 0
+    prev = _AUDIT_GENESIS
+    try:
+        lines = p.read_text(encoding="utf-8").strip().splitlines()
     except OSError:
-        logger.warning("config audit write failed", exc_info=True)
+        lines = []
+    for i, ln in enumerate(lines, 1):
+        try:
+            rec = json.loads(ln)
+        except json.JSONDecodeError:
+            breaks.append({"line": i, "reason": "unparseable"})
+            continue
+        h = rec.get("hash")
+        if not h:
+            legacy += 1          # pre-v1.4 record — chain restarts after
+            prev = _AUDIT_GENESIS
+            continue
+        body = {k: v for k, v in rec.items() if k != "hash"}
+        if _audit_hash(body) != h:
+            breaks.append({"line": i, "reason": "hash mismatch (tampered)"})
+        elif rec.get("prev") != prev:
+            breaks.append({"line": i,
+                           "reason": "chain break (prev mismatch)"})
+        prev = h
+        chained += 1
+    return {"lines": len(lines), "chained": chained, "legacy": legacy,
+            "breaks": breaks, "valid": not breaks}
+
+
+def _audit_config(action: str) -> None:
+    """Append-only audit of config mutations (who / when / what) —
+    hash-chained config-audit.jsonl next to the request log (see
+    append_audit_record). Ships the CHAINED record to the configured
+    audit webhook (SIEM) when set — the SIEM can verify the chain
+    independently."""
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "key": _REQUEST_KEY_ID.get() or "(open)",
+           "action": action[:200]}
+    chained = append_audit_record(rec)
     # remote sink (best-effort, fire-and-forget)
     try:
         cfg = get_gateway_config()
         url = (cfg.audit or {}).get("webhook_url") if cfg.audit else ""
-        if url:
-            payload = dict(rec)
+        if url and chained is not None:
+            payload = dict(chained)
             payload["type"] = "config_audit"
             try:
                 loop = asyncio.get_running_loop()
@@ -3431,7 +3532,8 @@ def _audit_config(action: str) -> None:
 
 @app.get("/admin/audit")
 async def admin_audit() -> Response:
-    """Last config mutations (newest first, max 200)."""
+    """Last config mutations (newest first, max 200) + the hash-chain
+    verification status."""
     try:
         lines = (_LOG_PATH.parent / "config-audit.jsonl").read_text(
             encoding="utf-8").strip().splitlines()
@@ -3443,7 +3545,7 @@ async def admin_audit() -> Response:
             out.append(json.loads(ln))
         except json.JSONDecodeError:
             continue
-    return {"audit": out[::-1]}
+    return {"audit": out[::-1], "chain": verify_audit_chain()}
 
 
 def _mutate_config(mutator, action: str = "config-mutation") -> None:
