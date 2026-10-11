@@ -285,6 +285,16 @@ def bootstrap(*, edition: str = "community",
     return status()
 
 
+def ensure_bootstrapped(*, edition: str = "community") -> dict[str, Any]:
+    """bootstrap(), but idempotent — the entry-point CHAIN (the fork's
+    enterprise_main → core __main__.main) must not clobber an already-
+    installed state with community semantics. Direct bootstrap() calls
+    always re-run (tests, re-issuing); entry points use this."""
+    if _STATE is None:
+        return bootstrap(edition=edition)
+    return status()
+
+
 def _recheck(state: dict[str, Any], now: datetime) -> tuple[bool, str]:
     """Runtime (re)evaluation — license expiry mid-run, trial window
     and clock-rollback while serving. Well-defined failures only;

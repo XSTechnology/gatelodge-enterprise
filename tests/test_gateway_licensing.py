@@ -318,6 +318,24 @@ def test_unmanaged_passes():
     assert licensing.request_allowed() == (True, "unmanaged")
 
 
+def test_ensure_bootstrapped_does_not_clobber():
+    """The entry-point chain (enterprise_main → core main) must keep
+    the FIRST installed state — the core's community bootstrap never
+    overwrites an enterprise one."""
+    licensing.set_license_state({
+        "mode": "licensed", "edition": "enterprise",
+        "license": {"product": "gatelodge", "edition": "enterprise",
+                    "customer": "X", "features": ["tier_d"]},
+        "trial": None})
+    st = licensing.ensure_bootstrapped(edition="community")
+    assert st["edition"] == "enterprise"
+    assert st["license_edition"] == "enterprise"
+    # and with no state it bootstraps normally
+    licensing.set_license_state(None)
+    st2 = licensing.ensure_bootstrapped(edition="community")
+    assert st2["edition"] == "community"
+
+
 def test_expired_blocks_v1_but_not_healthz(wired, gguf):  # noqa: F811
     wired(_config(gguf))
     licensing.set_license_state({
