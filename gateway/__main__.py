@@ -58,6 +58,13 @@ def main() -> None:
 
     _load_secret_env()
 
+    # Licensing (v1.5 closed distribution): community binaries run a
+    # 30-day trial without a license; an expired trial keeps /healthz
+    # alive but the middleware 403s everything else. A valid license
+    # file (community OR enterprise claims) removes the limit.
+    from . import licensing
+    licensing.bootstrap(edition="community")
+
     from .config import get_gateway_config
     cfg = get_gateway_config()
     cfg.maybe_reload()

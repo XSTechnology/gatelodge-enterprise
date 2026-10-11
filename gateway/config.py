@@ -102,13 +102,22 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Compiled binaries (Nuitka, v1.5 closed distribution): anchor the data
+# tree to the EXECUTABLE's directory. In a onefile build __file__ points
+# into the per-boot extraction temp dir — data/ (config, license, trial
+# anchor, logs, models) would be orphaned between boots. Standalone
+# builds land in the same place either way; source runs are unchanged.
+if "__compiled__" in globals():
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "data" / "gateway_config.json"  # CWD-independent
 DEFAULT_MODELS_DIR = PROJECT_ROOT / "data" / "models"
 
