@@ -179,6 +179,37 @@ def test_open_mode_rbac_inert(wired, gguf):
         set_auth_pipeline(AuthPipeline())
 
 
+# ── whoami — the console's role awareness ──────────────────────────────────
+
+def test_whoami_key_roles(wired, gguf):
+    """whoami reports the resolved role per key: unassigned →
+    full_admin (the backward-compat default), assigned → the role,
+    with the audit identity (admin:<role>:<hash8>)."""
+    wired(_rbac_config(gguf, roles=[OPS],
+                       api_keys=[{"id": "program-x", "key": "vk-test-1"}]))
+    with TestClient(gw_app.app) as client:
+        w = client.get("/admin/whoami", headers=auth("admin-secret")).json()
+        assert w["via"] == "admin_key" and w["role"] == "full_admin"
+        assert w["who"] == ("admin:full_admin:"
+                            + hashlib.sha256(b"admin-secret").hexdigest()[:8])
+        assert "identity" not in w
+        w2 = client.get("/admin/whoami", headers=auth("ops-secret")).json()
+        assert w2["role"] == "ops_readonly"
+        assert w2["who"].startswith("admin:ops_readonly:")
+        # a virtual key never reaches whoami (admin gate), bare → 401
+        assert client.get("/admin/whoami",
+                          headers=auth("vk-test-1")).status_code == 403
+        assert client.get("/admin/whoami").status_code == 401
+
+
+def test_whoami_open_mode(wired, gguf):
+    """Open mode: whoami says so — via open, unrestricted."""
+    wired(_config(gguf))  # no keys
+    with TestClient(gw_app.app) as client:
+        w = client.get("/admin/whoami").json()
+        assert w == {"via": "open", "role": "full_admin", "who": "open"}
+
+
 def test_serving_surface_unaffected(wired, gguf, monkeypatch):
     """RBAC governs /admin only: an ops_readonly ADMIN key still serves
     /v1 traffic (core behavior — admin keys are unlimited consumers)."""

@@ -3986,6 +3986,32 @@ async def console() -> Response:
     return HTMLResponse(html)
 
 
+@app.get("/admin/whoami")
+async def admin_whoami(request: Request) -> Response:
+    """The request's governing principal — the console's role
+    awareness. who: the audit identity (sso:<email> for SSO
+    principals, admin:<role>:<hash8> for keys, "open" in open mode).
+    SSO principals also carry their full identity. The server stays
+    the source of truth for enforcement; this is what lets the UI
+    stop offering actions the role cannot perform."""
+    cfg = get_gateway_config()
+    cfg.maybe_reload()
+    key_id = _REQUEST_KEY_ID.get()
+    role, who, identity = auth.current_principal(cfg, request, key_id)
+    if identity is not None:
+        via = "sso"
+    elif key_id == "admin":
+        via = "admin_key"
+    else:
+        via, who = "open", "open"
+    out: dict[str, Any] = {"via": via, "role": role, "who": who}
+    if identity is not None:
+        out["identity"] = {"sub": str(identity.get("sub") or ""),
+                           "email": str(identity.get("email") or ""),
+                           "tenant": str(identity.get("tenant") or "")}
+    return out
+
+
 @app.get("/admin/config")
 async def admin_get_config() -> Response:
     """Raw config text for the console editor (defaults when the store

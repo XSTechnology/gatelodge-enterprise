@@ -363,6 +363,28 @@ async def _sso_resolve(cfg, request: Request, token: str,
     return None
 
 
+def current_principal(cfg, request: Request,
+                      key_id: str) -> tuple[str, str, dict | None]:
+    """The request's governing principal: (role, audit-identity,
+    sso-identity-or-None). Identity-first — an SSO principal's role
+    comes from its identity (never re-derived from admin_key_roles);
+    key-based admins use admin_key_roles → DEFAULT_ROLE. Shared by
+    rbac_link (enforcement + audit identity) and /admin/whoami (the
+    console's role awareness)."""
+    identity = get_identity()
+    if identity is not None:
+        role = str(identity.get("role") or "")
+        who = ("sso:" + str(identity.get("email")
+                            or identity.get("sub") or "unknown"))
+        return role, who, identity
+    token = _bearer_token(request)
+    role = get_admin_role_map().role_for(cfg, token) or DEFAULT_ROLE
+    who = (f"admin:{role}:"
+           f"{hashlib.sha256(token.encode('utf-8')).hexdigest()[:8]}"
+           if token else f"admin:{role}")
+    return role, who, None
+
+
 def rbac_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     """Link 2 (default): enforce the role→admin-surface mapping
     (gateway/rbac.py, from the config's admin_key_roles section) on
@@ -388,17 +410,7 @@ def rbac_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
         return None
     if key_id != "admin":
         return None
-    identity = get_identity()
-    if identity is not None:
-        role = str(identity.get("role") or "")
-        who = ("sso:" + str(identity.get("email")
-                            or identity.get("sub") or "unknown"))
-    else:
-        token = _bearer_token(request)
-        role = get_admin_role_map().role_for(cfg, token) or DEFAULT_ROLE
-        who = (f"admin:{role}:"
-               f"{hashlib.sha256(token.encode('utf-8')).hexdigest()[:8]}"
-               if token else f"admin:{role}")
+    role, who, _ = current_principal(cfg, request, key_id)
     if allowed(role, request.method, path):
         logger.debug("rbac allow %s %s (role %s)", request.method, path, role)
         return None

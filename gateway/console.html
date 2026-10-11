@@ -200,6 +200,7 @@ select.lc-in { width:auto; padding-right:4px; }
 <div class="header">
   <h1>🧠 Gatelodge Admin</h1>
   <span class="spacer"></span>
+  <span id="role" class="badge" style="display:none;margin-right:8px" title=""></span>
   <span id="conn">connecting…</span>
   <input id="key" type="password" placeholder="API key (blank = open)" style="display:none">
 </div>
@@ -262,18 +263,41 @@ select.lc-in { width:auto; padding-right:4px; }
 <script>
 'use strict';
 var KEY = localStorage.getItem('gw_key') || '';
+var ROLE = null;  // console RBAC awareness (set from /admin/whoami)
 var _syslogTimer = null, _perfTimer = null, _bwTimer = null, _lcTimer = null;
 
 // ---------- api ----------
+// Client-side mirror of the gateway's role table (gateway/rbac.py) —
+// the SERVER stays the source of truth; this only stops offering
+// actions the role cannot perform (no more mystery 403 toasts).
+function mayDo(method, path) {
+  if (!ROLE || method === 'GET') return true;       // unknown → server decides
+  if (ROLE === 'full_admin') return true;
+  if (ROLE === 'key_manager') return path === '/admin/keys';
+  return false;                                     // ops_readonly + unknown: reads only
+}
 function api(path, opts) {
   opts = opts || {};
+  var m = opts.method || 'GET';
+  if (!mayDo(m, path)) {
+    notify("role '" + ROLE + "' may not " + m + " " + path, true);
+    return Promise.reject(new Error('forbidden by role'));
+  }
   var headers = opts.headers || {};
   headers['Content-Type'] = 'application/json';
   if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
-  return fetch(path, {method: opts.method || 'GET', headers: headers,
+  return fetch(path, {method: m, headers: headers,
                       body: opts.body ? JSON.stringify(opts.body) : undefined})
     .then(function (r) {
       if (r.status === 401) { setConn('bad', '401 — wrong API key'); throw new Error('401 unauthorized'); }
+      if (r.status === 403) {
+        return r.json().then(function (b) {
+          var msg = (b && b.error && b.error.message) || '403 forbidden';
+          notify(msg, true);       // role changed server-side → re-check
+          fetchWhoami();
+          throw new Error(msg);
+        });
+      }
       if (!r.ok) return r.json().then(function (b) {
         throw new Error((b && b.error && b.error.message) || ('HTTP ' + r.status));
       });
@@ -293,14 +317,31 @@ function notify(msg, isErr) {
 function fmtMB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB'; }
 
 // ---------- boot ----------
+function fetchWhoami() {
+  api('/admin/whoami').then(function (d) {
+    ROLE = d.role || null;
+    var el = document.getElementById('role');
+    el.style.display = '';
+    el.textContent = (d.via === 'sso' && d.identity && d.identity.email)
+      ? ('🔑 ' + d.identity.email + ' · ' + ROLE)
+      : ('role: ' + ROLE);
+    el.title = 'via ' + d.via + ' — ' + d.who;
+  }).catch(function () {
+    ROLE = null;                    // no/invalid key or virtual key — server decides
+    var el = document.getElementById('role');
+    if (el) el.style.display = 'none';
+  });
+}
 function boot() {
   var keyEl = document.getElementById('key');
   keyEl.style.display = '';
   keyEl.value = KEY;
   keyEl.addEventListener('change', function () {
     KEY = keyEl.value.trim(); localStorage.setItem('gw_key', KEY); refreshHeader();
+    fetchWhoami();
   });
   refreshHeader();
+  fetchWhoami();
   setInterval(refreshHeader, 15000);
 }
 function refreshHeader() {

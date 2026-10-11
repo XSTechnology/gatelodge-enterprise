@@ -719,3 +719,25 @@ def test_jwks_config_parsing(monkeypatch):
     st2 = gw_sso._parse_sso({"sso": dict(base)})
     assert st2.jwks_url == ""                    # absent = introspect only
     assert st2.jwks_cache_ttl_s == 300.0         # default
+
+
+def test_whoami_sso_identity(wired, gguf, monkeypatch):
+    """whoami surfaces the SSO principal: via sso, the full identity
+    (sub/email/tenant), the role from the claims, and the sso:<email>
+    audit identity."""
+    monkeypatch.setenv("TEST_SSO_SECRET", "secret")
+    wired(_sso_config(gguf, sso=_sso_section()))
+    monkeypatch.setattr(gw_sso, "introspect", FakeIdP(ADMIN_CLAIMS))
+    _wire_enterprise()
+    try:
+        with TestClient(gw_app.app) as client:
+            w = client.get("/admin/whoami",
+                           headers=auth("zzz.yyy.xxx")).json()
+        assert w["via"] == "sso" and w["role"] == "full_admin"
+        assert w["who"] == "sso:alice@corp.example"
+        assert w["identity"] == {"sub": "user-1",
+                                 "email": "alice@corp.example",
+                                 "tenant": ""}
+    finally:
+        set_auth_pipeline(AuthPipeline())
+        reset_storage()

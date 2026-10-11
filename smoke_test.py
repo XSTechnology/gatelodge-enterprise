@@ -50,6 +50,7 @@ checks = [
     ("admin/aliases", "GET", "/admin/aliases", 200, None),
     ("admin/backends", "GET", "/admin/backends", 200, None),
     ("admin/config", "GET", "/admin/config", 200, None),
+    ("admin/whoami", "GET", "/admin/whoami", 200, None),
     ("batches list", "GET", "/v1/batches", 200, None),
     ("admin batches (governance pane)", "GET", "/admin/batches", 200, None),
     ("bad model 400", "POST", "/v1/chat/completions", 400,
