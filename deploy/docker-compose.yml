@@ -1,0 +1,89 @@
+# Gatelodge Enterprise — tier D reference deployment.
+#
+#   docker compose up -d                          gateway + redis + postgres
+#   docker compose --profile obs up -d            + prometheus + grafana
+#
+# First boot: the gateway seeds its config from the mounted
+# ./data/gateway_config.json into Postgres (set your admin keys there
+# BEFORE the first start — the seed runs once, when the table is empty).
+# 10-minute walkthrough: deploy/QUICKSTART.md.
+
+services:
+  redis:
+    image: redis:7-alpine
+    # dedicated DB index = deployment isolation (clear("*") wipes the index)
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gatelodge
+      POSTGRES_PASSWORD: gatelodge
+      POSTGRES_DB: gatelodge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatelodge -d gatelodge"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: gatelodge-enterprise
+    environment:
+      GATELODGE_REDIS_URL: redis://redis:6379/0
+      GATELODGE_CONFIG_DSN: postgresql://gatelodge:gatelodge@postgres:5432/gatelodge
+    volumes:
+      # seed config (bind 0.0.0.0 for the container; keys live here)
+      - ./data:/app/data
+    ports:
+      - "8011:8011"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    # multi-replica: replicas share redis+postgres; put them behind a
+    # load balancer instead of publishing host ports per replica.
+
+  # ── optional observability stack: --profile obs ─────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["obs"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["obs"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboard.json:/var/lib/grafana/dashboards/gatelodge.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pgdata:

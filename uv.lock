@@ -1,6 +1,10 @@
 version = 1
 revision = 3
 requires-python = ">=3.12"
+resolution-markers = [
+    "sys_platform == 'win32'",
+    "sys_platform != 'win32'",
+]
 
 [[package]]
 name = "annotated-doc"
@@ -260,7 +264,8 @@ dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "keyring" },
-    { name = "llama-cpp-python" },
+    { name = "llama-cpp-python", version = "0.3.35", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
+    { name = "llama-cpp-python", version = "0.3.35", source = { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" }, marker = "sys_platform == 'win32'" },
     { name = "openai" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
@@ -282,7 +287,8 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=1.32.0" },
     { name = "keyring", specifier = ">=25.7.0" },
-    { name = "llama-cpp-python", url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" },
+    { name = "llama-cpp-python", marker = "sys_platform != 'win32'" },
+    { name = "llama-cpp-python", marker = "sys_platform == 'win32'", url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" },
     { name = "openai", specifier = ">=1.60" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "pydantic", specifier = ">=2.9" },
@@ -605,7 +611,25 @@ wheels = [
 [[package]]
 name = "llama-cpp-python"
 version = "0.3.35"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "sys_platform != 'win32'",
+]
+dependencies = [
+    { name = "diskcache" },
+    { name = "jinja2" },
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/71/5ecdad726b87527b361d9d95313c6591f27bb3fad79c9ab524ad4250b4c9/llama_cpp_python-0.3.35.tar.gz", hash = "sha256:1139dbb54509074b70893fab8554e3b079aa9f4d312058ce4018ef0019e3de12", size = 74868054, upload-time = "2026-08-17T09:41:34.939Z" }
+
+[[package]]
+name = "llama-cpp-python"
+version = "0.3.35"
 source = { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" }
+resolution-markers = [
+    "sys_platform == 'win32'",
+]
 dependencies = [
     { name = "diskcache" },
     { name = "jinja2" },

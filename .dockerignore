@@ -1,0 +1,15 @@
+.git
+.venv
+.workshop
+data
+plans
+tests
+scripts
+__pycache__
+*.pyc
+*.md
+tuning.docx
+start*.bat
+start.sh
+smoke_test.py
+benchmark.py

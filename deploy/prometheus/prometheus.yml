@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Gatelodge metrics are PER-PROCESS by design — one target per
+  # replica. Add targets as you scale (or use service discovery).
+  # The gateway's auth pipeline covers /metrics too: paste the same
+  # admin/observer bearer the console uses.
+  - job_name: gatelodge
+    authorization:
+      credentials: CHANGE_ME_admin_bearer
+    static_configs:
+      - targets: ["gateway:8011"]
+        labels:
+          replica: "1"

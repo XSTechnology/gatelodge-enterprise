@@ -1,0 +1,57 @@
+# Gatelodge alert rules — the operational minimum for a production
+# gateway. Metric names match gateway/app.py's Prometheus exposition.
+
+groups:
+  - name: gatelodge
+    rules:
+      - alert: GatewayDown
+        expr: up{job="gatelodge"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gatelodge replica {{ $labels.instance }} is down"
+          description: "The gateway has failed its scrape for 1 minute."
+
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum by (instance) (rate(gateway_requests_total{status=~"5.."}[5m]))
+            /
+          clamp_min(sum by (instance) (rate(gateway_requests_total[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway error rate above 5%"
+          description: "5xx responses exceed 5% of traffic for 5 minutes on {{ $labels.instance }}."
+
+      - alert: GatewayHighLatency
+        expr: |
+          sum by (instance) (rate(gateway_request_ms_sum[10m]))
+            /
+          clamp_min(sum by (instance) (rate(gateway_request_ms_count[10m])), 0.001)
+            > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway average latency above 10s"
+          description: "Average request latency (incl. model time) exceeds 10 seconds for 10 minutes."
+
+      - alert: GatewayVerifyFailing
+        expr: gateway_verify_failing > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled verification failing"
+          description: "Synthetic verification has been failing for 15 minutes — a backend may be silently broken."
+
+      - alert: GatewayGuardrailSpike
+        expr: sum by (rule) (increase(gateway_guardrail_blocks_total[15m])) > 20
+        labels:
+          severity: info
+        annotations:
+          summary: "Guardrail blocks spiking ({{ $labels.rule }})"
+          description: "More than 20 blocks by rule '{{ $labels.rule }}' in 15 minutes — investigate the traffic pattern."

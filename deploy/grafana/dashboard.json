@@ -1,0 +1,143 @@
+{
+  "title": "Gatelodge Enterprise",
+  "uid": "gatelodge-enterprise",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate (req/s, by status)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(gateway_requests_total[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "title": "Error rate (5xx %)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(gateway_requests_total{status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(gateway_requests_total[$__rate_interval])), 0.001)",
+          "legendFormat": "5xx %"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100 }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "Replicas up",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "count(up{job=\"gatelodge\"} == 1)", "legendFormat": "replicas" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+        { "color": "red", "value": null }, { "color": "green", "value": 1 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "Average latency (ms, by backend)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (backend) (rate(gateway_request_ms_sum[$__rate_interval])) / clamp_min(sum by (backend) (rate(gateway_request_ms_count[$__rate_interval])), 0.001)",
+          "legendFormat": "{{backend}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "title": "Tokens/min (by model)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(gateway_tokens_total[$__rate_interval])) * 60",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "Estimated cost (USD/min, by backend)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (backend) (rate(gateway_cost_usd_total[$__rate_interval])) * 60",
+          "legendFormat": "{{backend}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "title": "Requests/min by consuming key",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (key) (rate(gateway_requests_by_key_total[$__rate_interval])) * 60",
+          "legendFormat": "{{key}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 8,
+      "title": "Guardrail blocks/min (by rule)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (rule) (rate(gateway_guardrail_blocks_total[$__rate_interval])) * 60",
+          "legendFormat": "{{rule}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "title": "Response cache: entries / hit rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        { "expr": "gateway_cache_entries", "legendFormat": "entries ({{instance}})" },
+        {
+          "expr": "100 * rate(gateway_cache_hits_total[$__rate_interval]) / clamp_min(rate(gateway_cache_hits_total[$__rate_interval]) + sum(rate(gateway_requests_total[$__rate_interval])), 0.001)",
+          "legendFormat": "hit % ({{instance}})"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 10,
+      "title": "Verification health",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 24 },
+      "targets": [{ "expr": "max(gateway_verify_failing)", "legendFormat": "failing backends" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "title": "Uptime (s, per replica)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 24 },
+      "targets": [{ "expr": "gateway_uptime_seconds", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    }
+  ]
+}

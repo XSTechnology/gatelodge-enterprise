@@ -29,4 +29,8 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.uv.sources]
-llama-cpp-python = { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" }
+# Windows dev box: prebuilt CUDA wheel; other platforms (the Docker
+# image skips it entirely via --no-install-package) resolve from PyPI.
+llama-cpp-python = [
+  { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu132/llama_cpp_python-0.3.35-py3-none-win_amd64.whl", marker = "sys_platform == 'win32'" },
+]
