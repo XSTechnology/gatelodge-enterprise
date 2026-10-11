@@ -62,8 +62,10 @@ def main() -> None:
     # 30-day trial without a license; an expired trial keeps /healthz
     # alive but the middleware 403s everything else. A valid license
     # file (community OR enterprise claims) removes the limit.
+    # ensure_bootstrapped: the enterprise entry point installs ITS
+    # state before delegating here — this must not clobber it.
     from . import licensing
-    licensing.bootstrap(edition="community")
+    licensing.ensure_bootstrapped(edition="community")
 
     from .config import get_gateway_config
     cfg = get_gateway_config()
