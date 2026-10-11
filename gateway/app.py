@@ -2067,6 +2067,18 @@ async def chat_completions(body: ChatRequest) -> Response:
 RUNPOD_SSE_KEEPALIVE_S = 15.0
 
 
+def _estimate_stream_usage(body: ChatRequest, text_chars: int) -> dict:
+    """Fallback token estimate for streams whose wire format carries no
+    usage (embedded engine, passthrough SSE without a usage chunk):
+    chars//4 on both sides — the same heuristic as the TPM gate's
+    prompt estimate. An ESTIMATE (comment wherever budgets read it);
+    real usage wins whenever the wire provides it."""
+    prompt = len(json.dumps(body.messages, default=str)) // 4
+    comp = text_chars // 4
+    return {"prompt_tokens": prompt, "completion_tokens": comp,
+            "total_tokens": prompt + comp}
+
+
 def _stream_chat(requested: str, entry: tuple[str, str],
                  body: ChatRequest, slot: int) -> StreamingResponse:
     """SSE bridge — embedded engine (think-hold-back), llama-server
@@ -2096,6 +2108,23 @@ def _stream_chat(requested: str, entry: tuple[str, str],
         cfg = get_gateway_config()
         backend = cfg.backends[backend_name]
         t0 = time.perf_counter()
+        # Stream spend accounting (v2.0 fix): streams used to log usage
+        # {} and never charge — invisible to every spend surface. Real
+        # usage wins when the wire provides it (openai include_usage,
+        # SSE chunks carrying usage); otherwise a chars//4 estimate.
+        usage_out: dict[str, Any] = {}
+        text_chars = 0
+
+        def _charge_and_log(ms: int) -> None:
+            usage = usage_out or _estimate_stream_usage(body, text_chars)
+            cost = None
+            if backend.get("type") == "openai":
+                rid = str((backend.get("models") or {}).get(model_key) or "")
+                cost = _cost_usd(cfg, backend_name, rid, usage)
+            _charge_request(cfg, backend_name, usage, cost)
+            _log_request(requested, backend_name, True, ms, usage, 200,
+                         cost_usd=cost)
+
         try:
             if backend.get("type") == "embedded":
                 engine = get_engine()
@@ -2115,6 +2144,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         text = c.delta.get("content")
                         if text:
                             content_buf.append(text)
+                            text_chars += len(text)
                             yield _chunk({"content": text})
                 # If tools were offered, check buffered content for a tool call
                 if body.tools and content_buf:
@@ -2136,7 +2166,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         ms = int((time.perf_counter() - t0) * 1000)
                         logger.info("gateway stream ok (%s / %s) in %dms [tool]",
                                     backend_name, model_key, ms)
-                        _log_request(requested, backend_name, True, ms, {}, 200)
+                        _charge_and_log(ms)
                         return
                 yield _chunk({}, finish="stop")
             elif (backend.get("type") == "llama-server"
@@ -2167,6 +2197,17 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         base, payload, cfg.queue["timeout_s"]):
                     if data == "[DONE]":
                         break
+                    try:                    # usage/content capture
+                        d = json.loads(data)
+                        if isinstance(d, dict):
+                            if d.get("usage"):
+                                usage_out = d["usage"]
+                            ch0 = ((d.get("choices") or [{}])[0]
+                                   .get("delta") or {}).get("content")
+                            if ch0:
+                                text_chars += len(ch0)
+                    except ValueError:
+                        pass
                     yield f"data: {data}\n\n"
             elif (backend.get("type") == "runpod"
                     and not backend["models"][model_key].get("endpoint_id")):
@@ -2215,6 +2256,17 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                             base, payload, cfg.queue["timeout_s"]):
                         if data == "[DONE]":
                             break
+                        try:                # usage/content capture
+                            d = json.loads(data)
+                            if isinstance(d, dict):
+                                if d.get("usage"):
+                                    usage_out = d["usage"]
+                                ch0 = ((d.get("choices") or [{}])[0]
+                                       .get("delta") or {}).get("content")
+                                if ch0:
+                                    text_chars += len(ch0)
+                        except ValueError:
+                            pass
                         yield f"data: {data}\n\n"
             elif (backend.get("type") == "runpod"
                     and backend["models"][model_key].get("endpoint_id")
@@ -2260,6 +2312,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         {k: v for k, v in body_input.items() if k != "stream"},
                         api_env, tmo, policy=m.get("policy"))
                     resp = runpod.ollama_output_to_openai(out, requested)
+                    usage_out = resp.get("usage") or usage_out
                     choice = resp["choices"][0]
                     if choice["message"].get("content"):
                         yield _chunk({"content": choice["message"]["content"]})
@@ -2283,6 +2336,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     m["model_slug"], body_input, api_env, tmo,
                     policy=m.get("policy"))
                 resp = runpod.ollama_output_to_openai(out, requested)
+                usage_out = resp.get("usage") or usage_out
                 choice = resp["choices"][0]
                 if choice["message"].get("content"):
                     yield _chunk({"content": choice["message"]["content"]})
@@ -2316,6 +2370,12 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     "model": remote_id,
                     "messages": body.messages, "stream": True,
                 }
+                if backend.get("type") == "openai":
+                    # real usage for the charge/log tail (OpenAI spec:
+                    # a final usage-only chunk). Other OpenAI-compatible
+                    # providers may not accept the param — openai type
+                    # only.
+                    kwargs["stream_options"] = {"include_usage": True}
                 if body.temperature is not None:
                     kwargs["temperature"] = body.temperature
                 if body.max_tokens:
@@ -2332,6 +2392,18 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                                 "one retry", backend_name)
                     stream = await client.chat.completions.create(**kwargs)
                 async for chunk in stream:
+                    u = getattr(chunk, "usage", None)
+                    if u:
+                        usage_out = (u if isinstance(u, dict)
+                                     else (u.model_dump()
+                                           if hasattr(u, "model_dump")
+                                           else dict(u)))
+                    try:
+                        cs = getattr(chunk, "choices", None)
+                        if cs and getattr(cs[0].delta, "content", None):
+                            text_chars += len(cs[0].delta.content)
+                    except Exception:      # noqa: BLE001 — passthrough
+                        pass
                     data = (chunk.model_dump_json()
                             if hasattr(chunk, "model_dump_json")
                             else json.dumps(chunk))
@@ -2340,7 +2412,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             ms = int((time.perf_counter() - t0) * 1000)
             logger.info("gateway stream ok (%s / %s) in %dms",
                         backend_name, model_key, ms)
-            _log_request(requested, backend_name, True, ms, {}, 200)
+            _charge_and_log(ms)
         except lifecycle.LifecycleBudgetExceeded as e:
             ms = int((time.perf_counter() - t0) * 1000)
             yield "data: " + json.dumps({"error": {
