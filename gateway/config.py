@@ -862,6 +862,16 @@ class GatewayConfig:
             self.admin_bind = env_admin_bind
         self.models_dir = _resolve_dir(raw.get("models_dir"))
         self.gateway_keys = [str(k) for k in (raw.get("gateway_keys") or [])]
+        # URL-token auth (v2.x): keyless clients that only take an
+        # endpoint URL. "path" → /<token>/v1/... (the middleware
+        # rewrites to canonical /v1/... and hands the token to
+        # resolve_key_link); "query" → ?key=... on the normal paths.
+        # Both OFF by default: tokens in URLs surface in proxy/access
+        # logs — enable only for clients that cannot send headers.
+        a = raw.get("auth")
+        a = a if isinstance(a, dict) else {}
+        tf = {str(x).strip().lower() for x in (a.get("token_forms") or [])}
+        self.auth_token_forms = tf & {"path", "query"}
         self.default_alias = str(raw.get("default_alias") or "").strip()
         self.backends = _normalize_backends(raw.get("backends"))
         self.aliases = _normalize_aliases(raw.get("aliases"))

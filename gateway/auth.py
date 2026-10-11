@@ -57,6 +57,7 @@ import hmac
 import logging
 import re
 import time
+import urllib.parse
 from typing import Any, Callable
 
 from fastapi import Request
@@ -75,6 +76,10 @@ logger = logging.getLogger(__name__)
 # THE definition — app.py imports these (see module docstring).
 _REQUEST_KEY_ID = contextvars.ContextVar("gw_request_key", default="")
 _REQUEST_ID = contextvars.ContextVar("gw_request_id", default="")
+# URL-token (v2.x path form): the token from /<token>/v1/... — set by
+# the middleware rewrite below, read by resolve_key_link as a bearer
+# fallback. Reset on EVERY request (no cross-request leakage).
+_REQUEST_URL_TOKEN = contextvars.ContextVar("gw_url_token", default="")
 # Session id (v1.4 session budgets): set by the middleware from the
 # x-session-id header when session_budgets.enabled — read by the charge
 # hook (session:<id> spend scope) and the request log. Empty when the
@@ -104,6 +109,48 @@ def _sha256_hex(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# ── URL-token auth (v2.x) ──────────────────────────────────────────────────
+
+# Top-level path segments that are NEVER a URL-token: route namespace
+# first, token second — /<token>/v1/... is the ONLY rewritten shape.
+_RESERVED_TOP = frozenset(
+    ("v1", "admin", "teams", "scim", "mcp", "healthz", "metrics",
+     "favicon.ico", "docs", "redoc", "openapi.json"))
+
+
+def apply_url_token_forms(request: Request, cfg) -> str:
+    """URL-token PATH form (auth.token_forms = ["path"]): a keyless
+    client — an AI product whose only configurable field is an
+    endpoint URL — points at http://gw/<token>/v1 and the gateway
+    reads the key from the path. Rewrites the request scope to the
+    canonical /v1/... (routing, cache keys, spans, rate windows and
+    the split-port shims all see the same path a bearer client sends)
+    and parks the token in _REQUEST_URL_TOKEN for resolve_key_link.
+
+    Inert unless "path" is enabled; the QUERY form (?key=) needs no
+    rewrite — resolve_key_link reads it directly (also gated). Returns
+    the form applied ("path" or ""). Resets the ContextVar on EVERY
+    request — no cross-request token leakage under context reuse.
+    """
+    _REQUEST_URL_TOKEN.set("")
+    if "path" not in (getattr(cfg, "auth_token_forms", None) or ()):
+        return ""
+    path = request.scope.get("path") or ""
+    rest = path[1:] if path.startswith("/") else path
+    seg, _, tail = rest.partition("/")
+    if (not seg or seg in _RESERVED_TOP
+            or (tail != "v1" and not tail.startswith("v1/"))):
+        return ""
+    token = urllib.parse.unquote(seg)
+    if not token:
+        return ""
+    canonical = "/" + tail                    # /v1 or /v1/...
+    request.scope["path"] = canonical
+    request.scope["raw_path"] = canonical.encode()
+    _REQUEST_URL_TOKEN.set(token)
+    return "path"
+
+
 # ── core auth links ────────────────────────────────────────────────────────
 
 def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
@@ -114,6 +161,11 @@ def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     Virtual keys are hash-compared (constant-time). When NO keys are
     configured (open mode) everything passes with key_id=''.
 
+    Token precedence: Authorization header (explicit, never logged)
+    → URL path form /<token>/v1/... (set by apply_url_token_forms)
+    → query ?key= (only when auth.token_forms lists "query" — the
+    token surfaces in proxy logs, hence the separate gate).
+
     Sets _REQUEST_KEY_ID; returns 401 when keys are configured and the
     token is missing/unknown."""
     if not (cfg.gateway_keys or cfg.api_keys):
@@ -121,6 +173,10 @@ def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
         return None
     auth = request.headers.get("authorization") or ""
     token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not token:
+        token = _REQUEST_URL_TOKEN.get()      # path form (middleware)
+    if not token and "query" in (cfg.auth_token_forms or ()):
+        token = (request.query_params.get("key") or "").strip()
     resolved = _resolve_bearer(cfg, token)
     _REQUEST_KEY_ID.set(resolved)
     if not resolved:

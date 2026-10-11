@@ -143,7 +143,7 @@ from . import auth
 from .auth import (AuthPipeline, get_auth_pipeline, set_auth_pipeline,
                    _REQUEST_KEY_ID, _REQUEST_ID, _REQUEST_SESSION_ID,
                    _REQUEST_TEAM, _resolve_bearer, _sha256_hex,
-                   session_id_from_header)
+                   apply_url_token_forms, session_id_from_header)
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
@@ -635,6 +635,12 @@ def _rid_response(resp: Response, rid: str) -> Response:
 async def _bearer_auth(request: Request, call_next):
     cfg = get_gateway_config()
     cfg.maybe_reload()
+    # URL-token auth (v2.x): /<token>/v1/... → canonical /v1/... with
+    # the token riding _REQUEST_URL_TOKEN into the auth pipeline
+    # (query form ?key= is read inside resolve_key_link). Runs BEFORE
+    # the first request.url read so the license gate, span, routing
+    # and cache keys all see the canonical path a bearer client sends.
+    apply_url_token_forms(request, cfg)
     # Request id: honor inbound x-request-id (≤64 chars), else mint one.
     # Echoed on EVERY response and stamped into every log line.
     rid = ((request.headers.get("x-request-id") or "").strip())[:64] \
