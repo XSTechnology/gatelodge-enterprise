@@ -410,6 +410,10 @@ def rbac_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
         return None
     if key_id != "admin":
         return None
+    if path == "/admin/whoami":
+        return None  # self-describing: reveals only the caller's own
+        # principal. Every role must be able to learn its role — the
+        # console's awareness gate depends on it.
     role, who, _ = current_principal(cfg, request, key_id)
     if allowed(role, request.method, path):
         logger.debug("rbac allow %s %s (role %s)", request.method, path, role)
