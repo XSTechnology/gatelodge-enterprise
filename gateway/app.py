@@ -136,6 +136,7 @@ from . import upload
 # enterprise swaps it via set_auth_pipeline(). _REQUEST_KEY_ID /
 # _REQUEST_ID are defined in auth.py — imported here so the whole app
 # shares ONE ContextVar object per name.
+from . import auth
 from .auth import (AuthPipeline, get_auth_pipeline, set_auth_pipeline,
                    _REQUEST_KEY_ID, _REQUEST_ID, _resolve_bearer,
                    _sha256_hex)
@@ -472,11 +473,13 @@ async def prometheus_metrics() -> Response:
 # clears the window (one minute of slack, acceptable for an RPM limiter).
 
 _RATE_WINDOWS = NamespaceDict("rate_windows")
+_RATE_TPM_WINDOWS = NamespaceDict("rate_tpm_windows")
 
 
 def reset_rate_windows() -> None:
     """Drop rate windows (tests)."""
     _RATE_WINDOWS.clear()
+    _RATE_TPM_WINDOWS.clear()
 
 
 def _rid_response(resp: Response, rid: str) -> Response:
@@ -766,15 +769,19 @@ def _charge_request(cfg, backend_name: str, usage: dict,
                     cost_usd: float | None) -> None:
     """Charge a successful request: the backend's token ledger
     (openai-type, costed) + the consuming key's ledger (tokens always,
-    usd when priced) + the 80%-of-budget alert."""
+    usd when priced) + the key's TPM window (when rate_limit_tpm is
+    configured) + the 80%-of-budget alert."""
     tokens = int((usage or {}).get("total_tokens") or 0)
     backend = cfg.backends.get(backend_name) or {}
     if backend.get("type") == "openai":
         _charge_scope(f"backend:{backend_name}", tokens, cost_usd)
     kid = _REQUEST_KEY_ID.get()
     if kid and kid != "admin":
+        entry = (cfg.api_keys or {}).get(kid) or {}
         _charge_scope(f"key:{kid}", tokens, cost_usd)
-        _maybe_spend_alert(kid, (cfg.api_keys or {}).get(kid) or {})
+        if int(entry.get("rate_limit_tpm") or 0) > 0:
+            auth._tpm_charge(kid, tokens)
+        _maybe_spend_alert(kid, entry)
 
 
 def _maybe_spend_alert(key_id: str, entry: dict) -> None:
@@ -4678,6 +4685,7 @@ class ApiKeyPayload(BaseModel):
     monthly_usd_budget: float | None = None
     models: list[str] | None = None  # allowlist (empty = all)
     rate_limit_rpm: int | None = None
+    rate_limit_tpm: int | None = None
     delete: bool = False
 
 
@@ -4701,6 +4709,7 @@ async def admin_keys() -> Response:
             "monthly_usd_budget": float(e.get("monthly_usd_budget") or 0),
             "models": list(e.get("models") or []),
             "rate_limit_rpm": int(e.get("rate_limit_rpm") or 0),
+            "rate_limit_tpm": int(e.get("rate_limit_tpm") or 0),
             "used_tokens": spend["tokens"],
             "used_usd": round(spend["usd"], 6),
             "month": month,
@@ -4742,6 +4751,7 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
         "models": [str(m).strip() for m in (payload.models or [])
                    if str(m).strip()],
         "rate_limit_rpm": max(0, int(payload.rate_limit_rpm or 0)),
+        "rate_limit_tpm": max(0, int(payload.rate_limit_tpm or 0)),
     }
     # mint the plaintext key whose hash we stored
     plaintext = f"vk-{secrets.token_urlsafe(24)}"

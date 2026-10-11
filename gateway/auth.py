@@ -167,28 +167,105 @@ def _key_rate_limit(key_id: str, rpm: int) -> float:
 
 
 def rate_limit_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
-    """Link 3: per-key RPM (requests/minute, sliding 60s window) on the
-    serving surface. Admin keys and open mode are unlimited. Returns 429
-    on over-limit."""
+    """Link 3: per-key limits on the serving surface. Admin keys and
+    open mode are unlimited. Returns 429 on over-limit.
+
+    RPM (requests/minute): a sliding 60s window counting ADMISSIONS —
+    recorded at gate time, denied requests are not counted.
+
+    TPM (tokens/minute): a sliding 60s window of ACTUAL token usage,
+    charged after each successful request (auth._tpm_charge from
+    _charge_request). The gate admits when window-usage + a prompt-size
+    estimate (request body bytes // 4 — cheap, no body read) fits the
+    limit. Concurrency note: parallel in-flight requests are each
+    gated against the pre-request window, so a burst can overshoot —
+    the same relaxation every rolling-window token limiter makes;
+    RPM's admission-counting does not share it."""
     if not key_id or key_id == "admin":
         return None
     if not request.url.path.startswith("/v1/"):
         return None
     entry = (cfg.api_keys or {}).get(key_id) or {}
     rpm = int(entry.get("rate_limit_rpm") or 0)
-    if rpm <= 0:
-        return None
-    retry_after = _key_rate_limit(key_id, rpm)
-    if retry_after > 0:
-        return JSONResponse(
-            status_code=429,
-            content={"error": {
-                "message": (f"key {key_id!r}: rate limit "
-                            f"({rpm} requests/minute)"),
-                "type": "rate_limit_error", "param": None,
-                "code": "rate_limited"}},
-            headers={"Retry-After": str(int(retry_after) + 1)})
+    if rpm > 0:
+        retry_after = _key_rate_limit(key_id, rpm)
+        if retry_after > 0:
+            return JSONResponse(
+                status_code=429,
+                content={"error": {
+                    "message": (f"key {key_id!r}: rate limit "
+                                f"({rpm} requests/minute)"),
+                    "type": "rate_limit_error", "param": None,
+                    "code": "rate_limited"}},
+                headers={"Retry-After": str(int(retry_after) + 1)})
+    tpm = int(entry.get("rate_limit_tpm") or 0)
+    if tpm > 0:
+        retry_after = _tpm_gate(key_id, tpm, _prompt_estimate(request))
+        if retry_after > 0:
+            return JSONResponse(
+                status_code=429,
+                content={"error": {
+                    "message": (f"key {key_id!r}: token rate limit "
+                                f"({tpm} tokens/minute)"),
+                    "type": "rate_limit_error", "param": None,
+                    "code": "rate_limited"}},
+                headers={"Retry-After": str(int(retry_after) + 1)})
     return None
+
+
+# ── TPM (tokens/minute) — window state + helpers ───────────────────────────
+
+def _prompt_estimate(request: Request) -> int:
+    """Rough prompt-size estimate for the TPM pre-gate: request body
+    bytes // 4 (≈ chars/4 ≈ tokens for English JSON). Reads only the
+    Content-Length header — no body parse. Zero when unknown (GETs,
+    chunked bodies): the gate then checks the charged window alone."""
+    try:
+        cl = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        return 0
+    return max(0, cl) // 4
+
+
+def _tpm_window(key_id: str) -> list[list[float]]:
+    """This key's fresh (≤60s old) [ts, tokens] charges. Prunes expired
+    entries on read; rides the storage backend (namespace
+    "rate_tpm_windows") — shared across replicas when the backend is."""
+    now = time.time()
+    win = []
+    for e in (get_storage().get("rate_tpm_windows", key_id) or []):
+        try:
+            if isinstance(e, (list, tuple)) and len(e) == 2 \
+                    and now - float(e[0]) <= 60.0:
+                win.append([float(e[0]), float(e[1])])
+        except (TypeError, ValueError):
+            continue
+    return win
+
+
+def _tpm_gate(key_id: str, tpm: int, estimate: int) -> float:
+    """Admission check for the token window: 0.0 when the window's
+    charged usage + the incoming estimate fits the limit, else the
+    seconds until the oldest charge leaves the 60s window
+    (Retry-After). The estimate is NEVER recorded — only actual usage
+    is charged, after the request."""
+    win = _tpm_window(key_id)
+    used = sum(e[1] for e in win)
+    if used + estimate <= tpm:
+        return 0.0
+    oldest = min((e[0] for e in win), default=time.time())
+    return max(0.0, 60.0 - (time.time() - oldest))
+
+
+def _tpm_charge(key_id: str, tokens: int) -> None:
+    """Append actual usage to the key's TPM window (called from
+    _charge_request after a successful request). Read-modify-write,
+    never in-place — a swapped (shared) backend sees explicit sets."""
+    if tokens <= 0:
+        return
+    win = _tpm_window(key_id)
+    win.append([time.time(), float(tokens)])
+    get_storage().set("rate_tpm_windows", key_id, win)
 
 
 # ── governance links (inert without config — see module docstring) ─────────

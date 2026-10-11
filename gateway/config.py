@@ -482,8 +482,8 @@ def _looks_hashed(raw: str) -> bool:
 
 def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
     """api_keys: list of {id, key | key_hash, owner?, note?,
-    monthly_token_budget?, monthly_usd_budget?, models?, rate_limit_rpm?}
-    → {id: entry}.
+    monthly_token_budget?, monthly_usd_budget?, models?, rate_limit_rpm?,
+    rate_limit_tpm?} → {id: entry}.
 
     KEYS ARE HASHED AT REST: a plaintext `key` is converted to
     `key_hash` (sha256) at load time and the plaintext is dropped from
@@ -517,6 +517,10 @@ def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
             rpm = max(0, int(k.get("rate_limit_rpm") or 0))
         except (TypeError, ValueError):
             rpm = 0
+        try:
+            tpm = max(0, int(k.get("rate_limit_tpm") or 0))
+        except (TypeError, ValueError):
+            tpm = 0
         models = [str(m).strip() for m in (k.get("models") or [])
                   if str(m).strip()]
         out[kid] = {
@@ -527,6 +531,7 @@ def _normalize_api_keys(raw: Any) -> dict[str, dict[str, Any]]:
             "monthly_usd_budget": usd_b,
             "models": models,
             "rate_limit_rpm": rpm,
+            "rate_limit_tpm": tpm,
         }
     return out
 
