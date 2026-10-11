@@ -99,6 +99,29 @@ def _wire_scim(enabled: bool = True) -> None:
     set_extra_router(build_router(), prefix="/scim")
 
 
+def _wire_mcp(enabled: bool = True) -> None:
+    """Mount the MCP gateway surface (gateway_enterprise/mcp.py) via the
+    ADDITIVE router seam (v2.0 — SCIM at /scim and MCP at /mcp coexist;
+    wiring order matters: scim mounts first, mcp ADDS). License-claimed:
+    the 'mcp' feature key — enterprise licenses carry it by default, and
+    an unlicensed binary ignores the mcp section entirely."""
+    from gateway import config as gw_config
+    from gateway.app import add_extra_router
+    if not enabled:
+        import logging
+        logging.getLogger("gateway.enterprise").warning(
+            "MCP gateway NOT licensed — the mcp config section is "
+            "ignored")
+        return
+    raw = gw_config.get_gateway_config().store.load()
+    mcp = raw.get("mcp") if isinstance(raw, dict) else None
+    mcp = mcp if isinstance(mcp, dict) else {}
+    if not mcp.get("enabled"):
+        return
+    from gateway_enterprise.mcp import build_router
+    add_extra_router(build_router(), prefix="/mcp")
+
+
 def _wire_auth_pipeline(session_budgets: bool) -> None:
     """Install the enterprise auth pipeline (core governance + the
     session-budget gate when licensed). Without the session_budgets
@@ -144,6 +167,7 @@ def main() -> None:
     # three keys).
     _wire_tier_d(enabled=licensing.allows("tier_d"))
     _wire_scim(enabled=licensing.allows("scim"))
+    _wire_mcp(enabled=licensing.allows("mcp"))
 
     # v1.4: session budgets — the ENTERPRISE link (inert without the
     # session_budgets section; the core carries the charge hook). The
