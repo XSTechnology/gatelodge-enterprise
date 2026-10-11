@@ -226,6 +226,51 @@ def test_shared_rate_window_two_clients(wired, gguf, monkeypatch):
         reset_storage()
 
 
+def test_shared_tpm_window_two_clients(wired, gguf, monkeypatch):
+    """TPM windows ride the shared backend too: usage charged via
+    client 1 lands in shared storage, and a window populated across
+    replicas (the same write another replica's charge makes) gates
+    client 2 — multi-replica token limiting."""
+    import time as _time
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    cfgd = _config(gguf)
+    cfgd["gateway_keys"] = ["admin-secret"]
+    cfgd["api_keys"] = [{"id": "tok-limited", "key": "vk-tok",
+                         "rate_limit_tpm": 100}]
+    wired(cfgd)
+    _patch_cloud(monkeypatch, _FakeCloud())
+    server = fakeredis.FakeRedis()
+    set_storage(RedisStorage(client=server))
+    try:
+        # client 1: three UNIQUE requests (cache-busting content) →
+        # 3 × 8 tokens charged into the SHARED window
+        with TestClient(gw_app.app) as c1:
+            for i in range(3):
+                body = {"model": "groq:cloud-fast",
+                        "messages": [{"role": "user",
+                                      "content": f"tpm-shared-{i}"}]}
+                r = c1.post("/v1/chat/completions",
+                            headers=auth("vk-tok"), json=body)
+                assert r.status_code == 200, r.text
+        win = RedisStorage(client=server).get(
+            "rate_tpm_windows", "tok-limited")
+        assert len(win) == 3 and sum(e[1] for e in win) == 24.0
+        # another replica's charges accumulate in the same window (the
+        # exact write _tpm_charge makes) → 90 tokens outstanding
+        RedisStorage(client=server).set(
+            "rate_tpm_windows", "tok-limited", [[_time.time(), 90.0]])
+        # client 2 (a second "replica"): 90 + prompt estimate > 100 →
+        # 429 before the backend
+        with TestClient(gw_app.app) as c2:
+            r2 = c2.post("/v1/chat/completions",
+                         headers=auth("vk-tok"), json=CHAT_BODY)
+            assert r2.status_code == 429, r2.text
+            assert "token rate limit" in r2.json()["error"]["message"]
+    finally:
+        reset_storage()
+
+
 def test_response_cache_shared_two_clients(wired, gguf, monkeypatch):
     """Identical request from the second client is served from the
     SHARED response cache — the cloud backend sees exactly one call."""
