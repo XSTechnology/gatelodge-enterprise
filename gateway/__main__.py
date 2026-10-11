@@ -19,14 +19,21 @@ import sys
 
 
 def _load_secret_env() -> None:
-    """api_key_env vars → OS keyring fallback. Never logs values."""
+    """api_key_env vars + sso.client_secret_env → OS keyring fallback.
+    Never logs values."""
     try:
         import keyring
     except ImportError:
         return
     from .config import get_gateway_config
-    names = {b.get("api_key_env")
-             for b in get_gateway_config().backends.values()}
+    cfg = get_gateway_config()
+    names = {b.get("api_key_env") for b in cfg.backends.values()}
+    # sso.client_secret_env rides the same boot bridge (governance is
+    # core; the IdP client secret follows the api_key_env convention)
+    raw = cfg.store.load()
+    sso = raw.get("sso") if isinstance(raw, dict) else None
+    if isinstance(sso, dict):
+        names.add(sso.get("client_secret_env"))
     for name in sorted(n for n in names if n):
         if os.environ.get(name):
             continue
