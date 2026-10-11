@@ -19,6 +19,7 @@ import logging
 import os
 from typing import Any
 
+import httpx
 from openai import (APIConnectionError, APITimeoutError, AsyncOpenAI)
 
 logger = logging.getLogger(__name__)
@@ -100,27 +101,50 @@ def resolve_backend_key(backend: dict[str, Any]) -> str:
 
 def get_cloud_client(name: str, backend: dict[str, Any],
                      timeout: float = 120.0) -> AsyncOpenAI:
-    """Cached AsyncOpenAI client for a configured openai-type backend."""
+    """Cached AsyncOpenAI client for a configured openai-type backend.
+    auth: sigv4 / adc backends get a platform-chain httpx.Auth instead
+    of a static key (gateway/credchains.py) — no secret at rest."""
     base_url = str(backend.get("base_url") or "").strip()
     key_env = str(backend.get("api_key_env") or "").strip()
-    sig = f"{base_url}\x00{key_env}"
+    auth_mode = str(backend.get("auth") or "").strip().lower()
+    sig = f"{base_url}\x00{key_env}\x00{auth_mode}"
     cached = _CLIENTS.get(name)
     if cached is not None and cached[0] == sig:
         return cached[1]
-    api_key = resolve_backend_key(backend)
-    if key_env and not api_key:
-        raise CloudBackendError(
-            f"cloud backend {name!r}: api key env var {key_env!r} is not set "
-            f"and the OS keyring has no '{key_env}' entry")
     try:
-        client = AsyncOpenAI(base_url=base_url or None,
-                             api_key=api_key or "not-set",
-                             timeout=timeout)
+        if auth_mode == "sigv4":
+            from .credchains import SigV4Auth
+            client = AsyncOpenAI(
+                base_url=base_url or None, api_key="sigv4",
+                timeout=timeout,
+                http_client=httpx.AsyncClient(auth=SigV4Auth(
+                    region=str(backend.get("region") or "")),
+                    timeout=timeout))
+        elif auth_mode == "adc":
+            from .credchains import ADCAuth
+            client = AsyncOpenAI(
+                base_url=base_url or None, api_key="adc",
+                timeout=timeout,
+                http_client=httpx.AsyncClient(auth=ADCAuth(),
+                                              timeout=timeout))
+        else:
+            api_key = resolve_backend_key(backend)
+            if key_env and not api_key:
+                raise CloudBackendError(
+                    f"cloud backend {name!r}: api key env var {key_env!r} is "
+                    f"not set and the OS keyring has no '{key_env}' entry")
+            client = AsyncOpenAI(base_url=base_url or None,
+                                 api_key=api_key or "not-set",
+                                 timeout=timeout)
+    except CloudBackendError:
+        raise
     except Exception as e:  # bad base_url etc.
         raise CloudBackendError(
             f"cloud backend {name!r} client init failed: {e}") from e
     _CLIENTS[name] = (sig, client)
-    logger.info("cloud client ready: %s -> %s", name, base_url or "(openai default)")
+    logger.info("cloud client ready: %s -> %s%s", name,
+                base_url or "(openai default)",
+                f" (auth: {auth_mode})" if auth_mode else "")
     return client
 
 

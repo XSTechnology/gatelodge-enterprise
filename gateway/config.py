@@ -429,6 +429,13 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
             # env var → api_key_file → api_key_cmd → OS keyring.
             entry["api_key_file"] = str(b.get("api_key_file") or "").strip()
             entry["api_key_cmd"] = str(b.get("api_key_cmd") or "").strip()
+            # Platform credential chains (v1.4): auth: sigv4 (AWS env-var
+            # chain, per-request signer) or auth: adc (Google Application
+            # Default Credentials, cached token) — no static key at rest
+            # (gateway/credchains.py). Empty = classic api-key auth.
+            _auth = str(b.get("auth") or "").strip().lower()
+            entry["auth"] = _auth if _auth in ("sigv4", "adc") else ""
+            entry["region"] = str(b.get("region") or "").strip()
             # Monthly token budget (0 = off): the gateway counts usage from
             # its own request log (cache hits never bill — they log as
             # backend "cache") and refuses with 503 budget_exceeded once
