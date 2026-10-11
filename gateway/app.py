@@ -153,7 +153,7 @@ from .storage import NamespaceDict, NamespaceSet, get_storage, reset_storage
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Gatelodge", version="1.2.1")
+app = FastAPI(title="Gatelodge", version="1.3.0")
 
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
