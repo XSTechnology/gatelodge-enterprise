@@ -127,6 +127,7 @@ from . import cloud
 from . import catalog
 from . import capabilities
 from . import lifecycle
+from . import licensing
 from . import llamaserver
 from . import modelsearch
 from . import providers
@@ -529,6 +530,20 @@ async def _bearer_auth(request: Request, call_next):
     rid = ((request.headers.get("x-request-id") or "").strip())[:64] \
         or uuid.uuid4().hex[:16]
     _REQUEST_ID.set(rid)
+    # Licensing (v1.5 closed distribution): an expired trial/license
+    # stops serving — every route except /healthz answers 403
+    # license_expired so the operator can still see WHY. Unmanaged
+    # (source runs / tests — pre-bootstrap) passes through; the
+    # enterprise binary never serves unlicensed (its entry point exits
+    # before uvicorn starts). Evaluated at most once per minute.
+    lic_ok, lic_mode = licensing.request_allowed()
+    if not lic_ok and request.url.path != "/healthz":
+        return _rid_response(_error(
+            403,
+            f"Gatelodge license/trial has expired ({lic_mode}) — serving "
+            "is disabled. Install a valid data/license.json (or set "
+            "GATELODGE_LICENSE) and restart.",
+            "license_expired"), rid)
     # Session budgets (v1.4): capture the validated x-session-id when
     # the feature is enabled — the charge hook and request log read it.
     if (cfg.session_budgets or {}).get("enabled"):
@@ -3393,6 +3408,7 @@ async def healthz() -> dict[str, Any]:
     return {
         "status": "ok",
         "version": app.version,
+        "license": licensing.healthz_license(),
         "bind": cfg.bind,
         "port": cfg.port,
         "models_dir": cfg.models_dir,
@@ -4167,6 +4183,16 @@ async def admin_whoami(request: Request) -> Response:
                            "email": str(identity.get("email") or ""),
                            "tenant": str(identity.get("tenant") or "")}
     return out
+
+
+@app.get("/admin/license")
+async def admin_license() -> dict[str, Any]:
+    """Licensing status (v1.5 closed distribution): mode, license
+    claims (edition/customer/vendor/support/features/expiry) or trial
+    window. Read-only, behind the admin pipeline + RBAC like every
+    /admin GET. Claims are visible here — never on /healthz (that
+    surface is unauthenticated)."""
+    return licensing.status()
 
 
 @app.get("/admin/config")

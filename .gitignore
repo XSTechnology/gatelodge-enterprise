@@ -2,6 +2,9 @@
 data/
 .env
 
+# Vendor license-signing key (the crown jewel — offline custody)
+vendor_keys/
+
 # Python
 .venv/
 __pycache__/
