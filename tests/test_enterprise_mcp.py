@@ -11,6 +11,8 @@ surface, proven live:
 """
 import hashlib
 import json
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -282,6 +284,169 @@ def test_tool_call_span_parented(wired, gguf, monkeypatch):  # noqa: F811
               for a in tool["attributes"]}
     assert tattrs["mcp.server"] == "stub"
     assert tattrs["mcp.status"] == "ok"
+
+
+# ── stdio transports (REAL child processes) ────────────────────────────────
+
+STUB_STDIO = r'''
+import json, os, sys
+
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+
+TOOLS = [
+    {"name": "echo", "description": "Echo text back",
+     "inputSchema": {"type": "object"}},
+    {"name": "env", "description": "Read an env var",
+     "inputSchema": {"type": "object"}},
+]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    m = json.loads(line)
+    mid, method = m.get("id"), m.get("method")
+    p = m.get("params") or {}
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "stdio-stub", "version": "1"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
+    elif method == "tools/call" and p.get("name") == "echo":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text",
+                         "text": str((p.get("arguments") or {})
+                                     .get("text", ""))}],
+            "isError": False}})
+    elif method == "tools/call" and p.get("name") == "env":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text",
+                         "text": os.environ.get(
+                             str((p.get("arguments") or {})
+                                 .get("var", "")), "")}],
+            "isError": False}})
+    elif method == "tools/call" and p.get("name") == "boom":
+        sys.exit(1)                     # die mid-call (restart test)
+    elif mid is not None:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    # notifications (no id): nothing to answer
+'''
+
+
+def _stdio_config(gguf, stub_path, env=None):
+    cfg = _config(gguf)
+    server: dict = {"command": [sys.executable, str(stub_path)]}
+    if env:
+        server["env"] = env
+    cfg["mcp"] = {"enabled": True, "keys": [KH],
+                  "servers": {"local": server}}
+    return cfg
+
+
+def _write_stub(tmp_path) -> Path:
+    p = tmp_path / "mcp_stdio_stub.py"
+    p.write_text(STUB_STDIO, encoding="utf-8")
+    return p
+
+
+def test_stdio_tools_list_and_call(wired, gguf, tmp_path):  # noqa: F811
+    """A REAL child process: the gateway spawns the stub, handshakes,
+    lists tools (namespaced) and round-trips a call."""
+    wired(_stdio_config(gguf, _write_stub(tmp_path)))
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    try:
+        with TestClient(gw_app.app) as client:
+            names = [t["name"] for t in
+                     _rpc(client, "tools/list").json()["result"]["tools"]]
+            assert names == ["local.echo", "local.env"]
+            r = _rpc(client, "tools/call", {
+                "name": "local.echo",
+                "arguments": {"text": "from a child process"}})
+            assert r.json()["result"]["content"][0]["text"] == \
+                "from a child process"
+    finally:
+        gw_app.set_extra_router(None, prefix="/mcp")
+
+
+def test_stdio_env_passes_through(wired, gguf, tmp_path):  # noqa: F811
+    """Server env entries ride atop the gateway environment."""
+    wired(_stdio_config(gguf, _write_stub(tmp_path),
+                        env={"GATELODGE_TEST_ENV": "injected-42"}))
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    try:
+        with TestClient(gw_app.app) as client:
+            r = _rpc(client, "tools/call", {
+                "name": "local.env",
+                "arguments": {"var": "GATELODGE_TEST_ENV"}})
+            assert r.json()["result"]["content"][0]["text"] == "injected-42"
+    finally:
+        gw_app.set_extra_router(None, prefix="/mcp")
+
+
+def test_stdio_child_death_respawns(wired, gguf, tmp_path):  # noqa: F811
+    """A child that DIES mid-call (boom → exit 1): the call fails with
+    -32003, the NEXT call transparently respawns the child and works."""
+    wired(_stdio_config(gguf, _write_stub(tmp_path)))
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    try:
+        with TestClient(gw_app.app) as client:
+            boom = _rpc(client, "tools/call", {"name": "local.boom"})
+            assert boom.json()["error"]["code"] == -32003
+            # the respawn happens on the next call
+            ok = _rpc(client, "tools/call", {
+                "name": "local.echo", "arguments": {"text": "revived"}})
+            assert ok.status_code == 200
+            assert ok.json()["result"]["content"][0]["text"] == "revived"
+    finally:
+        gw_app.set_extra_router(None, prefix="/mcp")
+
+
+def test_stdio_and_http_servers_coexist(wired, gguf, tmp_path, monkeypatch):  # noqa: F811
+    """One registry, both transports: stdio (real child) + HTTP
+    (mock transport) side by side, tools merged + namespaced."""
+    seen = []
+    monkeypatch.setattr(
+        mcp, "_new_async_client",
+        lambda url, headers: httpx.AsyncClient(
+            transport=httpx.MockTransport(_stub_handler(seen)), headers=headers,
+            timeout=5.0))
+    cfg = _stdio_config(gguf, _write_stub(tmp_path))
+    cfg["mcp"]["servers"]["remote"] = {"url": "http://stub.internal/mcp"}
+    wired(cfg)
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    try:
+        with TestClient(gw_app.app) as client:
+            names = sorted(t["name"] for t in
+                           _rpc(client, "tools/list")
+                           .json()["result"]["tools"])
+            assert names == ["local.echo", "local.env",
+                             "remote.add", "remote.echo"]
+    finally:
+        gw_app.set_extra_router(None, prefix="/mcp")
+
+
+def test_stdio_governed_audit(wired, gguf, tmp_path):  # noqa: F811
+    """stdio tool calls get the SAME governance: chained audit record."""
+    wired(_stdio_config(gguf, _write_stub(tmp_path)))
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    try:
+        with TestClient(gw_app.app) as client:
+            _rpc(client, "tools/call", {
+                "name": "local.echo", "arguments": {"text": "audited"}})
+        p = gw_app._LOG_PATH.parent / "config-audit.jsonl"
+        recs = [json.loads(l) for l in
+                p.read_text(encoding="utf-8").strip().splitlines()
+                if l.strip()]
+        rec = [r for r in recs
+               if r.get("action") == "mcp-tool-call"][-1]
+        assert rec["server"] == "local" and rec["tool"] == "echo"
+        assert rec["status"] == "ok" and rec["hash"]
+    finally:
+        gw_app.set_extra_router(None, prefix="/mcp")
 
 
 # ── the license gate + coexistence ─────────────────────────────────────────

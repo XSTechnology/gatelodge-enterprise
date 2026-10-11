@@ -26,19 +26,26 @@ The gateway is a STATELESS MCP server (no client session required) and
 a session-holding MCP CLIENT per upstream (lazy initialize handshake,
 ``Mcp-Session-Id`` captured and reused, tools cached with a TTL).
 
-Config (raw section, hot-read per request like scim — the core parses
-nothing MCP-specific):
+Config (raw section; the core parses nothing MCP-specific — the
+gateway is BOTH an MCP server (to clients) and an MCP client (to
+upstream servers over streamable HTTP **or stdio child processes**):
 
     "mcp": {
       "enabled": true,
       "keys": ["<sha256 of the MCP client bearer>"],
       "servers": {
-        "fs":  {"url": "http://127.0.0.1:8801/mcp",
-                "headers": {"authorization": "literal"},
-                "headers_env": {"authorization": "ENV_VAR"}}
+        "fs":  {"command": ["node", "mcp-server-filesystem", "/data"],
+                "env": {"FS_ROOT": "/srv"}, "cwd": "/srv"},
+        "remote": {"url": "http://127.0.0.1:8801/mcp",
+                   "headers": {"authorization": "literal"},
+                   "headers_env": {"authorization": "ENV_VAR"}}
       },
       "allowlists": {"<key sha256>": {"fs": ["read_file", "list_dir"]}}
     }
+
+stdio children (``command``) spawn lazily on first use, respawn once
+when they die, and are reaped on app shutdown; ``env`` entries ride
+atop the gateway's own environment.
 
 Posture (matching RBAC doctrine): a key with an allowlist entry gets
 EXACTLY what it lists; a key with NO entry gets everything (the
@@ -53,6 +60,7 @@ mutations), a Prometheus counter, and an OTLP span parented to the
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -76,8 +84,8 @@ _TOOLS_TTL_S = 30.0          # upstream tools/list cache
 _UPSTREAM_TIMEOUT_S = 60.0
 
 # module-level upstream registry (rebuilt when a server's url changes)
-_upstreams: dict[str, "_UpstreamMCP"] = {}
-_upstream_urls: dict[str, str] = {}
+_upstreams: dict[str, Any] = {}
+_upstream_sigs: dict[str, str] = {}
 
 
 def _sha256(raw: str) -> str:
@@ -249,30 +257,199 @@ class _UpstreamMCP:
         await self.client.aclose()
 
 
-async def _registry(section: dict[str, Any]) -> dict[str, _UpstreamMCP]:
-    """Build/refresh the upstream registry from the config section
-    (url change → fresh client, like the embedding-instance pattern;
-    retired clients are closed)."""
+class _StdioMCP:
+    """One stdio-transport MCP server: a managed CHILD PROCESS speaking
+    newline-delimited JSON-RPC over stdin/stdout (the transport the
+    official servers — filesystem, github, sqlite — use). Lazy spawn on
+    first use; a dead child (crash, exit) is respawned ONCE per call
+    (the HTTP path's 404→re-init analog); requests serialize on a lock
+    (one in-flight RPC per child — the request model of the gateway).
+
+    No session handshake ids on this transport (the MCP stdio spec has
+    no Mcp-Session-Id); stderr is drained to debug logs so server
+    crashes are diagnosable.
+    """
+
+    def __init__(self, name: str, command: list[str],
+                 env: dict[str, str] | None = None, cwd: str | None = None):
+        self.name = name
+        self.command = list(command)
+        self.env = dict(env or {})
+        self.cwd = cwd
+        self.proc: asyncio.subprocess.Process | None = None
+        self.protocol_version: str | None = None
+        self._initialized = False
+        self._tools: list[dict[str, Any]] | None = None
+        self._tools_ts = 0.0
+        self._rpc_seq = iter(range(1, 1 << 30))
+        self._lock = asyncio.Lock()
+
+    # ── lifecycle ────────────────────────────────────────────────
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    async def _spawn(self) -> None:
+        env = {**os.environ, **self.env}
+        self.proc = await asyncio.create_subprocess_exec(
+            *self.command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env, cwd=self.cwd)
+        asyncio.ensure_future(self._drain_stderr())
+
+    async def _drain_stderr(self) -> None:
+        try:
+            assert self.proc and self.proc.stderr
+            async for line in self.proc.stderr:
+                logger.debug("mcp stdio %r stderr: %s", self.name,
+                             line.decode("utf-8", errors="replace").rstrip())
+        except Exception:                                      # noqa: BLE001
+            pass                       # child died — _rpc notices
+
+    async def _kill(self) -> None:
+        proc, self.proc = self.proc, None
+        self._initialized = False
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:                                      # noqa: BLE001
+            pass
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            await self._kill()
+
+    # ── JSON-RPC over the pipes ──────────────────────────────────
+    async def _rpc_once(self, method: str,
+                        params: dict | None) -> dict[str, Any]:
+        if not self._alive():
+            await self._spawn()
+        assert self.proc and self.proc.stdin and self.proc.stdout
+        msg_id = next(self._rpc_seq)
+        msg: dict[str, Any] = {"jsonrpc": "2.0", "id": msg_id,
+                               "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await self.proc.stdin.drain()
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError(
+                    f"stdio server {self.name!r} exited "
+                    f"(code {self.proc.returncode})")
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                out = json.loads(text)
+            except ValueError:
+                continue               # non-JSON noise on stdout
+            if not isinstance(out, dict) or out.get("id") != msg_id:
+                continue               # notification / interleaved msg
+            if "error" in out:
+                e = out["error"] or {}
+                raise RuntimeError(f"upstream {self.name!r}: "
+                                   f"{e.get('message') or e}")
+            return out.get("result") or {}
+
+    async def _rpc(self, method: str, params: dict | None = None) \
+            -> dict[str, Any]:
+        async with self._lock:
+            try:
+                return await self._rpc_once(method, params)
+            except Exception:
+                logger.info("mcp stdio %r rpc failed — respawning once",
+                            self.name)
+                await self._kill()
+                return await self._rpc_once(method, params)
+
+    async def _notify(self, method: str) -> None:
+        async with self._lock:
+            if not self._alive():
+                return
+            assert self.proc and self.proc.stdin
+            note = {"jsonrpc": "2.0", "method": method}
+            self.proc.stdin.write((json.dumps(note) + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
+
+    async def ensure(self) -> None:
+        """initialize handshake (idempotent) + the initialized
+        notification."""
+        if self._alive() and self._initialized:
+            return
+        res = await self._rpc("initialize", {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "gatelodge-mcp", "version": "1"}})
+        self.protocol_version = res.get("protocolVersion") or PROTOCOL_VERSION
+        self._initialized = True
+        await self._notify("notifications/initialized")
+
+    async def tools(self, refresh: bool = False) -> list[dict[str, Any]]:
+        if (self._tools is not None and not refresh
+                and time.monotonic() - self._tools_ts < _TOOLS_TTL_S):
+            return self._tools
+        await self.ensure()
+        res = await self._rpc("tools/list")
+        tools = res.get("tools") or []
+        self._tools = tools if isinstance(tools, list) else []
+        self._tools_ts = time.monotonic()
+        return self._tools
+
+    async def call(self, tool: str, args: dict) -> dict[str, Any]:
+        await self.ensure()
+        return await self._rpc("tools/call", {"name": tool,
+                                              "arguments": args or {}})
+
+
+async def _registry(section: dict[str, Any]) -> dict[str, Any]:
+    """Build/refresh the upstream registry from the config section —
+    HTTP/SSE servers (``url``) and stdio servers (``command``) side by
+    side. A spec change (url or command) → fresh instance, like the
+    embedding-instance pattern; retired instances are closed."""
     servers = section.get("servers") or {}
     if not isinstance(servers, dict):
         return {}
-    retired: list[_UpstreamMCP] = []
+
+    def _sig(spec: dict) -> str:
+        if spec.get("command"):
+            return "cmd:" + json.dumps([str(c) for c in spec["command"]]
+                                       + [spec.get("cwd") or ""])
+        return "url:" + str(spec.get("url") or "")
+
+    retired: list[Any] = []
     for name, spec in list(_upstreams.items()):
-        if name not in servers or (servers.get(name) or {}).get("url") != \
-                _upstream_urls.get(name):
+        want = _sig(servers.get(name) or {})
+        if name not in servers or want != _upstream_sigs.get(name):
             retired.append(_upstreams.pop(name))
-            _upstream_urls.pop(name, None)
+            _upstream_sigs.pop(name, None)
     for name, spec in servers.items():
-        if not isinstance(spec, dict) or not spec.get("url") or name in _upstreams:
+        if not isinstance(spec, dict) or name in _upstreams:
             continue
-        headers = {str(k): str(v)
-                   for k, v in (spec.get("headers") or {}).items()}
-        for k, env in (spec.get("headers_env") or {}).items():
-            val = os.environ.get(str(env))
-            if val:
-                headers[str(k)] = val
-        _upstreams[name] = _UpstreamMCP(name, str(spec["url"]), headers)
-        _upstream_urls[name] = str(spec["url"])
+        if spec.get("command"):
+            cmd = [str(c) for c in spec["command"] if str(c).strip()]
+            if not cmd:
+                continue
+            _upstreams[name] = _StdioMCP(
+                name, cmd, spec.get("env") or {}, spec.get("cwd"))
+        elif spec.get("url"):
+            headers = {str(k): str(v)
+                       for k, v in (spec.get("headers") or {}).items()}
+            for k, env in (spec.get("headers_env") or {}).items():
+                val = os.environ.get(str(env))
+                if val:
+                    headers[str(k)] = val
+            _upstreams[name] = _UpstreamMCP(name, str(spec["url"]), headers)
+        else:
+            continue
+        _upstream_sigs[name] = _sig(spec)
     for old in retired:
         try:
             await old.aclose()
@@ -415,6 +592,13 @@ def build_router() -> APIRouter:
     """The MCP surface — mounted at /mcp via add_extra_router (v2.0
     additive seam; SCIM keeps its own mount). The prefix owns its
     auth: MCP bearers are NOT gateway credentials."""
+    global _SHUTDOWN_HOOKED
+    if not _SHUTDOWN_HOOKED:
+        # reap stdio children + close HTTP clients on app shutdown
+        # (the router-level API — FastAPI removed the app-level one)
+        from gateway.app import app as _gw_app
+        _gw_app.router.add_event_handler("shutdown", _shutdown_all)
+        _SHUTDOWN_HOOKED = True
     r = APIRouter()
 
     @r.post("")
@@ -430,4 +614,20 @@ def reset_mcp_state() -> None:
     clients in tests need no close; production churn closes via
     _registry's retired list."""
     _upstreams.clear()
-    _upstream_urls.clear()
+    _upstream_sigs.clear()
+
+
+_SHUTDOWN_HOOKED = False
+
+
+async def _shutdown_all() -> None:
+    """App-shutdown hook: reap every stdio child + close HTTP clients
+    (registered once by build_router — the gateway never leaks MCP
+    server processes)."""
+    for up in list(_upstreams.values()):
+        try:
+            await up.aclose()
+        except Exception:                                      # noqa: BLE001
+            pass
+    _upstreams.clear()
+    _upstream_sigs.clear()
