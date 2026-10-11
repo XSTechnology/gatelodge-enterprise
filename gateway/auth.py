@@ -54,7 +54,6 @@ import asyncio
 import contextvars
 import hashlib
 import hmac
-import json
 import logging
 import time
 from typing import Any, Callable
@@ -278,21 +277,18 @@ def _bearer_token(request: Request) -> str:
 
 
 def _audit_deny(who: str, method: str, path: str) -> None:
-    """Append the denial to the core config-audit trail (same file,
-    same shape, so it surfaces in GET /admin/audit). Best effort —
-    auditing must never break the 403. ``who`` is the caller-computed
-    identity: "sso:<email>" for SSO principals, "admin:<role>:<hash8>"
-    for key-based admins."""
+    """Append the denial to the core config-audit trail — the SAME
+    hash-chained file as config mutations (gateway.app.append_audit_
+    record is the chokepoint), so it surfaces in GET /admin/audit with
+    chain verification. Best effort — auditing must never break the
+    403. ``who`` is the caller-computed identity: "sso:<email>" for SSO
+    principals, "admin:<role>:<hash8>" for key-based admins."""
     try:
         import gateway.app as gw_app  # lazy: app imports THIS module
-        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-               "key": who,
-               "action": f"rbac-deny {method} {path}"[:200]}
-        p = gw_app._LOG_PATH.parent / "config-audit.jsonl"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with gw_app._log_lock:
-            with open(p, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+        gw_app.append_audit_record({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "key": who,
+            "action": f"rbac-deny {method} {path}"[:200]})
     except Exception:  # noqa: BLE001
         logger.debug("rbac denial audit failed", exc_info=True)
 
