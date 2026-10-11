@@ -129,6 +129,7 @@ from . import capabilities
 from . import lifecycle
 from . import licensing
 from . import llamaserver
+from . import tracing
 from . import modelsearch
 from . import providers
 from . import runpod
@@ -325,6 +326,22 @@ for _lg_name in ("uvicorn.error", "asyncio"):
 async def _kill_llama_servers() -> None:
     """Stop every managed llama-server child when the gateway exits."""
     llamaserver.kill_all()
+
+
+@app.on_event("shutdown")
+async def _flush_tracing() -> None:
+    """Best-effort final OTLP flush — in-flight spans ride the last
+    batch instead of dying with the process."""
+    tracing.shutdown_flush()
+
+
+@app.on_event("startup")
+async def _configure_tracing() -> None:
+    """Install the tracing state from the otel section (boot-time — a
+    section change needs a restart, like scim)."""
+    cfg = get_gateway_config()
+    tracing.configure(cfg.otel, version=app.version,
+                      edition=licensing.status().get("edition") or "")
 
 
 @app.on_event("startup")
@@ -548,24 +565,47 @@ async def _bearer_auth(request: Request, call_next):
     # the feature is enabled — the charge hook and request log read it.
     if (cfg.session_budgets or {}).get("enabled"):
         _REQUEST_SESSION_ID.set(session_id_from_header(request))
+    # Tracing (v2.0): W3C-correlated SERVER span around everything past
+    # the license gate. A valid inbound traceparent continues the
+    # caller's trace; the active trace id rides the request log and the
+    # current span echoes back on the response (client correlation).
+    # None (disabled/unsampled) = the entire path costs one dict lookup.
+    span = tracing.request_span(request.method, request.url.path,
+                                request.headers.get("traceparent"))
+    resp: Response
     if request.method == "GET" and request.url.path == "/":
         _REQUEST_KEY_ID.set("")  # static console shell — its API
         # calls still require the key (the page prompts for it)
-        return _rid_response(await call_next(request), rid)
+        resp = await call_next(request)
     # extra-router seam: mounted enterprise surfaces (SCIM, …) own
     # their authentication — the core pipeline does not gate their
     # registered prefix (their bearers are not gateway credentials).
-    for _p in _EXTRA_ROUTER_PREFIXES:
-        if request.url.path.startswith(_p):
-            return _rid_response(await call_next(request), rid)
-    # Auth runs through the ACTIVE pipeline (default: bearer resolve →
-    # admin gate → per-key RPM, all in auth.py). Enterprise swaps the
-    # pipeline via set_auth_pipeline() — SSO/OIDC + RBAC links — with
-    # zero core changes. The pipeline sets _REQUEST_KEY_ID on success.
-    blocked = await get_auth_pipeline().run(request, cfg)
-    if blocked is not None:
-        return _rid_response(blocked, rid)
-    return _rid_response(await call_next(request), rid)
+    elif any(request.url.path.startswith(_p)
+             for _p in _EXTRA_ROUTER_PREFIXES):
+        resp = await call_next(request)
+    else:
+        # Auth runs through the ACTIVE pipeline (default: bearer resolve →
+        # admin gate → per-key RPM, all in auth.py). Enterprise swaps the
+        # pipeline via set_auth_pipeline() — SSO/OIDC + RBAC links — with
+        # zero core changes. The pipeline sets _REQUEST_KEY_ID on success.
+        blocked = await get_auth_pipeline().run(request, cfg)
+        resp = blocked if blocked is not None else await call_next(request)
+    if span is not None:
+        # Correlation attrs (the span object is shared with the
+        # downstream context): request id joins trace ↔ log; key/session
+        # ids join trace ↔ spend scopes. The key id was set by the auth
+        # pipeline — it runs in THIS task, before call_next forks it.
+        span.set("gatelodge.request_id", rid)
+        kid = _REQUEST_KEY_ID.get()
+        if kid:
+            span.set("gatelodge.key_id", kid)
+        sid = _REQUEST_SESSION_ID.get()
+        if sid:
+            span.set("gatelodge.session_id", sid)
+        tracing.finish_request_span(span, resp.status_code)
+        resp.headers["traceparent"] = tracing.format_traceparent(
+            span.trace_id, span.span_id)
+    return _rid_response(resp, rid)
 
 
 @app.exception_handler(RequestValidationError)
@@ -602,6 +642,15 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
     rid = _REQUEST_ID.get()
     if rid:
         rec["req"] = rid
+    # Trace correlation (v2.0): the active OTLP trace id links this
+    # log line to the exported span — log ↔ trace join in one id.
+    trace_id = tracing.current_trace_id()
+    if trace_id:
+        rec["trace"] = trace_id
+    # INTERNAL child span per model call (same chokepoint as the log —
+    # every completion, whatever its status; no-op when unsampled).
+    tracing.add_llm_span(model, backend, ms, usage or {}, status,
+                         cost_usd=cost_usd)
     line = json.dumps(rec)
     # Prometheus counters (best-effort; single chokepoint for every
     # request whatever its status — errors included)
@@ -3409,6 +3458,7 @@ async def healthz() -> dict[str, Any]:
         "status": "ok",
         "version": app.version,
         "license": licensing.healthz_license(),
+        "tracing": tracing.healthz_status(),
         "bind": cfg.bind,
         "port": cfg.port,
         "models_dir": cfg.models_dir,
@@ -4193,6 +4243,15 @@ async def admin_license() -> dict[str, Any]:
     /admin GET. Claims are visible here — never on /healthz (that
     surface is unauthenticated)."""
     return licensing.status()
+
+
+@app.get("/admin/tracing")
+async def admin_tracing() -> dict[str, Any]:
+    """Tracing status (v2.0): OTLP endpoint, sampling, span counters
+    (created/exported/dropped, export errors). Read-only, behind the
+    admin pipeline + RBAC like every /admin GET. The endpoint string
+    stays here — never on /healthz."""
+    return tracing.status()
 
 
 @app.get("/admin/config")

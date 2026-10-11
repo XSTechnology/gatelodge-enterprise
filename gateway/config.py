@@ -877,6 +877,24 @@ class GatewayConfig:
         # Audit shipping (tier B)
         audit = raw.get("audit") if isinstance(raw.get("audit"), dict) else {}
         self.audit = {"webhook_url": str(audit.get("webhook_url") or "").strip()}
+        # Tracing (v2.0): OTLP export — boot-time section (a change
+        # needs a restart, like scim). gateway/tracing.py owns the
+        # semantics; this is just the normalized surface.
+        otel = raw.get("otel")
+        otel = otel if isinstance(otel, dict) else {}
+        self.otel = {
+            "enabled": bool(otel.get("enabled")),
+            "endpoint": str(otel.get("endpoint") or "").strip(),
+            "service_name": str(otel.get("service_name") or "gatelodge"),
+            "sample_ratio": otel.get("sample_ratio", 1.0),
+            "headers": otel.get("headers")
+            if isinstance(otel.get("headers"), dict) else {},
+            "headers_env": otel.get("headers_env")
+            if isinstance(otel.get("headers_env"), dict) else {},
+            "batch_flush_s": otel.get("batch_flush_s", 5.0),
+            "batch_max": otel.get("batch_max", 64),
+            "timeout_s": otel.get("timeout_s", 5.0),
+        }
         # Session budgets (v1.4): when enabled, an x-session-id header
         # on a request charges a session:<id> spend scope alongside the
         # consuming key (the enterprise pre-gate reads the raw section
