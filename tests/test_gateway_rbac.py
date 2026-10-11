@@ -202,6 +202,16 @@ def test_whoami_key_roles(wired, gguf):
         assert client.get("/admin/whoami").status_code == 401
 
 
+def test_whoami_allowed_for_every_role(wired, gguf):
+    """whoami is self-describing — even key_manager (whose table row
+    is keys CRUD only) must learn its own role: the console's
+    awareness gate depends on it."""
+    wired(_rbac_config(gguf, roles=[OPS, KM]))
+    with TestClient(gw_app.app) as client:
+        w = client.get("/admin/whoami", headers=auth("km-secret")).json()
+        assert w["via"] == "admin_key" and w["role"] == "key_manager"
+
+
 def test_whoami_open_mode(wired, gguf):
     """Open mode: whoami says so — via open, unrestricted."""
     wired(_config(gguf))  # no keys
