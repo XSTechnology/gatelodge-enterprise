@@ -29,6 +29,16 @@ Role-scoped admin keys (optional, same file):
 Roles: `full_admin` (default), `ops_readonly` (admin GETs except
 raw config), `key_manager` (virtual-key CRUD only).
 
+## 1b. Install your license (v1.5 — REQUIRED)
+
+The enterprise binary refuses to boot without a valid ENTERPRISE
+license (no trial mode). Drop the signed license your vendor issued
+at `deploy/data/license.json` (the same mounted directory as the
+seed config). `GET /admin/license` shows the active claims; the
+license's feature keys gate tier D, SCIM and session budgets. For
+container envs, `GATELODGE_LICENSE` (a file path or inline JWT)
+works too. Community-edition licenses do not unlock this binary.
+
 ## 2. Start the stack (2 min)
 
     cd deploy

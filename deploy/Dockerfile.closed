@@ -1,0 +1,67 @@
+# Gatelodge Enterprise — CLOSED-DISTRIBUTION image (v1.5).
+#
+# Compiles the gateway to MACHINE CODE in-container (Nuitka standalone:
+# no source, no bytecode in the shipped image; source is disclosed only
+# under contract / external-audit conditions). Nuitka cannot
+# cross-compile — Linux builds happen HERE, in the builder stage.
+#
+#   docker build -f deploy/Dockerfile.closed -t gatelodge-enterprise:closed .
+#   (from the repo root — same context as the source image)
+#
+# Runtime is identical to the source image (deploy/Dockerfile):
+#   GATELODGE_REDIS_URL / GATELODGE_CONFIG_DSN  tier D wiring
+#   mounted data/                               config seed + LICENSE
+# The enterprise binary REFUSES TO BOOT without a valid enterprise
+# license at data/license.json (or GATELODGE_LICENSE with a path /
+# inline JWT). The embedded llama.cpp engine is excluded, same posture
+# as the source image (cloud / llama-server / RunPod backends; the
+# gateway's llama_cpp import is deferred, so the binary runs without
+# it — Nuitka leaves it a runtime-optional import).
+
+# ── stage 1: compile (machine code) ─────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ make patchelf ccache ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /src
+ENV UV_LINK_MODE=copy
+
+# deps first (layer cache): no llama-cpp (no GPU here), no dev group;
+# the compiler toolchain rides its own install into the project venv
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-package llama-cpp-python \
+    && uv pip install nuitka ordered-set zstandard
+
+# app code + build driver (build_binary.py compiles + normalizes dist/)
+COPY gateway ./gateway
+COPY gateway_enterprise ./gateway_enterprise
+COPY scripts/license_tool.py scripts/build_binary.py ./scripts/
+COPY enterprise_main.py run_gateway.py ./
+
+RUN uv run --no-sync scripts/build_binary.py --edition enterprise
+
+# ── stage 2: runtime (the compiled tree only) ───────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /src/dist/gatelodge-enterprise ./
+
+# operator config + runtime state + LICENSE (mount over; the DB store
+# seeds from data/gateway_config.json when its table is empty)
+RUN mkdir -p data && useradd -r -u 10001 gatelodge \
+    && chown -R gatelodge:gatelodge /app
+USER gatelodge
+VOLUME ["/app/data"]
+
+EXPOSE 8011
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8011/healthz || exit 1
+
+CMD ["./gatelodge-enterprise"]
