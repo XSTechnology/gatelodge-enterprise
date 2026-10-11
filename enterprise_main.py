@@ -34,13 +34,17 @@ from __future__ import annotations
 import os
 
 
-def _wire_tier_d() -> None:
+def _wire_tier_d(enabled: bool = True) -> None:
     """Swap the storage + config backends when the operator points at
     shared ones (tier D — multi-replica: N replicas, one Redis, one
     DB). NO env vars = the core's single-process defaults, byte-for-
     byte. Env-var bootstrap mirrors the api_key_env convention: the
     Redis URL / DSN must be known before the config loads, so it
     cannot live IN the config.
+
+    v1.5: ``enabled`` is the license claim (tier_d) — an enterprise
+    license without the key skips the swap even when the env vars are
+    set.
 
       GATELODGE_REDIS_URL   e.g. redis://127.0.0.1:6379/0
       GATELODGE_CONFIG_DSN  e.g. postgresql://user:pw@host/gatelodge
@@ -51,6 +55,14 @@ def _wire_tier_d() -> None:
     its table is empty — the operator's pre-tier-D config carries
     over. Call BEFORE serving; existing state does NOT migrate."""
     from gateway import config as gw_config
+
+    if not enabled:
+        import logging
+        logging.getLogger("gateway.enterprise").warning(
+            "tier D NOT licensed — running single-process state "
+            "even though GATELODGE_REDIS_URL/GATELODGE_CONFIG_DSN "
+            "may be set")
+        return
 
     redis_url = os.environ.get("GATELODGE_REDIS_URL", "").strip()
     if redis_url:
@@ -65,12 +77,19 @@ def _wire_tier_d() -> None:
             dsn=dsn, seed_file=gw_config.CONFIG_PATH))
 
 
-def _wire_scim() -> None:
+def _wire_scim(enabled: bool = True) -> None:
     """Mount the SCIM provisioning surface (gateway_enterprise/scim.py)
     via the router seam when scim.enabled — boot-time mounting (section
-    changes need a restart; the token_hash hot-reloads per request)."""
+    changes need a restart; the token_hash hot-reloads per request).
+    v1.5: the scim license claim gates the mount regardless of the
+    config section."""
     from gateway import config as gw_config
     from gateway.app import set_extra_router
+    if not enabled:
+        import logging
+        logging.getLogger("gateway.enterprise").warning(
+            "SCIM NOT licensed — the scim config section is ignored")
+        return
     raw = gw_config.get_gateway_config().store.load()
     scim = raw.get("scim") if isinstance(raw, dict) else None
     scim = scim if isinstance(scim, dict) else {}
@@ -78,6 +97,26 @@ def _wire_scim() -> None:
         return
     from gateway_enterprise.scim import build_router
     set_extra_router(build_router(), prefix="/scim")
+
+
+def _wire_auth_pipeline(session_budgets: bool) -> None:
+    """Install the enterprise auth pipeline (core governance + the
+    session-budget gate when licensed). Without the session_budgets
+    claim the binary runs the CORE pipeline — the license file decides
+    what this binary executes, not the config."""
+    import logging
+    from gateway.auth import (AuthPipeline, admin_gate_link,
+                              rate_limit_link, resolve_link, rbac_link,
+                              set_auth_pipeline)
+    links = [resolve_link, rbac_link]
+    if session_budgets:
+        from gateway_enterprise.session_budget import session_budget_link
+        links.append(session_budget_link)
+    else:
+        logging.getLogger("gateway.enterprise").warning(
+            "session budgets NOT licensed — running the core pipeline")
+    links += [admin_gate_link, rate_limit_link]
+    set_auth_pipeline(AuthPipeline(links))
 
 
 def main() -> None:
@@ -90,23 +129,27 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    # Tier D: multi-replica shared state (the commercial tier —
-    # governance itself is core now). No env vars = no-op.
-    _wire_tier_d()
+    # v1.5 closed distribution: the enterprise binary REFUSES TO BOOT
+    # without a valid ENTERPRISE license — no trial mode (that is the
+    # community binary's posture). The gate exits(2) with a clear log
+    # line before any wiring or serving. Community-edition licenses do
+    # not unlock this binary.
+    from gateway import licensing
+    lic = licensing.bootstrap(edition="enterprise")
+    licensing.enterprise_boot_gate(lic)
 
-    # v1.4: SCIM provisioning (router seam) — no-op unless scim.enabled.
-    _wire_scim()
+    # Enterprise feature claims gate the commercial modules — the
+    # license file decides what this binary runs (issue with
+    # scripts/license_tool.py; enterprise licenses default to all
+    # three keys).
+    _wire_tier_d(enabled=licensing.allows("tier_d"))
+    _wire_scim(enabled=licensing.allows("scim"))
 
     # v1.4: session budgets — the ENTERPRISE link (inert without the
     # session_budgets section; the core carries the charge hook). The
-    # enterprise pipeline = core governance + the session gate.
-    from gateway.auth import (AuthPipeline, admin_gate_link,
-                              rate_limit_link, resolve_link, rbac_link,
-                              set_auth_pipeline)
-    from gateway_enterprise.session_budget import session_budget_link
-    set_auth_pipeline(AuthPipeline([
-        resolve_link, rbac_link, session_budget_link,
-        admin_gate_link, rate_limit_link]))
+    # enterprise pipeline = core governance + the session gate; without
+    # the session_budgets claim the binary runs the core pipeline.
+    _wire_auth_pipeline(session_budgets=licensing.allows("session_budgets"))
 
     # The core's default pipeline (resolve_link → rbac_link →
     # admin_gate → rate_limit) carries governance; the core's boot
