@@ -122,16 +122,44 @@ def _wire_mcp(enabled: bool = True) -> None:
     add_extra_router(build_router(), prefix="/mcp")
 
 
-def _wire_auth_pipeline(session_budgets: bool) -> None:
+def _wire_teams(enabled: bool = True) -> None:
+    """Mount the teams surface (gateway_enterprise/teams.py) at /teams
+    via the additive router seam (SCIM + MCP + teams coexist). The
+    auth-pipeline links (attribution + budget gate) are wired in
+    _wire_auth_pipeline — this mounts the ADMIN surface only.
+    License-claimed: the 'teams' feature key."""
+    from gateway import config as gw_config
+    from gateway.app import add_extra_router
+    if not enabled:
+        import logging
+        logging.getLogger("gateway.enterprise").warning(
+            "teams NOT licensed — the teams config section is ignored")
+        return
+    raw = gw_config.get_gateway_config().store.load()
+    teams = raw.get("teams") if isinstance(raw, dict) else None
+    teams = teams if isinstance(teams, dict) else {}
+    if not teams.get("enabled"):
+        return
+    from gateway_enterprise.teams import build_router
+    add_extra_router(build_router(), prefix="/teams")
+
+
+def _wire_auth_pipeline(session_budgets: bool, teams: bool = False) -> None:
     """Install the enterprise auth pipeline (core governance + the
-    session-budget gate when licensed). Without the session_budgets
-    claim the binary runs the CORE pipeline — the license file decides
-    what this binary executes, not the config."""
+    license-claimed enterprise links). Without their claims the binary
+    runs the CORE pipeline — the license file decides what this binary
+    executes, not the config."""
     import logging
     from gateway.auth import (AuthPipeline, admin_gate_link,
                               rate_limit_link, resolve_link, rbac_link,
                               set_auth_pipeline)
     links = [resolve_link, rbac_link]
+    if teams:
+        from gateway_enterprise.teams import team_budget_link, team_link
+        links += [team_link, team_budget_link]
+    else:
+        logging.getLogger("gateway.enterprise").warning(
+            "teams NOT licensed — running without team links")
     if session_budgets:
         from gateway_enterprise.session_budget import session_budget_link
         links.append(session_budget_link)
@@ -168,12 +196,16 @@ def main() -> None:
     _wire_tier_d(enabled=licensing.allows("tier_d"))
     _wire_scim(enabled=licensing.allows("scim"))
     _wire_mcp(enabled=licensing.allows("mcp"))
+    _wire_teams(enabled=licensing.allows("teams"))
 
     # v1.4: session budgets — the ENTERPRISE link (inert without the
     # session_budgets section; the core carries the charge hook). The
     # enterprise pipeline = core governance + the session gate; without
     # the session_budgets claim the binary runs the core pipeline.
-    _wire_auth_pipeline(session_budgets=licensing.allows("session_budgets"))
+    # v2.0: team links (attribution + budget gate) ride the same
+    # pipeline, teams claim gated.
+    _wire_auth_pipeline(session_budgets=licensing.allows("session_budgets"),
+                        teams=licensing.allows("teams"))
 
     # The core's default pipeline (resolve_link → rbac_link →
     # admin_gate → rate_limit) carries governance; the core's boot

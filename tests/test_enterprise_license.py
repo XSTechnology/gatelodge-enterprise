@@ -52,7 +52,8 @@ def _mint(priv: str, **overrides) -> str:
     now = int(datetime.now(timezone.utc).timestamp())
     claims = {"product": "gatelodge", "edition": "enterprise",
               "customer": "Enterprise Co", "support": True,
-              "features": ["tier_d", "scim", "session_budgets", "mcp"],
+              "features": ["tier_d", "scim", "session_budgets", "mcp",
+                           "teams"],
               "iat": now, "nbf": now}
     claims.update(overrides)
     return jwt.encode(claims, priv, algorithm="RS256")
@@ -101,15 +102,19 @@ def test_main_boots_and_wires_with_enterprise_license(keypair, monkeypatch):
                         lambda enabled: calls.__setitem__("scim", enabled))
     monkeypatch.setattr(enterprise_main, "_wire_mcp",
                         lambda enabled: calls.__setitem__("mcp", enabled))
+    monkeypatch.setattr(enterprise_main, "_wire_teams",
+                        lambda enabled: calls.__setitem__("teams", enabled))
     monkeypatch.setattr(enterprise_main, "_wire_auth_pipeline",
-                        lambda session_budgets: calls.__setitem__(
-                            "session_budgets", session_budgets))
+                        lambda session_budgets, teams=False: (
+                            calls.__setitem__("session_budgets", session_budgets),
+                            calls.__setitem__("team_links", teams)))
     import gateway.__main__ as gw_main
     monkeypatch.setattr(gw_main, "main",
                         lambda: calls.__setitem__("core", True))
     enterprise_main.main()
     assert calls == {"tier_d": True, "scim": True, "mcp": True,
-                     "session_budgets": True, "core": True}
+                     "teams": True, "session_budgets": True,
+                     "team_links": True, "core": True}
 
 
 def test_main_wires_only_licensed_features(keypair, monkeypatch):
@@ -126,15 +131,19 @@ def test_main_wires_only_licensed_features(keypair, monkeypatch):
                         lambda enabled: calls.__setitem__("scim", enabled))
     monkeypatch.setattr(enterprise_main, "_wire_mcp",
                         lambda enabled: calls.__setitem__("mcp", enabled))
+    monkeypatch.setattr(enterprise_main, "_wire_teams",
+                        lambda enabled: calls.__setitem__("teams", enabled))
     monkeypatch.setattr(enterprise_main, "_wire_auth_pipeline",
-                        lambda session_budgets: calls.__setitem__(
-                            "session_budgets", session_budgets))
+                        lambda session_budgets, teams=False: (
+                            calls.__setitem__("session_budgets", session_budgets),
+                            calls.__setitem__("team_links", teams)))
     import gateway.__main__ as gw_main
     monkeypatch.setattr(gw_main, "main",
                         lambda: calls.__setitem__("core", True))
     enterprise_main.main()
     assert calls == {"tier_d": True, "scim": False, "mcp": False,
-                     "session_budgets": False, "core": True}
+                     "teams": False, "session_budgets": False,
+                     "team_links": False, "core": True}
 
 
 # ── the wiring itself obeys the claims ─────────────────────────────────────
