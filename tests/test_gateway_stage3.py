@@ -820,7 +820,10 @@ def test_cache_simple_prompt_served_from_memory(wired, gguf, monkeypatch):
                  (gw_app._month_log_path(gw_app._month_key())
                   .read_text(encoding="utf-8").strip().splitlines())]
         assert lines[-1]["backend"] == "cache"
-        assert gw_app.cache_stats() == {"entries": 1, "hits": 1}
+        # shape-relaxed (v2.0): cache_stats() also carries the semantic
+        # sub-dict — this test owns the EXACT-cache fields.
+        _cs = gw_app.cache_stats()
+        assert _cs["entries"] == 1 and _cs["hits"] == 1
 
     _with_fake_llama(fn)
 

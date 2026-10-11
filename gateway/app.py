@@ -129,6 +129,7 @@ from . import capabilities
 from . import lifecycle
 from . import licensing
 from . import llamaserver
+from . import semantic_cache
 from . import tracing
 from . import modelsearch
 from . import providers
@@ -495,6 +496,10 @@ def _metrics_text() -> str:
     out.append("# HELP gateway_cache_hits_total Response-cache hits.")
     out.append("# TYPE gateway_cache_hits_total counter")
     out.append(f"gateway_cache_hits_total {cs['hits']}")
+    out.append("# HELP gateway_semantic_cache_entries Semantically "
+               "cached responses (paraphrase layer).")
+    out.append("# TYPE gateway_semantic_cache_entries gauge")
+    out.append(f"gateway_semantic_cache_entries {cs['semantic']['entries']}")
     out.append("# HELP gateway_verify_failing Backends currently failing "
                "scheduled verification.")
     out.append("# TYPE gateway_verify_failing gauge")
@@ -1824,13 +1829,16 @@ def _cache_key(requested: str, body: ChatRequest) -> str:
 
 def cache_stats() -> dict[str, Any]:
     total_hits = sum(e.get("hits", 0) for e in _RESPONSE_CACHE.values())
-    return {"entries": len(_RESPONSE_CACHE), "hits": total_hits}
+    return {"entries": len(_RESPONSE_CACHE), "hits": total_hits,
+            "semantic": semantic_cache.stats()}
 
 
 def clear_response_cache() -> int:
-    """Drop cached responses (tests / admin). Returns entries cleared."""
+    """Drop cached responses (tests / admin). Returns exact-cache
+    entries cleared; the semantic layer clears alongside."""
     n = len(_RESPONSE_CACHE)
     _RESPONSE_CACHE.clear()
+    semantic_cache.clear()
     return n
 
 
@@ -1910,6 +1918,20 @@ async def chat_completions(body: ChatRequest) -> Response:
             return JSONResponse(resp)
         if hit:  # expired — drop before re-executing
             _RESPONSE_CACHE.pop(ckey, None)
+        # Semantic cache (v2.0): paraphrase hit for the SAME eligible
+        # class. Scoped to (model, key, params) — never cross-key; the
+        # local embed call is milliseconds and never gates serving (any
+        # embed failure = transparent skip). The vector rides back so a
+        # miss stores without re-embedding.
+        sem_resp, sem_vec = await semantic_cache.lookup(
+            requested, str(body.messages[-1].get("content") or ""),
+            _REQUEST_KEY_ID.get(),
+            (body.max_tokens, body.temperature))
+        if sem_resp is not None:
+            _metric_inc("gateway_semantic_cache_hits_total", (requested,))
+            _log_request(requested, "semantic-cache", body.stream, 0,
+                         sem_resp.get("usage") or {}, 200)
+            return JSONResponse(sem_resp)
 
     # Per-key monthly budgets (AFTER the cache — hits are free). Admin
     # keys and open mode pass through.
@@ -1975,6 +1997,11 @@ async def chat_completions(body: ChatRequest) -> Response:
                     _RESPONSE_CACHE.pop(oldest[0], None)
                 _RESPONSE_CACHE[ckey] = {"resp": dict(resp),
                                          "ts": time.time(), "hits": 0}
+            # Semantic layer stores under the prompt VECTOR (computed
+            # pre-exec; None = layer off/failed → no-op).
+            await semantic_cache.store(
+                requested, _REQUEST_KEY_ID.get(), sem_vec, dict(resp),
+                (body.max_tokens, body.temperature))
         _log_request(requested, winner, body.stream, ms,
                      resp.get("usage") or {}, 200,
                      cost_usd=resp.get("cost_usd"))
