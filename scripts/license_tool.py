@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 KEY_PATH = ROOT / "vendor_keys" / "license_signing_key.pem"
 
 PRODUCT = "gatelodge"
-ENTERPRISE_FEATURES = ["tier_d", "scim", "session_budgets", "mcp"]
+ENTERPRISE_FEATURES = ["tier_d", "scim", "session_budgets", "mcp", "teams"]
 
 
 def _now() -> dt.datetime:

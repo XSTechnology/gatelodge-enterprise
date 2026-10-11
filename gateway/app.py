@@ -142,7 +142,8 @@ from . import upload
 from . import auth
 from .auth import (AuthPipeline, get_auth_pipeline, set_auth_pipeline,
                    _REQUEST_KEY_ID, _REQUEST_ID, _REQUEST_SESSION_ID,
-                   _resolve_bearer, _sha256_hex, session_id_from_header)
+                   _REQUEST_TEAM, _resolve_bearer, _sha256_hex,
+                   session_id_from_header)
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
@@ -668,6 +669,9 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
     sid = _REQUEST_SESSION_ID.get()
     if sid:
         rec["session"] = sid
+    team = _REQUEST_TEAM.get()
+    if team:
+        rec["team"] = team
     if cost_usd is not None:
         rec["cost_usd"] = round(cost_usd, 6)
     rid = _REQUEST_ID.get()
@@ -874,6 +878,9 @@ def _scope_spend(scope: str) -> dict[str, float]:
             elif kind == "session":
                 if e.get("session") != marker:
                     continue
+            elif kind == "team":
+                if e.get("team") != marker:
+                    continue
             elif e.get("key") != marker:
                 continue
             tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
@@ -932,6 +939,12 @@ def _charge_request(cfg, backend_name: str, usage: dict,
     sid = _REQUEST_SESSION_ID.get()
     if sid:
         _charge_scope(f"session:{sid}", tokens, cost_usd)
+    # Teams (v2.0): charge the team scope when the enterprise team link
+    # attributed this request to a team — rollups and the team budget
+    # gate read the same ledger.
+    tid = _REQUEST_TEAM.get()
+    if tid:
+        _charge_scope(f"team:{tid}", tokens, cost_usd)
 
 
 def _maybe_spend_alert(key_id: str, entry: dict) -> None:

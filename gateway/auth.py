@@ -81,6 +81,12 @@ _REQUEST_ID = contextvars.ContextVar("gw_request_id", default="")
 # feature is off or the header is absent/invalid.
 _REQUEST_SESSION_ID = contextvars.ContextVar("gw_request_session",
                                              default="")
+# Team id (v2.0 teams/workspaces): set by the ENTERPRISE team link when
+# the consuming virtual key belongs to a team — read by the charge hook
+# (team:<id> spend scope) and the request log for attribution/rollups.
+# Core never resolves key→team (teams are an enterprise config section);
+# it only carries the id once the link has set it.
+_REQUEST_TEAM = contextvars.ContextVar("gw_request_team", default="")
 
 
 def session_id_from_header(request: Request) -> str:
