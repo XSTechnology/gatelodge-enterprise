@@ -15,9 +15,11 @@ hot-reloads on the store's version token):
     "sso": {
       "enabled": true,
       "introspection_url": "https://idp.corp.example/oauth2/introspect",
+      "jwks_url": "https://idp.corp.example/.well-known/jwks.json",
       "client_id": "gatelodge-enterprise",
       "client_secret_env": "GATELODGE_SSO_CLIENT_SECRET",
       "audience": "",                  // optional aud claim check
+      "jwks_cache_ttl_s": 300,         // keyset cache (0 = refetch every use)
       "timeout_s": 5.0,
       "cache_ttl_s": 60,
       "fail_open": false,
@@ -28,6 +30,14 @@ hot-reloads on the store's version token):
          "role": "full_admin"}
       ]
     }
+
+Local validation (jwks_url): JWT-shaped bearers are validated OFFLINE
+against the IdP's published keyset — signature, exp/nbf, aud (when
+`audience` is set) and iss (when `issuer` is set) — with a per-process
+kid→JWKS cache (unknown kids trigger one throttled keyset refresh).
+Any local miss falls back to RFC 7662 introspection, which stays the
+REQUIRED source of truth (fallback path + opaque tokens); `none` and
+HMAC algorithms are never locally validated.
 
 Security posture:
 - SSO users with no matching rule get ``default_role`` (ops_readonly)
@@ -77,6 +87,8 @@ class SSOSettings:
     client_secret_env: str = ""
     client_secret: str = ""      # resolved from the env at parse time
     audience: str = ""
+    jwks_url: str = ""           # local JWT validation (empty = introspect only)
+    jwks_cache_ttl_s: float = 300.0
     timeout_s: float = 5.0
     cache_ttl_s: float = 60.0
     fail_open: bool = False
@@ -103,13 +115,15 @@ def _parse_sso(raw: dict[str, Any]) -> SSOSettings:
         client_id=str(s.get("client_id") or "").strip(),
         client_secret_env=str(s.get("client_secret_env") or "").strip(),
         audience=str(s.get("audience") or "").strip(),
+        jwks_url=str(s.get("jwks_url") or "").strip(),
         fail_open=bool(s.get("fail_open", False)),
         token_prefixes=[str(p).strip() for p in (s.get("token_prefixes") or [])
                         if str(p).strip()],
     )
     for name, attr, default, lo, hi in (
             ("timeout_s", "timeout_s", 5.0, 0.1, 60.0),
-            ("cache_ttl_s", "cache_ttl_s", 60.0, 0.0, 3600.0)):
+            ("cache_ttl_s", "cache_ttl_s", 60.0, 0.0, 3600.0),
+            ("jwks_cache_ttl_s", "jwks_cache_ttl_s", 300.0, 0.0, 86400.0)):
         raw_v = s.get(name)
         try:
             # explicit None check: 0 is a VALID cache_ttl_s (no caching)
@@ -312,16 +326,125 @@ def _cache_put(token: str, claims: dict[str, Any]) -> None:
         {"claims": claims, "cached_at": time.time()})
 
 
+# ── local JWT validation (JWKS) ────────────────────────────────────────────
+#
+# The keyset is PUBLIC and rarely rotates → a per-process in-memory cache
+# keyed by jwks_url (the per-TOKEN result cache above already rides the
+# storage backend, so replicas share validation results; only the keyset
+# fetch itself is per-process). An unknown kid refreshes the keyset at most
+# once per _JWKS_MIN_REFRESH_S — a spray of random kids must not hammer
+# the IdP.
+
+_JWKS_CACHE: dict[str, dict] = {}      # url -> {"fetched_at", "keys": {kid: jwk}}
+_JWKS_MIN_REFRESH_S = 30.0
+
+
+async def _jwks_fetch(url: str, timeout_s: float) -> dict:
+    """GET the IdP's JWKS document → {"keys": [...]}. Raises on any
+    transport/format failure (the caller falls back to introspection)."""
+    async with httpx.AsyncClient(timeout=timeout_s) as hc:
+        r = await hc.get(url)
+        r.raise_for_status()
+        body = r.json()
+    if not isinstance(body, dict) or not isinstance(body.get("keys"), list):
+        raise ValueError("jwks: malformed keyset")
+    return body
+
+
+def _jwks_index(keyset: dict) -> dict[str, dict]:
+    """keyset → {kid: jwk} (entries without a kid are unusable)."""
+    out: dict[str, dict] = {}
+    for k in keyset.get("keys") or []:
+        if isinstance(k, dict) and str(k.get("kid") or ""):
+            out[str(k["kid"])] = k
+    return out
+
+
+async def _jwk_for(kid: str, settings: SSOSettings) -> dict | None:
+    """The JWK for kid from the cached keyset. Refresh on TTL expiry;
+    on an unknown kid, refresh at most once per _JWKS_MIN_REFRESH_S.
+    A failed fetch keeps serving the stale keyset (availability)."""
+    if not settings.jwks_url:
+        return None
+    url = settings.jwks_url
+    now = time.time()
+    ent = _JWKS_CACHE.get(url)
+    if ent and kid in ent["keys"] \
+            and now - ent["fetched_at"] <= settings.jwks_cache_ttl_s:
+        return ent["keys"][kid]
+    if ent and kid not in ent["keys"] \
+            and now - ent["fetched_at"] < _JWKS_MIN_REFRESH_S:
+        return None  # unknown kid, refreshed recently — don't hammer
+    try:
+        keyset = await _jwks_fetch(url, settings.timeout_s)
+        _JWKS_CACHE[url] = {"fetched_at": now, "keys": _jwks_index(keyset)}
+    except Exception as e:
+        logger.warning("sso: jwks fetch failed (%s) — falling back", e)
+        if ent and kid in ent["keys"]:
+            return ent["keys"][kid]   # stale but better than nothing
+        return None
+    return _JWKS_CACHE[url]["keys"].get(kid)
+
+
+async def validate_local(token: str, settings: SSOSettings) -> dict | None:
+    """Validate the token LOCALLY against the IdP's published keyset:
+    signature (kid → JWK), exp/nbf (PyJWT defaults), aud/iss (when
+    configured). Returns the claims dict on success; None on ANY miss
+    — malformed token, unknown kid, bad signature, expired, wrong
+    aud/iss, JWKS unreachable, or PyJWT not installed — the caller
+    falls back to introspection, which stays the source of truth.
+
+    Hard rules: `none` and HMAC algorithms are never locally validated
+    (an unsigned token, or an HMAC signature over a PUBLIC key, is
+    not an OIDC credential)."""
+    try:
+        import jwt  # PyJWT — lazy: introspection-only setups run without it
+        from jwt import PyJWK
+    except ImportError:
+        return None
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:  # noqa: BLE001 — not a JWT → introspection
+        return None
+    alg = str(header.get("alg") or "")
+    if alg in ("none", "") or alg.startswith("HS"):
+        return None
+    kid = str(header.get("kid") or "")
+    jwk = await _jwk_for(kid, settings)
+    if jwk is None:
+        return None
+    try:
+        key = PyJWK(jwk).key
+        claims = jwt.decode(
+            token, key, algorithms=[alg],
+            audience=settings.audience or None,
+            issuer=settings.issuer or None)
+    except Exception:  # noqa: BLE001 — invalid → introspection decides
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
 async def authenticate(token: str, settings: SSOSettings) -> dict[str, Any]:
-    """Validated claims for token: cache → introspect → cache.
+    """Validated claims for token: cache → LOCAL JWT validation (when
+    jwks_url is configured — signature/aud/iss/exp checked against the
+    IdP's published keyset, no network round-trip) → introspection →
+    cache. Local validation is an ACCELERATOR: any miss (malformed
+    token, unknown kid, bad signature, expired, wrong aud/iss, JWKS
+    unreachable) falls back to introspection, which stays the source
+    of truth. Introspection therefore remains REQUIRED while sso is
+    enabled — it is the fallback and the opaque-token path.
     Returns {} when the token is invalid/inactive/audience-mismatched.
-    Raises SSOUnavailable on transport failure. Positive-only caching
-    (negative results are never cached — an IdP outage must not
-    extend a denial)."""
+    Raises SSOUnavailable on introspection transport failure.
+    Positive-only caching (negative results are never cached — an IdP
+    outage must not extend a denial)."""
     cached = _cache_get(token, settings.cache_ttl_s)
     if cached is not None:
         return cached
-    claims = await introspect(token, settings)
+    claims = None
+    if settings.jwks_url:
+        claims = await validate_local(token, settings)
+    if claims is None:
+        claims = await introspect(token, settings)
     if claims and not _audience_ok(claims, settings.audience):
         claims = {}
     if claims:
