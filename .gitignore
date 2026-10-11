@@ -5,6 +5,10 @@ data/
 # Vendor license-signing key (the crown jewel — offline custody)
 vendor_keys/
 
+# Nuitka build outputs (scripts/build_binary.py)
+build/
+dist/
+
 # Python
 .venv/
 __pycache__/

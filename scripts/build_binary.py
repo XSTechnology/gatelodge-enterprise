@@ -64,7 +64,7 @@ def build(edition: str, debug: bool) -> int:
         raise SystemExit(f"entry point missing for {edition}: {entry}")
 
     version = _version()
-    exe = f"gatelodge-{edition}.exe"
+    exe = f"gatelodge-{edition}{'.exe' if sys.platform == 'win32' else ''}"
     print(f"building Gatelodge {edition} v{version} ({entry}) -> dist/")
 
     cmd = [sys.executable, "-m", "nuitka",
