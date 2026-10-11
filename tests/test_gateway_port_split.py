@@ -108,8 +108,9 @@ def test_serving_scope_blocks_control_plane(wired, gguf):  # noqa: F811
 
 
 def test_admin_scope_hosts_only_control_plane(wired, gguf):  # noqa: F811
-    """Through the ADMIN shim: /admin/* + console + /healthz serve;
-    the DATA plane (/v1, /mcp) 404s there."""
+    """Through the ADMIN shim: the CONTROL plane (/admin/*, /teams,
+    /scim) + console + /healthz serve; the DATA plane (/v1, /mcp)
+    404s there."""
     wired(_config_with(gguf))
     admin = gw_app.admin_scope_app()
     auth = {"Authorization": "Bearer admin-secret"}
@@ -118,6 +119,14 @@ def test_admin_scope_hosts_only_control_plane(wired, gguf):  # noqa: F811
         assert client.get("/").status_code == 200          # console
         r = client.get("/admin/stats", headers=auth)
         assert r.status_code == 200                        # works here
+        # control surfaces (enterprise mounts) are hosted HERE too —
+        # auth still applies (they own their bearers); the point is
+        # the request REACHES them, not a scope 404
+        rt = client.get("/teams")
+        assert rt.status_code == 401                       # reached +
+        # 401 = the teams surface's own auth (no bearer) — not 404
+        rs = client.get("/scim/v2/Users")
+        assert rs.status_code == 401                       # ditto SCIM
         assert client.get("/v1/models",
                           headers=auth).status_code == 404  # not hosted
         assert client.post("/mcp", json={"jsonrpc": "2.0", "id": 1,
