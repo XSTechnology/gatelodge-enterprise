@@ -1,6 +1,6 @@
 [project]
 name = "gatelodge"
-version = "1.3.0"
+version = "1.4.0"
 description = "Gatelodge — local OpenAI-compatible LLM gateway: embedded llama.cpp + cloud backends, JSON-convention tool calling, GPU placement"
 requires-python = ">=3.12"
 dependencies = [
