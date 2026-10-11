@@ -44,7 +44,12 @@ COPY enterprise_main.py run_gateway.py ./
 RUN uv run --no-sync scripts/build_binary.py --edition enterprise
 
 # ── stage 2: runtime (the compiled tree only) ───────────────────────────
-FROM debian:bookworm-slim
+# Base MUST match the builder's (python:3.12-slim): Nuitka links the
+# binary against the BUILDER's glibc, and a runtime base with an older
+# glibc fails to load it (observed: bookworm-slim 2.36 < required 2.38
+# when the builder moved to trixie). Same family tag = same base, so
+# the pair can never drift apart.
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \

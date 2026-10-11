@@ -5,6 +5,8 @@ data
 plans
 tests
 scripts
+!scripts/license_tool.py
+!scripts/build_binary.py
 __pycache__
 *.pyc
 *.md
