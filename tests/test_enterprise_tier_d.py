@@ -23,8 +23,8 @@ from gateway_enterprise.redis_storage import RedisStorage
 # shared fixtures/helpers (same directory; pytest inserts it in sys.path)
 from test_gateway_stage3 import (gguf, wired, _config, _patch_cloud,  # noqa: F401
                                  _FakeCloud)
-from test_enterprise_sso import (ADMIN_CLAIMS, FakeIdP, _sso_config,  # noqa: F401
-                                 _sso_section, _wire_enterprise, auth)
+from test_gateway_sso import (ADMIN_CLAIMS, FakeIdP, _sso_config,  # noqa: F401
+                              _sso_section, _wire_enterprise, auth)
 
 
 def _redis() -> RedisStorage:
@@ -252,7 +252,7 @@ def test_sso_introspection_cache_shared(wired, gguf, monkeypatch):
     monkeypatch.setenv("TEST_SSO_SECRET", "secret")
     wired(_sso_config(gguf, sso=_sso_section()))
     fake = FakeIdP(ADMIN_CLAIMS)
-    monkeypatch.setattr("gateway_enterprise.sso.introspect", fake)
+    monkeypatch.setattr("gateway.sso.introspect", fake)
     set_storage(RedisStorage(client=fakeredis.FakeRedis()))
     _wire_enterprise()
     try:

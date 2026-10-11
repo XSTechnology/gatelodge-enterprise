@@ -1,13 +1,16 @@
-"""Gatelodge Enterprise — fork-side behavior injected via the core
-seams (gateway.auth / gateway.storage / gateway.config).
+"""Gatelodge Enterprise — the COMMERCIAL fork modules, injected via the
+core seams (gateway.auth / gateway.storage / gateway.config) at
+startup by enterprise_main.py.
 
-Nothing in this package edits the core; it is imported and wired at
-startup by enterprise_main.py:
+Governance (RBAC role-scoped admin keys + SSO/OIDC) is CORE since
+upstream 755432f — gateway/rbac.py, gateway/identity.py,
+gateway/sso.py, with resolve_link + rbac_link in the default
+pipeline. This package carries only the paid tiers:
 
-    set_auth_pipeline(AuthPipeline([resolve_key_link, rbac_link,
-                                    admin_gate_link, rate_limit_link]))
+    tier D — multi-replica shared state:
+        redis_storage.RedisStorage (storage seam)
+        db_config.DatabaseConfigStore (config seam)
 
-Tier C-lite: role-scoped admin keys (rbac.py, links.py).
-Tier C:     SSO/OIDC (links.sso_link — reserved).
-Tier D:     RedisStorage + DatabaseConfigStore (future modules).
+Future: v1.4 SCIM + session budgets + audit hardening; v2.0 the
+Gatehouse (MCP gateway, OTel, semantic caching, teams).
 """
