@@ -10,23 +10,23 @@
     "status": "completed"
   },
   {
-    "content": "[c-lite-3] Wire pipeline in enterprise_main.py ([resolve, rbac, admin_gate, rate_limit], sso slot reserved) + docstring update — self (tiny, depends on c-lite-2)",
+    "content": "[c-lite-3] Wire pipeline in enterprise_main.py ([resolve, rbac, admin_gate, rate_limit], sso slot reserved) + logging-before-wiring fix — self",
     "id": "c-lite-3",
     "status": "completed"
   },
   {
-    "content": "[c-lite-4] tests/test_enterprise_rbac.py: 14 canary-style cases per plan test list (real wiring, restore in finally) — self (must match the exact API of 1-2)",
+    "content": "[c-lite-4] tests/test_enterprise_rbac.py: 14 canary-style cases per plan test list (real wiring, restore in finally) — self",
     "id": "c-lite-4",
     "status": "completed"
   },
   {
-    "content": "[c-lite-5] smoke_test.py --key/--ro-key extension + merge dev admin keys+roles into data/gateway_config.json (8011, preserve existing backends/aliases) — self (fork-owned files, must match dev key values used in verification)",
+    "content": "[c-lite-5] smoke_test.py --key/--ro-key extension + dev admin keys+roles (sha256 form) in data/gateway_config.json — self",
     "id": "c-lite-5",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[c-lite-6] Full suite + live verification on 8011 (startup log, smoke with --key, curl matrix, hot-reload flip), single commit, update project context — self (synthesis of all tasks)",
+    "content": "[c-lite-6] Full suite 484/484 + live verification on 8011 (swap log line, smoke 23/23, curl matrix, hot-reload flip), commit 33757c6, project context updated — self",
     "id": "c-lite-6",
-    "status": "pending"
+    "status": "completed"
   }
 ]

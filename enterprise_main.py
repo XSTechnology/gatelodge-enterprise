@@ -8,7 +8,9 @@ data/gateway_config.json — proving the wiring path works.
 
 Seam recipe (fill in as the tiers land):
 
-    # tier D — multi-replica shared state
+    # tier D — multi-replica shared state (LANDED; wired in main() via
+    # _wire_tier_d(), conditional on GATELODGE_REDIS_URL /
+    # GATELODGE_CONFIG_DSN — no env vars = core defaults):
     from gateway.storage import set_storage
     from gateway_enterprise.redis_storage import RedisStorage
     set_storage(RedisStorage(url="redis://..."))
@@ -24,7 +26,7 @@ Seam recipe (fill in as the tiers land):
     set_auth_pipeline(AuthPipeline([resolve_link, rbac_link,
                                     admin_gate_link, rate_limit_link]))
 
-    # tier D — shared config
+    # tier D — shared config (LANDED; same conditional wiring)
     from gateway import config as gw_config
     from gateway_enterprise.db_config import DatabaseConfigStore
     gw_config.set_config_store(DatabaseConfigStore(dsn="..."))
@@ -58,6 +60,37 @@ def _load_sso_secret() -> None:
         pass
 
 
+def _wire_tier_d() -> None:
+    """Swap the storage + config backends when the operator points at
+    shared ones (tier D — multi-replica: N replicas, one Redis, one
+    DB). NO env vars = the core's single-process defaults, byte-for-
+    byte. Env-var bootstrap mirrors the api_key_env convention: the
+    Redis URL / DSN must be known before the config loads, so it
+    cannot live IN the config.
+
+      GATELODGE_REDIS_URL   e.g. redis://127.0.0.1:6379/0
+      GATELODGE_CONFIG_DSN  e.g. postgresql://user:pw@host/gatelodge
+
+    Order matters: storage BEFORE config (tier C's sso_introspect
+    cache must never write to a backend that's about to be swapped).
+    The DB store seeds from the legacy data/gateway_config.json once,
+    when its table is empty — the operator's pre-tier-D config carries
+    over. Call BEFORE serving; existing state does NOT migrate."""
+    from gateway import config as gw_config
+
+    redis_url = os.environ.get("GATELODGE_REDIS_URL", "").strip()
+    if redis_url:
+        from gateway.storage import set_storage
+        from gateway_enterprise.redis_storage import RedisStorage
+        set_storage(RedisStorage(url=redis_url))
+
+    dsn = os.environ.get("GATELODGE_CONFIG_DSN", "").strip()
+    if dsn:
+        from gateway_enterprise.db_config import DatabaseConfigStore
+        gw_config.set_config_store(DatabaseConfigStore(
+            dsn=dsn, seed_file=gw_config.CONFIG_PATH))
+
+
 def main() -> None:
     # ── enterprise seam wiring (before serving) ────────────────────
     # The core's main() configures logging, but the wiring below logs
@@ -69,6 +102,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     _load_sso_secret()
+    _wire_tier_d()   # storage → config (before auth: the pipeline reads cfg)
 
     # C-lite LANDED: role-scoped admin keys (rbac_link — the
     # role→admin-surface mapping from admin_key_roles).

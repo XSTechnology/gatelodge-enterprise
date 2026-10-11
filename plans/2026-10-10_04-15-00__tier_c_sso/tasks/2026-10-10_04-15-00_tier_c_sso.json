@@ -1,32 +1,32 @@
 [
   {
-    "content": "[tier-c-1] gateway_enterprise/identity.py: _SSO_IDENTITY ContextVar + get/set helpers (single definition) — self (tiny, everything imports it)",
+    "content": "[tier-c-1] gateway_enterprise/identity.py: _SSO_IDENTITY ContextVar + get/set helpers (single definition) — self",
     "id": "tier-c-1",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[tier-c-2] gateway_enterprise/sso.py: SSOConfig parser, looks_like_oidc heuristic, introspect() async httpx, resolve_sso_role rules, storage-backed introspection cache — self (core module, links depend on its API)",
+    "content": "[tier-c-2] gateway_enterprise/sso.py: SSOConfig parser (fixed cache_ttl_s=0 falsy bug found by tests), looks_like_oidc, introspect(), resolve_sso_role, storage-backed cache — self",
     "id": "tier-c-2",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[tier-c-3] links.py: resolve_link dispatch wrapper (OIDC-shaped → SSO, else core resolve) + rbac_link identity-first role/audit extension — self (depends on tier-c-2 API)",
+    "content": "[tier-c-3] links.py: resolve_link dispatch wrapper + rbac_link identity-first role/audit extension — self",
     "id": "tier-c-3",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[tier-c-4] enterprise_main.py: swap resolve_key_link → resolve_link in wiring, keyring-load client_secret_env, fix docstring recipe ordering note — self (tiny, depends on tier-c-3)",
+    "content": "[tier-c-4] enterprise_main.py: wiring swap, keyring bridge _load_sso_secret, docstring recipe fixed — self",
     "id": "tier-c-4",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[tier-c-5] tests/test_enterprise_sso.py: ~14 cases per plan (monkeypatched introspection transport, no real HTTP) — self (must match exact APIs of 2-3)",
+    "content": "[tier-c-5] tests/test_enterprise_sso.py: 21 cases (monkeypatched transport, no real HTTP) — self",
     "id": "tier-c-5",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[tier-c-6] scripts/stub_idp.py dev stub + live verification on 8011 (curl matrix, cache check, no-sso regression), full suite, commit, context update — self (synthesis)",
+    "content": "[tier-c-6] scripts/stub_idp.py + live verification on 8011 (matrix, cache single-hit, sso: audit identities, no-sso regression), suite 505/505, commit f5cc2c8, context updated — self",
     "id": "tier-c-6",
-    "status": "pending"
+    "status": "completed"
   }
 ]

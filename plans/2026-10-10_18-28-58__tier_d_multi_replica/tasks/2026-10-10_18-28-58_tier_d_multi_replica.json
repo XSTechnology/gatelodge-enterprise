@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[tier-d-0] UPSTREAM: store-based config mutations (CAS) + canaries; committed c2a0b5f — DONE",
+    "id": "tier-d-0",
+    "status": "completed"
+  },
+  {
+    "content": "[tier-d-1] UPSTREAM: `shared` flag + _scope_spend guard; committed 2cc681a; merged (511/511) — DONE",
+    "id": "tier-d-1",
+    "status": "completed"
+  },
+  {
+    "content": "[tier-d-2] gateway_enterprise/redis_storage.py: full protocol parity with InMemoryStorage verified via fakeredis (bytes-client robustness fixed); deps redis+fakeredis added — DONE",
+    "id": "tier-d-2",
+    "status": "completed"
+  },
+  {
+    "content": "[tier-d-3] gateway_enterprise/db_config.py: DatabaseConfigStore (ConfigStore subclass; DB-API: dsn= psycopg3 / conn= sqlite for tests; gw_config table, BIGINT version, CAS save, seed-from-file on empty) + sqlite round-trip/CAS/seed tests — self",
+    "id": "tier-d-3",
+    "status": "in_progress"
+  },
+  {
+    "content": "[tier-d-4] enterprise_main.py conditional wiring (GATELODGE_REDIS_URL / GATELODGE_CONFIG_DSN; storage→config→auth order, no-env = defaults) + canary suite (real wiring swaps, two-client shared-backend cases per plan §Test plan) — self",
+    "id": "tier-d-4",
+    "status": "pending"
+  },
+  {
+    "content": "[tier-d-5] Live two-replica verification on 8011+8012 (Docker redis+pg if present, else fakeredis/sqlite through same code paths): cross-replica config propagation, shared rate window + sso cache, smoke both, no-env regression; fork commit + both project contexts updated — self (synthesis)",
+    "id": "tier-d-5",
+    "status": "pending"
+  }
+]
