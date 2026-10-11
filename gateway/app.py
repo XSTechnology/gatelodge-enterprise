@@ -461,6 +461,8 @@ _METRIC_LABELS: dict[str, tuple[str, ...]] = {
     "gateway_cost_usd_total": ("backend",),
     "gateway_requests_by_key_total": ("key",),
     "gateway_guardrail_blocks_total": ("rule",),
+    "gateway_semantic_cache_hits_total": ("model",),
+    "gateway_mcp_tool_calls_total": ("server", "tool", "status"),
 }
 _METRICS: dict[str, dict[tuple, float]] = {n: {} for n in _METRIC_LABELS}
 _METRIC_CARDINALITY_CAP = 1000
@@ -492,6 +494,8 @@ def _metrics_text() -> str:
         "gateway_cost_usd_total": "Estimated provider cost (USD) by backend.",
         "gateway_requests_by_key_total": "Requests by consuming key.",
         "gateway_guardrail_blocks_total": "Guardrail rule violations.",
+        "gateway_semantic_cache_hits_total": "Semantic-cache (paraphrase) hits by model.",
+        "gateway_mcp_tool_calls_total": "MCP tool calls by server/tool/status.",
     }
     types = {"gateway_requests_total": "counter",
              "gateway_request_ms_sum": "counter",
@@ -499,7 +503,9 @@ def _metrics_text() -> str:
              "gateway_tokens_total": "counter",
              "gateway_cost_usd_total": "counter",
              "gateway_requests_by_key_total": "counter",
-             "gateway_guardrail_blocks_total": "counter"}
+             "gateway_guardrail_blocks_total": "counter",
+             "gateway_semantic_cache_hits_total": "counter",
+             "gateway_mcp_tool_calls_total": "counter"}
     out: list[str] = []
     for name, label_names in _METRIC_LABELS.items():
         out.append(f"# HELP {name} {helps[name]}")
