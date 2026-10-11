@@ -191,6 +191,26 @@ def set_extra_router(router, *, prefix: str) -> None:
     app.include_router(router, prefix=prefix)
 
 
+def add_extra_router(router, *, prefix: str) -> None:
+    """Mount an ADDITIONAL enterprise surface alongside whatever is
+    already mounted (v2.0: SCIM at /scim and the MCP gateway at /mcp
+    coexist). Same auth-owns-prefix semantics as set_extra_router;
+    idempotent per prefix (a repeated mount is a no-op). set_extra_
+    router() remains the reset-and-mount primitive — calling it (or
+    its None cleanup) removes EVERYTHING mounted, added routers
+    included, because the truncation mark predates them all."""
+    global _EXTRA_ROUTER_MARK
+    prefix = "/" + prefix.strip("/")
+    if prefix in _EXTRA_ROUTER_PREFIXES:
+        return                      # already mounted — boot-time no-op
+    if _EXTRA_ROUTER_MARK is None:
+        # First surface arrived via the additive path: record the mark
+        # so set_extra_router(None) still truncates everything.
+        _EXTRA_ROUTER_MARK = len(app.router.routes)
+    _EXTRA_ROUTER_PREFIXES.append(prefix)
+    app.include_router(router, prefix=prefix)
+
+
 _LOG_PATH = PROJECT_ROOT / "data" / "gateway_log.jsonl"
 _log_lock = threading.Lock()
 

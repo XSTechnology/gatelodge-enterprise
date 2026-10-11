@@ -257,3 +257,46 @@ def test_extra_router_replace_semantics(wired, gguf):
                               ).status_code == 401
     finally:
         gw_app.set_extra_router(None, prefix="/second")
+
+
+def test_extra_router_additive_two_surfaces(wired, gguf):
+    """v2.0 seam extension: add_extra_router mounts a SECOND surface
+    alongside the first (SCIM + MCP coexist). Both prefixes serve and
+    both skip the core pipeline; a repeated mount of the same prefix is
+    a no-op; set_extra_router(None) still removes EVERYTHING."""
+    from fastapi import APIRouter
+    wired(_secured_config(gguf))
+    gw_app.set_extra_router(_probe_router(), prefix="/probe")
+    r2 = APIRouter()
+
+    @r2.get("/mcp-hello")
+    def _mcp_hello():
+        return {"surface": "mcp"}
+
+    gw_app.add_extra_router(r2, prefix="/mcp")
+    gw_app.add_extra_router(r2, prefix="/mcp")   # idempotent re-mount
+    try:
+        with TestClient(gw_app.app) as client:
+            assert client.get("/probe/hello").status_code == 200
+            assert client.get("/mcp/mcp-hello").status_code == 200
+            assert client.get("/mcp/mcp-hello").json() == {"surface": "mcp"}
+            # outside both prefixes the core pipeline is untouched
+            assert client.get("/admin/stats").status_code == 401
+    finally:
+        gw_app.set_extra_router(None, prefix="/probe")
+        assert "/mcp" not in gw_app._EXTRA_ROUTER_PREFIXES
+        assert "/probe" not in gw_app._EXTRA_ROUTER_PREFIXES
+
+
+def test_extra_router_additive_alone(wired, gguf):
+    """add_extra_router works without any prior set_extra_router — and
+    the None cleanup still removes it (the mark is recorded on first
+    additive mount too)."""
+    wired(_secured_config(gguf))
+    gw_app.add_extra_router(_probe_router(), prefix="/solo")
+    try:
+        with TestClient(gw_app.app) as client:
+            assert client.get("/solo/hello").status_code == 200
+    finally:
+        gw_app.set_extra_router(None, prefix="/solo")
+        assert "/solo" not in gw_app._EXTRA_ROUTER_PREFIXES
