@@ -861,6 +861,13 @@ class GatewayConfig:
         # Audit shipping (tier B)
         audit = raw.get("audit") if isinstance(raw.get("audit"), dict) else {}
         self.audit = {"webhook_url": str(audit.get("webhook_url") or "").strip()}
+        # Session budgets (v1.4): when enabled, an x-session-id header
+        # on a request charges a session:<id> spend scope alongside the
+        # consuming key (the enterprise pre-gate reads the raw section
+        # for its own knobs — default_tpm, per-tenant overrides).
+        sb = raw.get("session_budgets")
+        sb = sb if isinstance(sb, dict) else {}
+        self.session_budgets = {"enabled": bool(sb.get("enabled", False))}
         # Guardrails + smart routes (tier E)
         self.guardrails = _normalize_guardrails(raw.get("guardrails"))
         self.smart_routes = _normalize_smart_routes(raw.get("smart_routes"))

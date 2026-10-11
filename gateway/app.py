@@ -138,8 +138,8 @@ from . import upload
 # shares ONE ContextVar object per name.
 from . import auth
 from .auth import (AuthPipeline, get_auth_pipeline, set_auth_pipeline,
-                   _REQUEST_KEY_ID, _REQUEST_ID, _resolve_bearer,
-                   _sha256_hex)
+                   _REQUEST_KEY_ID, _REQUEST_ID, _REQUEST_SESSION_ID,
+                   _resolve_bearer, _sha256_hex, session_id_from_header)
 from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
                      get_gateway_config,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
@@ -529,6 +529,10 @@ async def _bearer_auth(request: Request, call_next):
     rid = ((request.headers.get("x-request-id") or "").strip())[:64] \
         or uuid.uuid4().hex[:16]
     _REQUEST_ID.set(rid)
+    # Session budgets (v1.4): capture the validated x-session-id when
+    # the feature is enabled — the charge hook and request log read it.
+    if (cfg.session_budgets or {}).get("enabled"):
+        _REQUEST_SESSION_ID.set(session_id_from_header(request))
     if request.method == "GET" and request.url.path == "/":
         _REQUEST_KEY_ID.set("")  # static console shell — its API
         # calls still require the key (the page prompts for it)
@@ -575,6 +579,9 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
     kid = _REQUEST_KEY_ID.get()
     if kid:
         rec["key"] = kid
+    sid = _REQUEST_SESSION_ID.get()
+    if sid:
+        rec["session"] = sid
     if cost_usd is not None:
         rec["cost_usd"] = round(cost_usd, 6)
     rid = _REQUEST_ID.get()
@@ -769,6 +776,9 @@ def _scope_spend(scope: str) -> dict[str, float]:
             if kind == "backend":
                 if e.get("backend") != marker:
                     continue
+            elif kind == "session":
+                if e.get("session") != marker:
+                    continue
             elif e.get("key") != marker:
                 continue
             tokens += int((e.get("usage") or {}).get("total_tokens") or 0)
@@ -821,6 +831,12 @@ def _charge_request(cfg, backend_name: str, usage: dict,
         if int(entry.get("rate_limit_tpm") or 0) > 0:
             auth._tpm_charge(kid, tokens)
         _maybe_spend_alert(kid, entry)
+    # Session budgets (v1.4): charge the session scope alongside the
+    # key — same ledger machinery, so the enterprise pre-gate (and any
+    # multi-replica shared backend) sees it for free.
+    sid = _REQUEST_SESSION_ID.get()
+    if sid:
+        _charge_scope(f"session:{sid}", tokens, cost_usd)
 
 
 def _maybe_spend_alert(key_id: str, entry: dict) -> None:

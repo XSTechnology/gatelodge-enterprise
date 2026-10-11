@@ -55,6 +55,7 @@ import contextvars
 import hashlib
 import hmac
 import logging
+import re
 import time
 from typing import Any, Callable
 
@@ -74,6 +75,23 @@ logger = logging.getLogger(__name__)
 # THE definition — app.py imports these (see module docstring).
 _REQUEST_KEY_ID = contextvars.ContextVar("gw_request_key", default="")
 _REQUEST_ID = contextvars.ContextVar("gw_request_id", default="")
+# Session id (v1.4 session budgets): set by the middleware from the
+# x-session-id header when session_budgets.enabled — read by the charge
+# hook (session:<id> spend scope) and the request log. Empty when the
+# feature is off or the header is absent/invalid.
+_REQUEST_SESSION_ID = contextvars.ContextVar("gw_request_session",
+                                             default="")
+
+
+def session_id_from_header(request: Request) -> str:
+    """The validated x-session-id header value ('' when absent or
+    invalid — ids are [A-Za-z0-9._:-]{1,64}, the same shape as key ids;
+    garbage is ignored rather than truncated so it cannot fragment the
+    spend ledger with unbounded unique markers)."""
+    sid = (request.headers.get("x-session-id") or "").strip()
+    if sid and re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", sid):
+        return sid
+    return ""
 
 
 def _sha256_hex(raw: str) -> str:
