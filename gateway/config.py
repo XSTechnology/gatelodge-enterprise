@@ -855,6 +855,21 @@ class GatewayConfig:
             "ttl_s": max(0.0, float(rc.get("ttl_s") or 3600)),
             "max": max(0, int(rc.get("max") or 100)),
         }
+        # Semantic cache (v2.0): paraphrase hits via LOCAL embeddings —
+        # rides the response-cache eligibility rules and master switch;
+        # gateway/semantic_cache.py owns the semantics.
+        sc = raw.get("semantic_cache") if isinstance(raw.get("semantic_cache"), dict) else {}
+        try:
+            sc_threshold = max(0.0, min(1.0, float(sc.get("threshold") or 0.92)))
+        except (TypeError, ValueError):
+            sc_threshold = 0.92
+        self.semantic_cache = {
+            "enabled": bool(sc.get("enabled", False)),
+            "embedding_model": str(sc.get("embedding_model") or "").strip(),
+            "threshold": sc_threshold,
+            "ttl_s": max(0.0, float(sc.get("ttl_s") or 3600)),
+            "max": max(0, int(sc.get("max") or 100)),
+        }
         # Virtual (per-consumer) keys + cached provider pricing
         self.api_keys = _normalize_api_keys(raw.get("api_keys"))
         self.model_prices = _normalize_model_prices(raw.get("model_prices"))
