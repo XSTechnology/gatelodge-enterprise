@@ -4088,6 +4088,7 @@ function renderApiKeys(rows) {
         + ' / ' + (k.monthly_usd_budget ? '$' + k.monthly_usd_budget : '—');
       var limits = (k.models && k.models.length ? esc(k.models.join(', ')) : 'all models');
       if (k.rate_limit_rpm) limits += '<br>' + k.rate_limit_rpm + ' rpm';
+      if (k.rate_limit_tpm) limits += '<br>' + k.rate_limit_tpm + ' tpm';
       var used = k.used_tokens + ' tok' + (k.used_usd ? ' · $' + Number(k.used_usd).toFixed(4) : '');
       var keydisp = k.key ? esc(_maskKey(k.key)) :
         (k.key_hash ? '<span class="muted">' + esc(k.key_hash) + '…</span>' : '—');
@@ -4108,6 +4109,7 @@ function renderApiKeys(rows) {
     '<div><div class="muted" style="font-size:0.72rem">owner</div><input id="nk-owner" placeholder="(optional)" style="width:110px;padding:6px 10px;"></div>' +
     '<div><div class="muted" style="font-size:0.72rem">models (allowlist)</div><input id="nk-models" placeholder="hf, glm53, hf:glm53… (blank = all)" style="width:220px;padding:6px 10px;"></div>' +
     '<div><div class="muted" style="font-size:0.72rem">rate limit /min</div><input id="nk-rpm" type="number" min="0" placeholder="0 = off" style="width:90px;padding:6px 10px;"></div>' +
+    '<div><div class="muted" style="font-size:0.72rem">tokens /min</div><input id="nk-tpm" type="number" min="0" placeholder="0 = off" style="width:100px;padding:6px 10px;"></div>' +
     '<div><div class="muted" style="font-size:0.72rem">token budget /mo</div><input id="nk-tok" type="number" min="0" placeholder="0 = off" style="width:100px;padding:6px 10px;"></div>' +
     '<div><div class="muted" style="font-size:0.72rem">$ budget /mo</div><input id="nk-usd" type="number" min="0" step="0.01" placeholder="0 = off" style="width:90px;padding:6px 10px;"></div>' +
     '<button class="btn btn-primary" onclick="createApiKey()">＋ Create key</button></div>';
@@ -4125,9 +4127,11 @@ function createApiKey() {
   var models = document.getElementById('nk-models').value.trim();
   if (models) payload.models = models.split(',').map(function (m) { return m.trim(); }).filter(Boolean);
   var rpm = document.getElementById('nk-rpm').value.trim();
+  var tpm = document.getElementById('nk-tpm').value.trim();
   var tok = document.getElementById('nk-tok').value.trim();
   var usd = document.getElementById('nk-usd').value.trim();
   if (rpm) payload.rate_limit_rpm = parseInt(rpm, 10) || 0;
+  if (tpm) payload.rate_limit_tpm = parseInt(tpm, 10) || 0;
   if (tok) payload.monthly_token_budget = parseInt(tok, 10) || 0;
   if (usd) payload.monthly_usd_budget = parseFloat(usd) || 0;
   api('/admin/keys', {method: 'POST', body: payload}).then(function (d) {
