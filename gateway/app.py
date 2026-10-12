@@ -438,6 +438,26 @@ async def _install_provider_gate() -> None:
     set_backend_filter(licensing.provider_allowed)
     cfg = get_gateway_config()
     _log_unlicensed_backends(cfg)
+    # v2.2 GPU cap advisory: a licensed gpus cap below the detected
+    # count warns loudly (visibility) — the instances cap is the hard
+    # enforcement; this catches over-provisioned boxes at boot.
+    gpus_cap = licensing.caps().get("gpus")
+    if gpus_cap is not None:
+        try:
+            n_gpus = len(detect_gpus(ttl_s=30.0))
+            if n_gpus > gpus_cap:
+                msg = (f"license caps this deployment at {gpus_cap} GPU(s) "
+                       f"— {n_gpus} detected; the instance cap "
+                       "({}) is enforced at load time".format(
+                           licensing.caps().get("instances", "n/a")))
+                logger.warning("License: %s", msg)
+                _event_ring().push({
+                    "ts": datetime.now().isoformat(),
+                    "event": "license_gpu_overcap",
+                    "cap": gpus_cap, "detected": n_gpus,
+                    "message": msg})
+        except Exception:                                  # noqa: BLE001
+            pass
 
 
 def _unlicensed_backends(cfg) -> list[str]:
@@ -673,6 +693,37 @@ def _rid_response(resp: Response, rid: str) -> Response:
     return resp
 
 
+_EXPIRY_LEVEL_SEEN: int | None = None
+
+
+def _license_watch() -> None:
+    """Per-request license watch (cheap): hot-reload a renewed license
+    file in place, then surface expiry warnings on level CHANGE (30→7→1
+    days) — event ring + log once per crossing, not per request."""
+    global _EXPIRY_LEVEL_SEEN
+    if licensing.maybe_reload_license():
+        # entitlements may have changed with the renewal — re-surface
+        _log_unlicensed_backends(get_gateway_config())
+    warn = licensing.expiry_warning()
+    level = (warn or {}).get("level")
+    if level != _EXPIRY_LEVEL_SEEN:
+        _EXPIRY_LEVEL_SEEN = level
+        if warn is not None:
+            msg = (f"license expires in {warn['days_left']} day(s) "
+                   f"(level {level}) — renew and drop the new "
+                   "data/license.json in place (hot-reloads, no "
+                   "restart needed)")
+            logger.warning("License: %s", msg)
+            try:
+                _event_ring().push({"ts": datetime.now().isoformat(),
+                                    "event": "license_expiry_warning",
+                                    "level": level,
+                                    "days_left": warn["days_left"],
+                                    "message": msg})
+            except Exception:                              # noqa: BLE001
+                pass
+
+
 @app.middleware("http")
 async def _bearer_auth(request: Request, call_next):
     cfg = get_gateway_config()
@@ -681,6 +732,7 @@ async def _bearer_auth(request: Request, call_next):
         # resolve_chain filter reads the licensing state live — this
         # only refreshes the boot-time warning)
         _log_unlicensed_backends(cfg)
+    _license_watch()
     # URL-token auth (v2.x): /<token>/v1/... → canonical /v1/... with
     # the token riding _REQUEST_URL_TOKEN into the auth pipeline
     # (query form ?key= is read inside resolve_key_link). Runs BEFORE
@@ -4052,6 +4104,14 @@ async def admin_load(payload: LoadPayload) -> Response:
     if not name:
         return _error(400, "model must not be empty", param="model")
     engine = get_engine()
+    # v2.2 scale caps: loading beyond the licensed instance count
+    # refuses (embedding instances count toward the same cap)
+    cap_ok, cap_limit = licensing.cap_allows(
+        "instances", len(engine.loaded_models()))
+    if not cap_ok:
+        return _error(403, f"license cap: instance limit ({cap_limit}) "
+                      "reached — this deployment's license caps its "
+                      "loaded-instance count", code="license_caps")
     try:
         # Embedding models FIRST — they're explicit config, and a name
         # equal to a GGUF stem would otherwise auto-discover as CHAT.
@@ -5330,6 +5390,13 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
                                if str((k or {}).get("id")) != kid]
         _mutate_config(_del, f"api-key-revoke {kid}")
         return {"revoked": kid}
+    # v2.2 scale caps: creating beyond the licensed key count refuses
+    cap_ok, cap_limit = licensing.cap_allows(
+        "keys", len(cfg.api_keys or {}))
+    if not cap_ok:
+        return _error(403, f"license cap: virtual-key limit "
+                      f"({cap_limit}) reached — this deployment's "
+                      "license caps its key count", code="license_caps")
     if not cfg.gateway_keys:
         return _error(400, "configure a gateway ADMIN key first "
                            "(gateway_keys) — creating virtual keys enables "

@@ -49,9 +49,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))          # import the registry from the core
 from gateway.licensing import (  # noqa: E402
-    CLOUD_PROVIDER_TYPES, FEATURE_CODES)
+    CLOUD_PROVIDER_TYPES, FEATURE_CODES, key_id)
 
 KEY_PATH = ROOT / "vendor_keys" / "license_signing_key.pem"
+LEDGER_PATH = ROOT / "vendor_keys" / "issued_ledger.jsonl"
 
 PRODUCT = "gatelodge"
 ENTERPRISE_FEATURES = list(FEATURE_CODES)
@@ -83,8 +84,9 @@ def cmd_keygen(args: argparse.Namespace) -> int:
         format=serialization.PublicFormat.SubjectPublicKeyInfo)
     print(f"private key: {KEY_PATH}  (gitignored — guard it)")
     print("public key (paste into gateway/licensing.py "
-          "_LICENSE_PUBLIC_KEY_PEM):")
+          "trusted-key list):")
     print(pub.decode("ascii"))
+    print(f"key id (kid): {key_id(pub.decode('ascii'))}")
     return 0
 
 
@@ -117,6 +119,7 @@ def cmd_issue(args: argparse.Namespace) -> int:
         print("error: --business-name is required "
               "(or the legacy --customer alias)", file=sys.stderr)
         return 2
+    import uuid
     priv = KEY_PATH.read_text(encoding="ascii")
     now = _now()
 
@@ -125,9 +128,11 @@ def cmd_issue(args: argparse.Namespace) -> int:
         duration = "perpetual"                          # legacy flag
     days = DURATIONS[duration]
 
+    serial = "GL-" + uuid.uuid4().hex[:12].upper()
     claims: dict = {
         "product": PRODUCT,
         "edition": args.edition,
+        "serial": serial,
         "business_name": args.business_name or args.customer,
         "support": bool(args.support),
         "iat": int(now.timestamp()),
@@ -145,6 +150,24 @@ def cmd_issue(args: argparse.Namespace) -> int:
     if args.provider:
         claims["providers"] = [p.strip() for p in args.provider
                                if p.strip()]
+    if args.cap:
+        caps: dict[str, int] = {}
+        for spec in args.cap:
+            kind, _, val = spec.partition("=")
+            kind = kind.strip()
+            try:
+                n = int(val)
+            except ValueError:
+                print(f"error: --cap {spec!r} needs an integer",
+                      file=sys.stderr)
+                return 2
+            if kind not in ("keys", "instances", "teams", "gpus"):
+                print(f"error: unknown cap kind {kind!r} "
+                      "(keys/instances/teams/gpus)", file=sys.stderr)
+                return 2
+            caps[kind] = n
+        if caps:
+            claims["caps"] = caps
     if args.node:
         claims["node"] = args.node
     if days is not None:
@@ -152,9 +175,41 @@ def cmd_issue(args: argparse.Namespace) -> int:
 
     # The license is PLAINTEXT claims; the SHA-256 hash of the
     # contents is signed with the vendor private key (RS256) and the
-    # gateway verifies it with the embedded public key.
+    # gateway verifies it with an embedded public key. The JWT header
+    # carries the signing key's id (kid) for rotation.
     import jwt
-    token = jwt.encode(claims, priv, algorithm="RS256")
+    from cryptography.hazmat.primitives import serialization
+    priv_key = serialization.load_pem_private_key(
+        priv.encode("ascii"), password=None)
+    pub_pem = priv_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("ascii")
+    token = jwt.encode(claims, priv, algorithm="RS256",
+                       headers={"kid": key_id(pub_pem)})
+
+    # vendor-side issuance ledger (gitignored, next to the key) —
+    # every license ever issued, one JSON line each
+    try:
+        LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LEDGER_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": now.isoformat(), "serial": serial,
+                "edition": claims["edition"],
+                "business_name": claims["business_name"],
+                "contract_email": claims.get("contract_email"),
+                "vendor": claims.get("vendor"),
+                "features": claims.get("features"),
+                "providers": claims.get("providers"),
+                "caps": claims.get("caps"),
+                "duration": duration,
+                "exp": claims.get("exp"),
+                "node": claims.get("node"),
+                "kid": key_id(pub_pem),
+            }) + "\n")
+    except OSError as e:
+        print(f"warning: issuance ledger not writable ({e})",
+              file=sys.stderr)
 
     if args.raw:
         print(token)
@@ -165,12 +220,12 @@ def cmd_issue(args: argparse.Namespace) -> int:
                    encoding="utf-8")
     on = {c: y for c, y in claims.get("features", {}).items() if y}
     print(f"license written: {out}")
-    print(f"  edition={claims['edition']} "
+    print(f"  serial={serial} edition={claims['edition']} "
           f"business={claims['business_name']!r} "
           f"email={claims.get('contract_email') or '-'}")
     print(f"  features(on)={sorted(on)} "
           f"providers={claims.get('providers', [])} "
-          f"duration={duration}")
+          f"caps={claims.get('caps', {})} duration={duration}")
     return 0
 
 
@@ -218,6 +273,9 @@ def main(argv: list[str] | None = None) -> int:
                      help="cloud backend NAME entitled to serve "
                      f"({','.join(sorted(CLOUD_PROVIDER_TYPES))} types; "
                      "repeatable; local types are free)")
+    isu.add_argument("--cap", action="append", metavar="KIND=N",
+                     help="scale cap, repeatable — kinds: "
+                     "keys/instances/teams/gpus (absent = unlimited)")
     isu.add_argument("--duration", default="1y", choices=list(DURATIONS),
                      help="validity preset: 30d/60d/90d evaluation, "
                      "1y/2y/3y term, perpetual (default 1y)")
