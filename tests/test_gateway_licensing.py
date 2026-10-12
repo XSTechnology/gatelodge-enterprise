@@ -92,7 +92,7 @@ def test_bootstrap_licensed_community(keypair, tmp_path):
     assert st["customer"] == "Acme Corp"
     assert st["vendor"] == "runpod"
     assert st["support"] is True
-    assert st["features"] == ["sso"]
+    assert st["features"] == {"sso": True}
     assert st["expires_at"] is not None
     assert st["perpetual"] is False
     assert licensing.allows("sso") is True
@@ -374,7 +374,7 @@ def test_licensed_serves_and_admin_license_surfaces_claims(wired, gguf):
             assert body["customer"] == "Acme Corp"
             assert body["vendor"] == "runpod"
             assert body["support"] is True
-            assert body["features"] == ["sso"]
+            assert body["features"] == {"sso": True}
             h = client.get("/healthz", headers=headers).json()
             assert h["license"]["mode"] == "licensed"
             assert "customer" not in h["license"]

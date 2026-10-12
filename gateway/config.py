@@ -176,6 +176,33 @@ class GatewayConfigError(ValueError):
     """Unknown model / bad alias chain — maps to HTTP 400."""
 
 
+class ProviderNotLicensedError(GatewayConfigError):
+    """A plan's backend is not licensed (v2.2 provider entitlement —
+    cloud backends need their NAME in the license ``providers``
+    claim). Subclasses GatewayConfigError so existing handlers still
+    catch it; serving handlers surface it as HTTP 403
+    license_providers instead of 400 model_not_found."""
+
+
+# Provider-entitlement seam (v2.2): installed at app startup as
+# gateway.licensing.provider_allowed (config must not import licensing
+# — cycle). None (source/tests before boot) = no gate.
+_BACKEND_FILTER: Any = None
+
+
+def set_backend_filter(fn: Any) -> None:
+    """Install the provider gate: fn(backend_name, backend_type) ->
+    bool. Called once at app startup (and by tests)."""
+    global _BACKEND_FILTER
+    _BACKEND_FILTER = fn
+
+
+def reset_backend_filter() -> None:
+    """Test teardown: uninstall the provider gate."""
+    global _BACKEND_FILTER
+    _BACKEND_FILTER = None
+
+
 def _default_raw() -> dict[str, Any]:
     """Deep copy of the built-in defaults (safe to update in place)."""
     return json.loads(json.dumps(DEFAULT_CONFIG))
@@ -1047,6 +1074,27 @@ class GatewayConfig:
                         f"unknown model: {name!r} (not an alias or a backend model)")
                 entries = [found]
             plan = {"entries": entries, "hedge_s": 0.0, "local_only": False}
+        # Provider entitlement (v2.2): cloud backends serve only under
+        # their per-backend license claim. The filter is INSTALLED at
+        # app startup (licensing.provider_allowed) — None here means
+        # unmanaged (source/tests): no gate. Local entries never drop.
+        if _BACKEND_FILTER is not None:
+            entries = plan["entries"]
+            dropped = [
+                (b, m) for b, m in entries
+                if not _BACKEND_FILTER(b, (self.backends.get(b) or {})
+                                       .get("type") or "")]
+            if dropped:
+                entries = [e for e in entries if e not in dropped]
+                if not entries:
+                    b0, _ = dropped[0]
+                    btype = (self.backends.get(b0) or {}).get("type") or "?"
+                    raise ProviderNotLicensedError(
+                        f"backend {b0!r} ({btype}) is not licensed for "
+                        "this deployment — the license providers claim "
+                        "does not include it (local backends embedded/"
+                        "llama-server are always allowed)")
+                plan["entries"] = entries
         if plan["local_only"]:
             plan["entries"] = [
                 (b, m) for b, m in plan["entries"]
@@ -1083,11 +1131,25 @@ class GatewayConfig:
         name = (name or "").strip()
         if not name:
             raise GatewayConfigError("embedding model must not be empty")
+
+        def _gate(backend_name: str) -> None:
+            """v2.2 provider entitlement (see resolve_chain)."""
+            if _BACKEND_FILTER is not None and not _BACKEND_FILTER(
+                    backend_name,
+                    (self.backends.get(backend_name) or {}).get("type")
+                    or ""):
+                btype = (self.backends.get(backend_name) or {}).get("type") or "?"
+                raise ProviderNotLicensedError(
+                    f"backend {backend_name!r} ({btype}) is not licensed "
+                    "for this deployment — the license providers claim "
+                    "does not include it")
+
         if ":" in name:
             backend_name, _, model_key = name.partition(":")
             backend = self.backends.get(backend_name)
             if backend is None:
                 raise GatewayConfigError(f"unknown backend in {name!r}")
+            _gate(backend_name)
             where = ("embedding_models" if backend.get("type") == EMBEDDED_BACKEND
                      else "models")
             if model_key not in (backend.get(where) or {}):
@@ -1099,6 +1161,7 @@ class GatewayConfig:
             return local, name
         for bname, b in self.backends.items():
             if b.get("type") != EMBEDDED_BACKEND and name in (b.get("models") or {}):
+                _gate(bname)
                 return bname, name
         raise GatewayConfigError(
             f"unknown embedding model: {name!r} (define it under "

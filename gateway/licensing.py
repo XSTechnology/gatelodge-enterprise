@@ -22,9 +22,24 @@ POLICY lives in the entry points:
         active. No trial. Feature claims gate tier_d / scim /
         session_budgets.
 
-License = RS256 JWT (PyJWT — the same crypto stack as SSO/JWKS).
-Claims: product, edition, customer, vendor?, support, features[],
-exp? (absent = perpetual), nbf, iat, node? (node-lock fingerprint).
+TOKEN FORMAT (owner decision 2026-10-11): the license file is
+PLAINTEXT/readable claims — operators can see their own entitlements
+without tooling. Authenticity = RSA signature: the SHA-256 hash of
+the contents is signed with the vendor PRIVATE key ("encrypted with
+the private key") and verified with the embedded PUBLIC key — a
+plain RS256 JWT (PyJWT). Tampering with any claim breaks the
+signature; forging requires the vendor private key (offline
+custody).
+
+CLAIMS: product, edition, business_name (v1: customer),
+contract_email, vendor?, support, features {code: Y/N} over
+FEATURE_CODES (v1 list = all Y), providers [backend names] —
+PER-BACKEND cloud entitlement: embedded + llama-server are FREE
+(local compute); openai / runpod / runpod-public backends serve only
+when their NAME is in the claim (provider_allowed). exp? (absent =
+perpetual; the tool issues 30d/60d/90d/1y/2y/3y presets), nbf, iat,
+node? (node-lock fingerprint).
+
 The signing keypair comes from ``scripts/license_tool.py keygen``;
 the PRIVATE half lives in vendor_keys/ (gitignored — offline
 custody); this module embeds the PUBLIC half. Tests swap the key via
@@ -63,6 +78,17 @@ EDITIONS = ("community", "enterprise")
 TRIAL_DAYS_DEFAULT = 30
 ROLLBACK_TOLERANCE_S = 300        # wall clock may drift; 5 min is hostile
 _RECHECK_S = 60.0                 # middleware re-evaluates at most 1x/min
+
+# Feature-code registry — the codes a license may switch Y/N. One
+# list shared by the tool (issue-time validation) and the gateway
+# (status surfaces the catalog). New codes ride a license-tool +
+# licensing.py bump together.
+FEATURE_CODES = ("tier_d", "scim", "session_budgets", "mcp", "teams")
+
+# Provider entitlement (v2.2): local compute is FREE; cloud provider
+# backends serve only under their per-backend license claim.
+LOCAL_PROVIDER_TYPES = frozenset({"embedded", "llama-server"})
+CLOUD_PROVIDER_TYPES = frozenset({"openai", "runpod", "runpod-public"})
 
 # The vendor's PUBLIC license-signing key (scripts/license_tool.py
 # keygen prints it; the private half never leaves vendor_keys/).
@@ -146,9 +172,12 @@ def _load_license_token(explicit_path: Path | None
 
 
 def _verify_token(token: str, now: datetime) -> tuple[dict | None, str]:
-    """RS256 verification against the ACTIVE public key + claim sanity.
-    PyJWT enforces exp/nbf; alg confusion is impossible (algorithms is
-    pinned). Returns (claims, '') or (None, reason)."""
+    """RS256 verification against the ACTIVE public key + claim sanity:
+    the license is plaintext claims; the SHA-256 hash of the contents
+    is signed with the vendor private key and verified here with the
+    embedded public key. PyJWT enforces exp/nbf; alg confusion is
+    impossible (algorithms is pinned). Returns (claims, '') or
+    (None, reason)."""
     try:
         claims = jwt.decode(token, _PUBLIC_KEY_PEM, algorithms=["RS256"])
     except jwt.ExpiredSignatureError:
@@ -342,15 +371,54 @@ def request_allowed() -> tuple[bool, str]:
     return result
 
 
+def _features_map(claims: dict[str, Any]) -> dict[str, bool]:
+    """Normalize the features claim: v2 {code: Y/N} map (dropping
+    unknown/false codes is the CALLER's choice — this returns the raw
+    map) or the v1 list (present = Y)."""
+    features = claims.get("features")
+    if isinstance(features, dict):
+        return {str(k): bool(v) for k, v in features.items()}
+    if isinstance(features, list):
+        return {str(c): True for c in features}
+    return {}
+
+
 def allows(feature: str) -> bool:
     """Feature-claim gate (community Pro extras; enterprise modules).
-    True only under an ACTIVE license whose features list carries the
-    key — trial/unlicensed/expired grant nothing."""
+    True only under an ACTIVE license whose features carry the code as
+    Y — v2 map {code: Y/N} or v1 list (present = Y). Trial/unlicensed/
+    expired grant nothing."""
     state = _STATE
     if not state or state.get("mode") != "licensed":
         return False
-    features = (state.get("license") or {}).get("features") or []
-    return isinstance(features, list) and feature in features
+    return _features_map(state.get("license") or {}).get(feature, False)
+
+
+def provider_allowed(name: str, ptype: str) -> bool:
+    """Per-backend provider entitlement (v2.2):
+
+    embedded + llama-server (LOCAL compute) are FREE — always allowed;
+
+    openai / runpod / runpod-public (CLOUD providers) serve only when
+    the ACTIVE license's ``providers`` claim names this backend.
+
+    Posture: unmanaged (source/tests) → no gate; TRIAL → the full
+    product (evaluation); expired/unlicensed → nothing (the license
+    middleware stops serving anyway — this returns False as defense
+    in depth)."""
+    state = _STATE
+    if state is None:
+        return True                    # unmanaged — source/tests
+    mode = state.get("mode")
+    if mode == "trial":
+        return True                    # trial = full evaluation
+    if mode != "licensed":
+        return False                   # expired/unlicensed
+    if ptype in LOCAL_PROVIDER_TYPES:
+        return True                    # local compute: free
+    providers = (state.get("license") or {}).get("providers") or []
+    return (isinstance(providers, list)
+            and str(name) in [str(p) for p in providers])
 
 
 def status() -> dict[str, Any]:
@@ -364,14 +432,23 @@ def status() -> dict[str, Any]:
     lic = state.get("license") or {}
     exp = lic.get("exp")
     trial = state.get("trial") or {}
+    providers = [str(p) for p in (lic.get("providers") or [])
+                 if str(p).strip()]
+    business = lic.get("business_name") or lic.get("customer")
     return {
         "mode": state.get("mode"),
         "edition": state.get("edition"),
         "license_edition": lic.get("edition"),
-        "customer": lic.get("customer"),
+        "business_name": business,
+        "contract_email": lic.get("contract_email"),
+        "customer": business,           # legacy alias
         "vendor": lic.get("vendor"),
         "support": bool(lic.get("support")),
-        "features": list(lic.get("features") or []),
+        "features": _features_map(lic),
+        "feature_codes": list(FEATURE_CODES),
+        "providers": providers,
+        "local_provider_types": sorted(LOCAL_PROVIDER_TYPES),
+        "cloud_provider_types": sorted(CLOUD_PROVIDER_TYPES),
         "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
         if exp is not None else None,
         "perpetual": bool(lic) and exp is None,
