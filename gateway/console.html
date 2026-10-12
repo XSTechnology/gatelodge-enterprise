@@ -4404,6 +4404,29 @@ function reloadConfig() {
     .then(function () { notify('✓ reloaded'); showPanel('params'); refreshHeader(); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
+// console-managed provider credentials (v2.2.1) — values never render back
+function setSecret(name) {
+  var input = document.getElementById('sec-' + name);
+  if (!input) return;
+  var value = input.value.trim();
+  if (!value) { notify('Paste the credential value first', true); return; }
+  api('/admin/secrets', {method: 'POST', body: {name: name, value: value}})
+    .then(function () {
+      notify('✓ ' + name + ' stored — active on the next request');
+      showPanel('keys');
+    })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+function removeSecret(name) {
+  if (!confirm('Remove the stored credential ' + name + '?')) return;
+  api('/admin/secrets', {method: 'POST', body: {name: name, delete: true}})
+    .then(function () {
+      notify('✓ ' + name + ' removed');
+      showPanel('keys');
+    })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
 function addGatewayKey() {
   var input = document.getElementById('gk-input');
   if (!input) return;
@@ -4546,18 +4569,25 @@ function showKeys(ui) {
     });
     html += '<div id="gk-list" style="margin-top:8px"></div>' +
       '<div class="muted" style="margin-top:6px">Keys apply on reload/restart. Long random values; sha256-hex entries stay hashed.</div></div>';
-    // Backend service credentials
+    // Backend service credentials — paste-in-place (v2.2.1: the
+    // console-managed store; values never render back)
     html += '<div class="widget"><h3>Backend service credentials</h3>';
     if (!(secrets.api_keys || []).length)
       html += '<div class="muted">No cloud/runpod backends configured — nothing needs keys.</div>';
     else {
-      html += '<table><thead><tr><th>Environment variable</th><th>Used by backends</th><th>Status</th></tr></thead><tbody>';
+      html += '<table><thead><tr><th>Environment variable</th><th>Used by backends</th><th>Status</th><th></th></tr></thead><tbody>';
       secrets.api_keys.forEach(function (k) {
         var badge = k.source === 'env' ? '<span class="badge ok">env</span>'
+          : k.source === 'console' ? '<span class="badge ok">console</span>'
           : k.source === 'keyring' ? '<span class="badge ok">keyring</span>'
           : '<span class="badge err">missing</span>';
+        var managed = k.source === 'console';
         html += '<tr><td><code>' + esc(k.name) + '</code></td><td>' +
-          k.backends.map(esc).join(', ') + '</td><td>' + badge + '</td></tr>';
+          k.backends.map(esc).join(', ') + '</td><td>' + badge + '</td>' +
+          '<td>' + (managed
+            ? '<button class="btn btn-sm btn-danger" onclick="removeSecret(\'' + esc(k.name) + '\')">remove</button>'
+            : '<input id="sec-' + esc(k.name) + '" type="password" placeholder="paste key…" style="width:150px;padding:4px 8px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);font-size:.8rem;font-family:inherit;"> <button class="btn btn-sm" onclick="setSecret(\'' + esc(k.name) + '\')">save</button>') +
+          '</td></tr>';
       });
       html += '</tbody></table>';
     }
@@ -4565,7 +4595,8 @@ function showKeys(ui) {
     // Provider API keys (deployment-supplied — v2.2.1 wording: the
     // gateway never stores provider credentials itself)
     html += '<div class="widget"><h3>Provider API keys</h3>' +
-      '<div class="muted">Backend service credentials (listed above) are supplied by the deployment: ' +
+      '<div class="muted">Paste credentials directly into the table above (console-managed — ' +
+      'takes effect on the next request, no restart), or supply them via the deployment: ' +
       'environment variables on the container, or a mounted secret file referenced per backend ' +
       'via <code>api_key_file</code>. They are never written into the gateway config. ' +
       'A missing key answers 502 on first use. Gateway keys and virtual keys are managed in this panel.</div></div>';

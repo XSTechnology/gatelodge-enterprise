@@ -15,8 +15,11 @@ unlike the embedded engine's JSON-convention shim.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -62,20 +65,89 @@ def _env_or_keyring(key_env: str) -> str:
     return ""
 
 
+# ── gateway-managed secrets (v2.2.1) ──────────────────────────────────────
+# The in-program provider-key store: operators paste a backend credential
+# in the console (POST /admin/secrets) instead of touching the container
+# env or mounting files. Persisted at data/secrets.json — a dedicated
+# store, NEVER the config JSON — values are never logged and never
+# returned by any API (GET /admin/secrets reports only presence).
+
+_MANAGED_LOCK = threading.Lock()
+
+
+def _managed_path() -> Path:
+    from .config import PROJECT_ROOT
+    return PROJECT_ROOT / "data" / "secrets.json"
+
+
+def _managed_load() -> dict[str, str]:
+    try:
+        data = json.loads(_managed_path().read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in data.items()} \
+            if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def managed_secret(name: str) -> str:
+    """The program-stored value for an env-var name ('' when absent).
+    Read per-request — a key pasted in the console works immediately,
+    no restart."""
+    if not name:
+        return ""
+    with _MANAGED_LOCK:
+        return _managed_load().get(str(name), "")
+
+
+def set_managed_secret(name: str, value: str) -> bool:
+    """Store (or overwrite) a credential. True when written. Never
+    logs the value."""
+    name = str(name or "").strip()
+    if not name or not value:
+        return False
+    with _MANAGED_LOCK:
+        store = _managed_load()
+        store[name] = str(value)
+        p = _managed_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(store, indent=2), encoding="utf-8")
+        tmp.replace(p)          # atomic — a crash never truncates
+    return True
+
+
+def delete_managed_secret(name: str) -> bool:
+    """Remove a stored credential. True when it existed."""
+    with _MANAGED_LOCK:
+        store = _managed_load()
+        if str(name) not in store:
+            return False
+        del store[str(name)]
+        _managed_path().write_text(json.dumps(store, indent=2),
+                                   encoding="utf-8")
+    return True
+
+
 def resolve_backend_key(backend: dict[str, Any]) -> str:
     """Full key-resolution chain for a backend (tier B), in order:
     1. api_key_env environment variable (always wins)
-    2. api_key_file — first line of the file (Docker/K8s mounted
+    2. gateway-managed store — the key pasted in the console
+       (data/secrets.json; set per-request, no restart)
+    3. api_key_file — first line of the file (Docker/K8s mounted
        secrets, Vault Agent rendered files)
-    3. api_key_cmd — first line of the command's stdout (vault CLI,
+    4. api_key_cmd — first line of the command's stdout (vault CLI,
        aws secretsmanager get-secret-value, any fetcher; the config is
        operator-trusted, same trust level as base_url)
-    4. OS keyring ('Workshop'/'workshop' casings)
+    5. OS keyring ('Workshop'/'workshop' casings)
     Never logs values. Empty string when nothing resolves."""
     key_env = str(backend.get("api_key_env") or "").strip()
     key = os.environ.get(key_env) if key_env else ""
     if key:
         return key
+    if key_env:
+        key = managed_secret(key_env)   # console-pasted (v2.2.1)
+        if key:
+            return key
     path = str(backend.get("api_key_file") or "").strip()
     if path:
         try:
