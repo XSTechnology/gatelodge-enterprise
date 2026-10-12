@@ -119,6 +119,96 @@ _STATE: dict[str, Any] | None = None    # None = unmanaged (source/tests)
 _CACHE: tuple[float, tuple[bool, str]] | None = None
 _LICENSE_MTIME: float | None = None     # hot-reload watch (file mtime)
 
+# Signed revocation list (#6): data/revocations.json = {"crl": <jwt>}
+# with claims {crl: true, revoked: [serials], version, iat} signed by
+# the vendor (kid, same trusted keys). Offline honesty: the box
+# holder can delete the file — same accepted risk as the trial
+# anchor; revocations ALSO ship embedded in later binary builds.
+_CRL: dict[str, Any] | None = None      # {"revoked": set, "version": n}
+_CRL_MTIME: float | None = None
+
+
+def _crl_path() -> Path:
+    return PROJECT_ROOT / "data" / "revocations.json"
+
+
+def _crl_is_revoked(serial: str) -> bool:
+    """Active CRL check (inert when no CRL is loaded)."""
+    return bool(_CRL and serial in _CRL.get("revoked", set()))
+
+
+def load_revocations(path: Path | None = None) -> bool:
+    """Load + verify the CRL file. A missing file = no revocations.
+    A BROKEN/tampered file is ignored with a warning (fail-open for
+    the FILE — a corrupt CRL must not brick serving; authenticity is
+    enforced for whatever it does contain). True when a valid CRL is
+    active. Boot + maybe_reload_crl both come through here."""
+    global _CRL, _CRL_MTIME
+    p = path or _crl_path()
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        token = raw.get("crl") if isinstance(raw, dict) else None
+        if not token:
+            return False
+        claims, err = _decode_jwt(str(token))
+        if claims is None:
+            logger.warning("Revocation list ignored (%s) — unsigned or "
+                           "tampered", err)
+            return False
+        if not claims.get("crl"):
+            logger.warning("Revocation list ignored — token is not a CRL")
+            return False
+        revoked = {str(s) for s in (claims.get("revoked") or [])
+                   if str(s).strip()}
+        _CRL = {"revoked": revoked,
+                "version": int(claims.get("version") or 1)}
+        _CRL_MTIME = p.stat().st_mtime
+        if revoked:
+            logger.info("Revocation list active (v%s): %d serial(s)",
+                        _CRL["version"], len(revoked))
+        # a just-loaded CRL may cover the ALREADY-ACTIVE license —
+        # flip immediately so the next request_allowed sees it
+        state = _STATE
+        if (state and state.get("mode") in ("licensed", "grace")
+                and _crl_is_revoked(
+                    (state.get("license") or {}).get("serial") or "")):
+            logger.error("License: REVOKED by CRL (serial %s) — serving "
+                         "disabled",
+                         (state.get("license") or {}).get("serial"))
+            state["mode"] = "revoked"
+            global _CACHE
+            _CACHE = None
+        return True
+    except OSError:
+        return False                     # no file — nothing revoked
+    except Exception as e:               # noqa: BLE001 — never brick on CRL
+        logger.warning("Revocation list ignored (%s: %s)",
+                       e.__class__.__name__, e)
+        return False
+
+
+def maybe_reload_crl() -> bool:
+    """mtime watch — a dropped/updated revocations.json takes effect
+    live (newly-revoked serials flip the active state to revoked).
+    A broken file is re-read only when it changes again (the mtime is
+    recorded on failure too — no per-request re-parse of garbage).
+    True when a valid CRL (re)loaded."""
+    global _CRL_MTIME
+    p = _crl_path()
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return False
+    if mtime == _CRL_MTIME and _CRL is not None:
+        return False
+    loaded = load_revocations(p)
+    if not loaded and _CRL_MTIME != mtime:
+        try:
+            _CRL_MTIME = mtime         # don't retry until it changes
+        except OSError:
+            pass
+    return loaded
+
 
 def key_id(pem: str) -> str:
     """A signing key's id: sha16 of the public key DER (the ``kid``
@@ -215,16 +305,13 @@ def _load_license_token(explicit_path: Path | None
     return None, None, "no license present"
 
 
-def _verify_token(token: str, now: datetime) -> tuple[dict | None, str]:
-    """RS256 verification against the TRUSTED keys + claim sanity: the
-    license is plaintext claims; the SHA-256 hash of the contents is
-    signed with the vendor private key and verified here with an
-    embedded public key. Key selection: the ``kid`` claim (sha16 of
-    the signing public key) picks the exact key — kid-less tokens
-    (v1, early v2) try keys newest-first. PyJWT enforces exp/nbf; alg
+def _decode_jwt(token: str) -> tuple[dict | None, str]:
+    """kid-aware RS256 decode against the TRUSTED keys — shared by the
+    license and CRL verification paths. Key selection: the ``kid``
+    header (sha16 of the signing public key) picks the exact key;
+    kid-less tokens try keys newest-first. PyJWT enforces exp/nbf; alg
     confusion is impossible (algorithms is pinned). Returns (claims,
     '') or (None, reason)."""
-    # kid pre-pass (unverified header read — selection only, never trust)
     kid: str | None = None
     try:
         import base64 as _b64
@@ -241,18 +328,29 @@ def _verify_token(token: str, now: datetime) -> tuple[dict | None, str]:
     else:
         candidates = list(_TRUSTED_KEYS)
     claims = None
-    last_err = "invalid license (InvalidTokenError)"
+    last_err = "invalid token (InvalidTokenError)"
     for pem in candidates:
         try:
             claims = jwt.decode(token, pem, algorithms=["RS256"])
             break
         except jwt.ExpiredSignatureError:
-            return None, "license expired"
+            return None, "token expired"
         except jwt.InvalidTokenError as e:
-            last_err = f"invalid license ({e.__class__.__name__})"
+            last_err = f"invalid token ({e.__class__.__name__})"
             claims = None
     if claims is None:
         return None, last_err
+    return claims, ""
+
+
+def _verify_token(token: str, now: datetime) -> tuple[dict | None, str]:
+    """License verification: plaintext claims, the SHA-256 hash of
+    the contents signed with the vendor private key, verified here
+    against an embedded public key (via _decode_jwt) + claim sanity.
+    Returns (claims, '') or (None, reason)."""
+    claims, err = _decode_jwt(token)
+    if claims is None:
+        return None, err
     if claims.get("product") != PRODUCT:
         return None, "license is for a different product"
     if claims.get("edition") not in EDITIONS:
@@ -348,6 +446,21 @@ def bootstrap(*, edition: str = "community",
     if token:
         claims, detail = _verify_token(token, now)
     if claims is not None:
+        # #6 revocation: checked BEFORE installing the licensed state
+        # — a revoked serial never serves (an enterprise binary's boot
+        # gate then refuses to start; community flips to revoked mode)
+        load_revocations()
+        if _crl_is_revoked(str(claims.get("serial") or "")):
+            _STATE = {"edition": edition, "mode": "revoked",
+                      "license": claims, "source": source,
+                      "detail": f"serial {claims.get('serial')} is "
+                      "revoked (CRL)", "trial": None}
+            logger.error("License: REVOKED (serial %s, CRL v%s) — this "
+                         "deployment may not serve",
+                         claims.get("serial"),
+                         (_CRL or {}).get("version", "?"))
+            _CACHE = None
+            return status()
         exp = claims.get("exp")
         _STATE = {"edition": edition, "mode": "licensed", "license": claims,
                   "source": source, "detail": "", "trial": None}
@@ -406,19 +519,53 @@ def ensure_bootstrapped(*, edition: str = "community") -> dict[str, Any]:
     return status()
 
 
+def _grace_hours(claims: dict[str, Any]) -> int:
+    """Post-expiry grace window in hours (#7): the license claim
+    ``grace_hours`` overrides; absent = the 72h default; 0/negative
+    disables (immediate stop at exp). Perpetual licenses never see
+    this path."""
+    raw = claims.get("grace_hours")
+    if raw is None:
+        return 72
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 72
+
+
 def _recheck(state: dict[str, Any], now: datetime) -> tuple[bool, str]:
-    """Runtime (re)evaluation — license expiry mid-run, trial window
-    and clock-rollback while serving. Well-defined failures only;
-    unexpected errors fail OPEN (a licensing bug must not brick a
-    paying deployment) and are logged."""
+    """Runtime (re)evaluation — license expiry mid-run (with the
+    post-expiry GRACE window: serving continues, everything warns),
+    revocation (CRL), trial window and clock-rollback while serving.
+    Well-defined failures only; unexpected errors fail OPEN (a
+    licensing bug must not brick a paying deployment) and are
+    logged."""
     try:
         mode = state.get("mode")
         if mode == "licensed":
-            exp = (state.get("license") or {}).get("exp")
+            lic = state.get("license") or {}
+            serial = lic.get("serial")
+            if serial and _crl_is_revoked(serial):
+                logger.error("License: REVOKED (serial %s, CRL v%s) — "
+                             "serving disabled", serial,
+                             (_CRL or {}).get("version", "?"))
+                state["mode"] = "revoked"
+                return False, "revoked"
+            exp = lic.get("exp")
             if exp is not None and now.timestamp() >= float(exp):
+                gh = _grace_hours(lic)
+                grace_end = float(exp) + gh * 3600.0
+                if gh > 0 and now.timestamp() < grace_end:
+                    state["grace"] = {
+                        "grace_hours": gh,
+                        "hours_left": round(
+                            (grace_end - now.timestamp()) / 3600.0, 1)}
+                    return True, "grace"
+                state.pop("grace", None)
                 logger.warning("License: EXPIRED while running — serving "
                                "disabled (403 license_expired)")
                 return False, "expired"
+            state.pop("grace", None)
             return True, "licensed"
         if mode == "trial":
             trial, m = _trial_state(Path(state["anchor_path"]),
@@ -543,12 +690,16 @@ def cap_allows(kind: str, current: int) -> tuple[bool, int | None]:
 
 def expiry_warning() -> dict[str, Any] | None:
     """The current license-expiry warning level, or None. {"level":
-    30|7|1, "days_left": float} — surfaced by the app on level CHANGE
-    (event ring + log); the console banner rides /admin/license."""
+    30|7|1, "days_left": float} pre-expiry; {"level": 0, "grace":
+    True, "hours_left": float} INSIDE the post-expiry grace window
+    (serving continues — level 0 rides the same on-change event/log
+    path). Surfaced by the app on level CHANGE (event ring + log);
+    the console banner rides /admin/license."""
     state = _STATE
-    if not state or state.get("mode") != "licensed":
+    if not state or state.get("mode") not in ("licensed", "grace"):
         return None
-    exp = (state.get("license") or {}).get("exp")
+    lic = state.get("license") or {}
+    exp = lic.get("exp")
     if exp is None:
         return None                     # perpetual
     try:
@@ -556,7 +707,14 @@ def expiry_warning() -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     if days < 0:
-        return None                     # expired — the gate handles it
+        # expired — inside the grace window? (level 0)
+        gh = _grace_hours(lic)
+        grace_end = float(exp) + gh * 3600.0
+        if gh > 0 and time.time() < grace_end:
+            return {"level": 0, "grace": True,
+                    "hours_left": round(
+                        (grace_end - time.time()) / 3600.0, 1)}
+        return None                     # past grace — the gate handles it
     for level in (1, 7, 30):
         if days <= level:
             return {"level": level, "days_left": round(days, 1)}
@@ -630,6 +788,7 @@ def status() -> dict[str, Any]:
                  if str(p).strip()]
     business = lic.get("business_name") or lic.get("customer")
     warn = expiry_warning()
+    grace = state.get("grace")          # set by _recheck inside the window
     return {
         "mode": state.get("mode"),
         "edition": state.get("edition"),
@@ -647,6 +806,8 @@ def status() -> dict[str, Any]:
         "cloud_provider_types": sorted(CLOUD_PROVIDER_TYPES),
         "caps": caps(),
         "cap_kinds": list(CAP_KINDS),
+        "grace_hours": _grace_hours(lic) if exp is not None else None,
+        "grace": grace,
         "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
         if exp is not None else None,
         "perpetual": bool(lic) and exp is None,
@@ -655,6 +816,7 @@ def status() -> dict[str, Any]:
         "expiry_warning": (warn or {}).get("level") if warn else None,
         "node_locked": bool(lic.get("node")),
         "trial_days_left": trial.get("days_left"),
+        "revoked_serials": len((_CRL or {}).get("revoked", set())),
         "source": state.get("source"),
         "detail": state.get("detail") or None,
     }
@@ -670,6 +832,9 @@ def healthz_license() -> dict[str, Any]:
     trial = state.get("trial")
     if trial:
         out["trial_days_left"] = trial.get("days_left")
+    grace = state.get("grace")         # post-expiry soft window (#7)
+    if grace:
+        out["grace_hours_left"] = grace.get("hours_left")
     return out
 
 
@@ -713,8 +878,11 @@ def set_license_state(state: dict[str, Any] | None) -> None:
 def reset_licensing() -> None:
     """Restore the embedded key + unmanaged state (test teardown)."""
     global _PUBLIC_KEY_PEM, _TRUSTED_KEYS, _STATE, _CACHE, _LICENSE_MTIME
+    global _CRL, _CRL_MTIME
     _PUBLIC_KEY_PEM = _EMBEDDED_PUBLIC_KEY_PEM
     _TRUSTED_KEYS = [_EMBEDDED_PUBLIC_KEY_PEM]
     _STATE = None
     _CACHE = None
     _LICENSE_MTIME = None
+    _CRL = None
+    _CRL_MTIME = None

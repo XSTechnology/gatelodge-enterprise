@@ -168,6 +168,8 @@ def cmd_issue(args: argparse.Namespace) -> int:
             caps[kind] = n
         if caps:
             claims["caps"] = caps
+    if args.grace_hours is not None:
+        claims["grace_hours"] = max(0, int(args.grace_hours))
     if args.node:
         claims["node"] = args.node
     if days is not None:
@@ -229,6 +231,69 @@ def cmd_issue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_revoke(args: argparse.Namespace) -> int:
+    """#6 revocation: append a serial to the signed CRL
+    (data/revocations.json — {"crl": <jwt>}), bump the version,
+    re-sign, ledger it. The gateway hot-reloads the file; a revoked
+    serial stops serving immediately (no grace — revocation is the
+    kill switch, expiry grace is the contract edge)."""
+    import jwt as _jwt
+    from cryptography.hazmat.primitives import serialization
+    priv = KEY_PATH.read_text(encoding="ascii")
+    priv_key = serialization.load_pem_private_key(priv.encode("ascii"),
+                                                  password=None)
+    pub_pem = priv_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("ascii")
+    kid = key_id(pub_pem)
+
+    path = Path(args.out) if args.out else ROOT / "data" / "revocations.json"
+    revoked: list[str] = []
+    version = 0
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            old = _jwt.decode(str(raw.get("crl")), pub_pem,
+                              algorithms=["RS256"])
+            if not old.get("crl"):
+                print("error: existing file is not a CRL", file=sys.stderr)
+                return 1
+            revoked = [str(s) for s in (old.get("revoked") or [])]
+            version = int(old.get("version") or 0)
+        except Exception as e:                              # noqa: BLE001
+            print(f"error: existing CRL unreadable/unsigned ({e}) — "
+                  "refusing to clobber it", file=sys.stderr)
+            return 1
+    serial = args.serial.strip().upper()
+    if serial in revoked:
+        print(f"already revoked (CRL v{version}): {serial}")
+        return 0
+    revoked.append(serial)
+    version += 1
+    token = _jwt.encode({"crl": True, "revoked": revoked,
+                         "version": version,
+                         "iat": int(_now().timestamp())},
+                        priv, algorithm="RS256", headers={"kid": kid})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"crl": token}, indent=2) + "\n",
+                    encoding="utf-8")
+    try:
+        LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LEDGER_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": _now().isoformat(),
+                                "revoked": serial,
+                                "crl_version": version, "kid": kid}) + "\n")
+    except OSError as e:
+        print(f"warning: issuance ledger not writable ({e})",
+              file=sys.stderr)
+    print(f"revoked: {serial}")
+    print(f"  CRL v{version} written: {path} ({len(revoked)} serial(s))")
+    print("  drop this file into the deployment's data/ — the gateway "
+          "hot-reloads it and stops serving that serial immediately")
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Vendor-side sanity check: read a license file and verify it
     against the SAME keypair (the gateway does this at boot with the
@@ -276,6 +341,9 @@ def main(argv: list[str] | None = None) -> int:
     isu.add_argument("--cap", action="append", metavar="KIND=N",
                      help="scale cap, repeatable — kinds: "
                      "keys/instances/teams/gpus (absent = unlimited)")
+    isu.add_argument("--grace-hours", type=int, default=None,
+                     help="post-expiry grace window in hours (default "
+                     "72; 0 = hard stop at exp)")
     isu.add_argument("--duration", default="1y", choices=list(DURATIONS),
                      help="validity preset: 30d/60d/90d evaluation, "
                      "1y/2y/3y term, perpetual (default 1y)")
@@ -293,6 +361,14 @@ def main(argv: list[str] | None = None) -> int:
                          "claims (vendor-side sanity check)")
     ver.add_argument("path", help="license JSON file")
     ver.set_defaults(fn=cmd_verify)
+
+    rvk = sub.add_parser("revoke", help="revoke a license serial — the "
+                         "signed CRL (data/revocations.json); the "
+                         "gateway hot-reloads it and stops serving that "
+                         "serial immediately (no grace)")
+    rvk.add_argument("--serial", required=True, help="the GL-… serial")
+    rvk.add_argument("--out", help="CRL path (default data/revocations.json)")
+    rvk.set_defaults(fn=cmd_revoke)
 
     args = p.parse_args(argv)
     if getattr(args, "days", None) and getattr(args, "duration", None):
