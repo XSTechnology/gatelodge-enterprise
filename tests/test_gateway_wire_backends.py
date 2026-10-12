@@ -164,7 +164,8 @@ async def _fake_gemini(url, headers, payload, timeout, provider):
 @pytest.fixture()
 def _mock_upstream(monkeypatch):
     def install(fn):
-        async def _post(url, headers, payload, timeout, provider):
+        async def _post(url, headers, payload, timeout, provider,
+                        auth=None):
             return await fn(url, headers, payload, timeout, provider)
         monkeypatch.setattr(wire, "_post_json", _post)
     return install
@@ -550,3 +551,158 @@ def test_vertex_backend_serves(wired, gguf, _mock_upstream, monkeypatch):
     finally:
         reset_storage()
         licensing.reset_licensing()
+
+
+# ── bedrock Converse (native, v2.3) ────────────────────────────────────────
+
+def test_bedrock_translation():
+    """OpenAI → Converse → OpenAI: system list, toolUse/toolResult
+    blocks, toolSpec.inputSchema.json, stopReason mapping, usage."""
+    system, msgs = wire._oai_messages_to_bedrock([
+        {"role": "system", "content": "Be terse."},
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello!",
+         "tool_calls": [{"id": "t1", "type": "function",
+                         "function": {"name": "get_weather",
+                                      "arguments": '{"city": "Boston"}'}}]},
+        {"role": "tool", "tool_call_id": "t1", "name": "get_weather",
+         "content": "52F"},
+        {"role": "user", "content": "Thanks"}])
+    assert system == "Be terse."
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user",
+                                         "user"]
+    assert msgs[1]["content"][0] == {"text": "Hello!"}
+    assert msgs[1]["content"][1] == {"toolUse": {
+        "toolUseId": "t1", "name": "get_weather",
+        "input": {"city": "Boston"}}}
+    assert msgs[2]["content"][0]["toolResult"]["toolUseId"] == "t1"
+    tools = wire._oai_tools_to_bedrock([
+        {"type": "function", "function": {
+            "name": "get_weather", "description": "w",
+            "parameters": {"type": "object"}}}])
+    assert tools[0]["toolSpec"]["name"] == "get_weather"
+    assert tools[0]["toolSpec"]["inputSchema"]["json"] == {"type": "object"}
+    out = wire._bedrock_to_oai({
+        "output": {"message": {"role": "assistant", "content": [
+            {"text": "Hello "},
+            {"toolUse": {"toolUseId": "tu1", "name": "get_weather",
+                         "input": {"city": "Boston"}}}]}},
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 4, "outputTokens": 2,
+                  "totalTokens": 6}}, "m")
+    assert out["choices"][0]["finish_reason"] == "tool_calls"
+    tc = out["choices"][0]["message"]["tool_calls"][0]
+    assert tc["id"] == "tu1"
+    assert tc["function"]["arguments"] == '{"city": "Boston"}'
+    assert out["usage"] == {"prompt_tokens": 4, "completion_tokens": 2,
+                            "total_tokens": 6}
+
+
+def _bedrock_config(gguf):
+    cfgd = _secured_config(gguf)
+    cfgd["backends"]["bdr"] = {
+        "type": "bedrock", "region": "eu-west-1",
+        "api_key_env": "BEDROCK_TEST_KEY",
+        "models": {"sonnet": "anthropic.claude-sonnet-4-5"}}
+    return cfgd
+
+
+async def _fake_bedrock(url, headers, payload, timeout, provider):
+    assert url == ("https://bedrock-runtime.eu-west-1.amazonaws.com/"
+                   "model/anthropic.claude-sonnet-4-5/converse")
+    assert headers["x-api-key"] == "bd-key"
+    assert payload["system"] == [{"text": "Be terse."}]
+    assert payload["inferenceConfig"]["maxTokens"] == 32
+    spec = payload["toolConfig"]["tools"][0]["toolSpec"]
+    assert spec["name"] == "get_weather"
+    assert spec["inputSchema"]["json"] == {"type": "object"}
+    return {"output": {"message": {"role": "assistant", "content": [
+        {"text": "BDR OK"},
+        {"toolUse": {"toolUseId": "tu9", "name": "get_weather",
+                     "input": {"city": "Boston"}}}]}},
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 4, "outputTokens": 2, "totalTokens": 6}}
+
+
+def test_bedrock_backend_serves(wired, gguf, _mock_upstream,
+                                monkeypatch):
+    """Native bedrock Converse: regional bedrock-runtime URL, modelId
+    in the path, Converse payload (system list, inferenceConfig,
+    toolConfig), x-api-key when a key is configured."""
+    wired(_bedrock_config(gguf))
+    monkeypatch.setenv("BEDROCK_TEST_KEY", "bd-key")
+    _entitle(monkeypatch, "bdr")
+    _mock_upstream(_fake_bedrock)
+    try:
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"},
+                            json={"model": "bdr:sonnet", "max_tokens": 32,
+                                  "messages": [
+                                      {"role": "system",
+                                       "content": "Be terse."},
+                                      {"role": "user", "content": "hi"}],
+                                  "tools": [{"type": "function",
+                                             "function": {
+                                                 "name": "get_weather",
+                                                 "description": "w",
+                                                 "parameters": {
+                                                     "type": "object"}}}]})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["choices"][0]["message"]["content"] == "BDR OK"
+            assert body["choices"][0]["finish_reason"] == "tool_calls"
+            assert body["usage"]["total_tokens"] == 6
+            # models listing includes the bedrock model
+            r2 = client.get("/v1/models",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"})
+            assert "sonnet" in [m["id"] for m in r2.json()["data"]]
+    finally:
+        reset_storage()
+        licensing.reset_licensing()
+
+
+def test_bedrock_auth_selection(monkeypatch):
+    """Key path → x-api-key header, no signer; no key → the SigV4
+    per-request signer (service 'bedrock', env-var chain)."""
+    import asyncio
+
+    import gateway.credchains as cc
+    captured: dict = {}
+
+    async def fake_post(url, headers, payload, timeout, provider,
+                        auth=None):
+        captured.clear()
+        captured.update(url=url, headers=dict(headers), auth=auth)
+        return {"output": {"message": {"role": "assistant",
+                                       "content": [{"text": "ok"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1,
+                          "totalTokens": 2}}
+
+    monkeypatch.setattr(wire, "_post_json", fake_post)
+    msgs = [{"role": "user", "content": "hi"}]
+
+    # 1) configured key → x-api-key, no signer
+    monkeypatch.setattr(wire.cloud, "resolve_backend_key",
+                        lambda b: "k-1")
+    asyncio.run(wire.bedrock_converse(
+        {"region": "us-east-1", "api_key_env": "K"}, "m1",
+        msgs, None, None, None, 5.0))
+    assert captured["headers"].get("x-api-key") == "k-1"
+    assert captured["auth"] is None
+    assert captured["url"] == ("https://bedrock-runtime.us-east-1."
+                               "amazonaws.com/model/m1/converse")
+
+    # 2) no key → SigV4 (credentials present in the env chain)
+    monkeypatch.setattr(wire.cloud, "resolve_backend_key",
+                        lambda b: "")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "shhh")
+    asyncio.run(wire.bedrock_converse(
+        {"region": "us-east-1"}, "m1", msgs, None, None, None, 5.0))
+    assert isinstance(captured["auth"], cc.SigV4Auth)
+    assert captured["auth"].service == "bedrock"
+    assert "x-api-key" not in captured["headers"]

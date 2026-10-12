@@ -129,7 +129,8 @@ RUNPOD_BACKEND = "runpod"
 RUNPOD_PUBLIC_BACKEND = "runpod-public"
 _BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
                   RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND,
-                  "anthropic", "gemini", "responses", "azure", "vertex")
+                  "anthropic", "gemini", "responses", "azure", "vertex",
+                  "bedrock")
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -498,6 +499,20 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                 entry["project"] = str(b.get("project") or "").strip()
                 entry["api_key_env"] = str(
                     b.get("api_key_env") or "").strip()
+            elif btype == "bedrock":
+                # AWS Bedrock Converse (native): region + SigV4 (env
+                # chain, service 'bedrock') or x-api-key; models map
+                # our name → the Bedrock modelId (e.g.
+                # anthropic.claude-sonnet-4-5). base_url defaults to
+                # the regional bedrock-runtime endpoint.
+                entry["region"] = str(b.get("region") or "").strip()
+                entry["base_url"] = str(
+                    b.get("base_url")
+                    or (f"https://bedrock-runtime."
+                        f"{entry['region'] or 'us-east-1'}.amazonaws.com")
+                    ).strip().rstrip("/")
+                entry["api_key_env"] = str(
+                    b.get("api_key_env") or "").strip()
             else:
                 entry["base_url"] = str(b.get("base_url") or "").strip()
                 entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
@@ -545,8 +560,13 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                 if isinstance(m, dict):
                     # "name" is what the console's model form writes —
                     # accept it or console-added cloud models silently
-                    # vanish on reload (observed bug)
-                    m = m.get("id") or m.get("model") or m.get("name") or ""
+                    # vanish on reload (observed bug). An entry with NO
+                    # usable id ({} — a model saved without a remote id)
+                    # keeps the entry with an IDENTITY mapping (our name
+                    # doubles as the remote id), matching the
+                    # runpod-public default — never silently dropped.
+                    m = (m.get("remote_id") or m.get("id")
+                         or m.get("model") or m.get("name") or mname or "")
                 if isinstance(m, str) and m.strip():
                     cmodels[str(mname)] = m.strip()
             entry["models"] = cmodels

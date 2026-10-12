@@ -1,8 +1,8 @@
 """Wire-format translator backends (v2.3) — non-OpenAI upstream APIs.
 
-Two upstream provider families speak their OWN wire formats; this
-module translates OpenAI chat (the gateway's internal shape) to each
-and back, so they ride the same backend model, budgets, licensing and
+Upstream providers that speak their OWN wire formats; this module
+translates OpenAI chat (the gateway's internal shape) to each and
+back, so they ride the same backend model, budgets, licensing and
 logging as every other backend:
 
     anthropic — the Anthropic Messages API (POST {base}/v1/messages,
@@ -19,13 +19,27 @@ logging as every other backend:
     STATELESS (store=false): the gateway owns conversation history,
     like every other backend — no server-side state is created.
 
-Both resolve keys through cloud.resolve_backend_key (env → file →
+    responses — OpenAI's Responses API (POST {base}/responses): the
+    forward path OpenAI steers toward. instructions + typed Items,
+    function_call / function_call_output, store=false stateless,
+    reasoning Items skipped.
+
+    vertex — Vertex AI Interactions: the gemini payload against
+    aiplatform project URLs (x-goog-api-key express or ADC Bearer).
+
+    bedrock — AWS Bedrock Converse (POST
+    {base}/model/{modelId}/converse): the native type behind the
+    bedrock-mantle shortcut. SigV4 (env-var chain, service 'bedrock')
+    or x-api-key; toolUse / toolResult blocks; stopReason mapping.
+
+All resolve keys through cloud.resolve_backend_key (env → file →
 cmd → keyring) and raise cloud.CloudBackendError on failure (→ 502).
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 from uuid import uuid4
@@ -43,11 +57,14 @@ GEMINI_INTERACTIONS_PATH = "/v1beta2/interactions"
 
 async def _post_json(url: str, headers: dict[str, str],
                      payload: dict[str, Any], timeout: float,
-                     provider: str) -> dict[str, Any]:
+                     provider: str,
+                     auth: Any = None) -> dict[str, Any]:
     """One POST, JSON both ways; CloudBackendError on any failure
-    (classified downstream by the caller's error handling)."""
+    (classified downstream by the caller's error handling). ``auth`` is
+    an optional httpx.Auth (the AWS SigV4 per-request signer for the
+    native bedrock type)."""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as hc:
+        async with httpx.AsyncClient(timeout=timeout, auth=auth) as hc:
             r = await hc.post(url, headers=headers,
                               json=payload)
         if r.status_code >= 400:
@@ -572,3 +589,187 @@ async def vertex_chat(backend: dict[str, Any], model: str,
            f"{project}/locations/global/interactions")
     resp = await _post_json(url, headers, payload, timeout, "vertex")
     return _gemini_to_oai(resp, model)
+
+
+# ── bedrock: OpenAI → Converse API → OpenAI (v2.3 native) ─────────────────
+#
+# The MANTLE shortcut (an openai-type backend + service: bedrock-mantle
+# sigv4 override) covers customers already on the mantle endpoints.
+# The NATIVE type here talks bedrock-runtime Converse directly — one
+# consistent request/response across every Bedrock model, no extra AWS
+# service in the path. Auth: AWS SigV4 (env-var credential chain) or,
+# when the backend has a key configured, the x-api-key header.
+
+BEDROCK_DEFAULT_MAX_TOKENS = 1024
+
+_BEDROCK_STOP_MAP = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+    "content_filtered": "content_filter",
+    "guardrail_intervened": "content_filter",
+}
+
+
+def _oai_messages_to_bedrock(
+        messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """OpenAI messages → (system, Converse messages). System extracts
+    to the top-level system list; tool_calls become toolUse blocks on
+    the assistant turn; tool results become toolResult blocks on a
+    USER turn (the API's requirement)."""
+    system_parts: list[str] = []
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            if isinstance(content, str) and content.strip():
+                system_parts.append(content)
+            continue
+        if role == "tool":
+            out.append({"role": "user", "content": [{
+                "toolResult": {
+                    "toolUseId": str(m.get("tool_call_id") or ""),
+                    "content": [{
+                        "text": content if isinstance(content, str)
+                        else json.dumps(content)}]}}]})
+            continue
+        if role == "assistant":
+            blocks: list[dict[str, Any]] = []
+            if isinstance(content, str) and content.strip():
+                blocks.append({"text": content})
+            elif isinstance(content, list):
+                blocks.extend(content)
+            for tc in (m.get("tool_calls") or []):
+                fn = (tc or {}).get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {"_raw": fn.get("arguments") or ""}
+                blocks.append({"toolUse": {
+                    "toolUseId": str(tc.get("id") or
+                                     f"toolu_{uuid4().hex[:12]}"),
+                    "name": fn.get("name") or "",
+                    "input": args}})
+            out.append({"role": "assistant",
+                        "content": blocks or [{"text": ""}]})
+            continue
+        # user (content may be a string or OpenAI content parts)
+        if isinstance(content, str):
+            out.append({"role": "user", "content": [{"text": content}]})
+        elif isinstance(content, list):
+            blocks = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    blocks.append({"text": str(part.get("text") or "")})
+            out.append({"role": "user", "content": blocks or [{"text": ""}]})
+        else:
+            out.append({"role": "user",
+                        "content": [{"text": content if isinstance(
+                            content, str) else json.dumps(content)}]})
+    return "\n\n".join(system_parts), out
+
+
+def _oai_tools_to_bedrock(tools: list[dict[str, Any]]
+                          ) -> list[dict[str, Any]]:
+    out = []
+    for t in tools or []:
+        fn = (t or {}).get("function") or {}
+        if not fn.get("name"):
+            continue
+        out.append({"toolSpec": {
+            "name": fn["name"],
+            "description": fn.get("description") or "",
+            "inputSchema": {"json": fn.get("parameters")
+                            or {"type": "object"}}}})
+    return out
+
+
+def _bedrock_to_oai(resp: dict[str, Any], model: str) -> dict[str, Any]:
+    """Converse response → OpenAI chat-completion shape."""
+    text_parts: list[str] = []
+    tool_calls = []
+    blocks = ((resp.get("output") or {}).get("message") or {}).get(
+        "content") or []
+    for b in blocks:
+        if "text" in b:
+            text_parts.append(str(b.get("text") or ""))
+        elif "toolUse" in b:
+            tu = b.get("toolUse") or {}
+            tool_calls.append({
+                "id": str(tu.get("toolUseId") or
+                          f"call_{uuid4().hex[:12]}"),
+                "type": "function",
+                "function": {"name": tu.get("name") or "",
+                             "arguments": json.dumps(
+                                 tu.get("input") or {})}})
+    finish = _BEDROCK_STOP_MAP.get(str(resp.get("stopReason") or ""),
+                                   "stop")
+    msg: dict[str, Any] = {
+        "role": "assistant",
+        "content": ("\n".join(text_parts) or None) if tool_calls
+        else "\n".join(text_parts)}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    usage = resp.get("usage") or {}
+    return {
+        "id": str(resp.get("id") or f"chatcmpl-gw-{uuid4().hex[:12]}"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": finish}],
+        "usage": {
+            "prompt_tokens": int(usage.get("inputTokens") or 0),
+            "completion_tokens": int(usage.get("outputTokens") or 0),
+            "total_tokens": int(usage.get("totalTokens") or 0)
+            or (int(usage.get("inputTokens") or 0)
+                + int(usage.get("outputTokens") or 0))},
+    }
+
+
+async def bedrock_converse(backend: dict[str, Any], model: str,
+                           messages: list[dict[str, Any]],
+                           temperature: float | None,
+                           max_tokens: int | None,
+                           tools: list[dict[str, Any]] | None,
+                           timeout: float) -> dict[str, Any]:
+    """One Bedrock Converse round-trip → OpenAI-shaped response.
+    POST {base}/model/{modelId}/converse, SigV4-signed (service
+    'bedrock') or x-api-key when the backend has a key configured."""
+    from . import credchains
+    region = str(backend.get("region")
+                 or os.environ.get("AWS_REGION", "us-east-1"))
+    base = str(backend.get("base_url")
+               or f"https://bedrock-runtime.{region}.amazonaws.com"
+               ).rstrip("/")
+    system, msgs = _oai_messages_to_bedrock(messages)
+    inference: dict[str, Any] = {
+        "maxTokens": int(max_tokens or BEDROCK_DEFAULT_MAX_TOKENS)}
+    if temperature is not None:
+        inference["temperature"] = temperature
+    payload: dict[str, Any] = {
+        "messages": msgs,
+        "inferenceConfig": inference}
+    if system:
+        payload["system"] = [{"text": system}]
+    b_tools = _oai_tools_to_bedrock(tools or [])
+    if b_tools:
+        payload["toolConfig"] = {"tools": b_tools}
+    headers = {"content-type": "application/json"}
+    auth = None
+    api_key = cloud.resolve_backend_key(backend)
+    if api_key:
+        headers["x-api-key"] = api_key
+    else:
+        try:
+            auth = credchains.SigV4Auth(region, "bedrock")
+            auth._creds()          # fail fast, classified below
+        except credchains.CloudCredentialError as e:
+            raise cloud.CloudBackendError(
+                f"bedrock backend: {e}") from e
+    resp = await _post_json(
+        f"{base}/model/{model}/converse", headers, payload, timeout,
+        "bedrock", auth=auth)
+    return _bedrock_to_oai(resp, model)

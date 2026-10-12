@@ -1119,6 +1119,73 @@ def test_console_add_model_survives_reload(wired, gguf, monkeypatch):
     assert fresh.backends["groq"]["models"]["glm53"] == "zai-org/GLM-5.3-Flash"
 
 
+# ── console backend/model add: wire types (v2.3 upsert gap fix) ────────────
+
+def test_console_add_wire_backends(wired, gguf):
+    """POST /admin/backends builds real config for the wire types:
+    azure keeps resource/api_version, anthropic keeps base_url — and
+    both survive a reload. (Previously only llama-server/runpod/openai
+    got any fields; wire types landed as bare type markers.)"""
+    cfgfile, cfg, _ = wired(_config(gguf))
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/backends", json={
+            "name": "az", "backend_type": "azure",
+            "resource": "my-res", "api_version": "2025-04-01-preview",
+            "api_key_env": "AZURE_KEY"})
+        assert r.status_code == 200, r.text
+        r = client.post("/admin/backends", json={
+            "name": "claude", "backend_type": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key_env": "ANTHROPIC_KEY"})
+        assert r.status_code == 200, r.text
+    fresh = gw_config.GatewayConfig(cfgfile)
+    az = fresh.backends["az"]
+    assert az["type"] == "azure" and az["resource"] == "my-res"
+    assert az["api_version"] == "2025-04-01-preview"
+    assert az["api_key_env"] == "AZURE_KEY"
+    cl = fresh.backends["claude"]
+    assert cl["type"] == "anthropic"
+    assert cl["base_url"] == "https://api.anthropic.com"
+    assert cl["api_key_env"] == "ANTHROPIC_KEY"
+
+
+def test_console_add_model_on_wire_backend(wired, gguf):
+    """POST /admin/models on wire-type backends persists: an explicit
+    remote_id (Azure DEPLOYMENT) and the identity fallback when none is
+    given (previously wrote {} and the normalizer dropped it)."""
+    cfgfile, cfg, _ = wired(_config(gguf))
+    with TestClient(gw_app.app) as client:
+        r = client.post("/admin/backends", json={
+            "name": "az", "backend_type": "azure", "resource": "my-res"})
+        assert r.status_code == 200, r.text
+        r = client.post("/admin/models", json={
+            "name": "gpt4o", "backend": "az", "role": "chat",
+            "remote_id": "deploy-gpt4o"})
+        assert r.status_code == 200, r.text
+        r = client.post("/admin/models", json={
+            "name": "sonnet", "backend": "az", "role": "chat"})
+        assert r.status_code == 200, r.text
+    fresh = gw_config.GatewayConfig(cfgfile)
+    assert fresh.backends["az"]["models"] == {
+        "gpt4o": "deploy-gpt4o", "sonnet": "sonnet"}
+
+
+def test_config_empty_model_dict_maps_identity():
+    """Normalizer: a cloud model saved as {} (no remote id anywhere)
+    keeps the entry with an IDENTITY mapping instead of dropping it."""
+    import tempfile
+    raw = json.dumps({
+        "port": 9911, "bind": "127.0.0.1", "models_dir": "unused",
+        "backends": {"az": {"type": "azure", "resource": "r",
+                            "models": {"a": {}, "b": "deploy-b"}}},
+        "aliases": {}})
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "gw.json"
+        p.write_text(raw, encoding="utf-8")
+        c = gw_config.GatewayConfig(p)
+    assert c.backends["az"]["models"] == {"a": "a", "b": "deploy-b"}
+
+
 # ── /admin/backends/{name}/remote-models (cloud catalog proxy) ─────────────
 
 def test_remote_models_proxies_catalog(wired, gguf, monkeypatch):
