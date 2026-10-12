@@ -1548,8 +1548,9 @@ async def list_models() -> dict[str, Any]:
                         "idle_terminate_s": mcfg.get("idle_terminate_s", 0),
                     })
 
-            elif btype == OPENAI_BACKEND:
-                # Cloud backend
+            elif btype in (OPENAI_BACKEND, "anthropic", "gemini"):
+                # Cloud backend (openai-compatible or the v2.3 wire
+                # translators — same shape: {name: remote_id})
                 remote_id = mcfg if isinstance(mcfg, str) else mcfg.get("name", mname)
                 _add({
                     "id": mname,

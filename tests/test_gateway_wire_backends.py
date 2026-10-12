@@ -201,6 +201,12 @@ def test_anthropic_backend_serves(wired, gguf, _mock_upstream,
             assert d["usage"]["total_tokens"] == 10
             # the request log/charging rode the standard path
             assert gw_app._scope_spend("backend:claude")["tokens"] == 10
+            # licensed wire backends LIST their models (v1/models)
+            r2 = client.get("/v1/models",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"})
+            ids = [m["id"] for m in r2.json()["data"]]
+            assert "sonnet" in ids
     finally:
         reset_storage()
         licensing.reset_licensing()
