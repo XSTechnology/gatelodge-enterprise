@@ -129,7 +129,7 @@ RUNPOD_BACKEND = "runpod"
 RUNPOD_PUBLIC_BACKEND = "runpod-public"
 _BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
                   RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND,
-                  "anthropic", "gemini")
+                  "anthropic", "gemini", "responses")
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -475,6 +475,12 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                     ).strip().rstrip("/")
                 entry["api_key_env"] = str(
                     b.get("api_key_env") or "GEMINI_API_KEY").strip()
+            elif btype == "responses":
+                entry["base_url"] = str(
+                    b.get("base_url")
+                    or "https://api.openai.com/v1").strip().rstrip("/")
+                entry["api_key_env"] = str(
+                    b.get("api_key_env") or "OPENAI_API_KEY").strip()
             else:
                 entry["base_url"] = str(b.get("base_url") or "").strip()
                 entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
