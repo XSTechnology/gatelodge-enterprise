@@ -95,7 +95,7 @@ FEATURE_CODES = ("tier_d", "scim", "session_budgets", "mcp", "teams")
 LOCAL_PROVIDER_TYPES = frozenset({"embedded", "llama-server"})
 CLOUD_PROVIDER_TYPES = frozenset({"openai", "runpod", "runpod-public",
                                   "anthropic", "gemini", "responses",
-                                  "azure", "vertex"})
+                                  "azure", "vertex", "bedrock"})
 
 # The vendor's PUBLIC license-signing key (scripts/license_tool.py
 # keygen prints it; the private half never leaves vendor_keys/).

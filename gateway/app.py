@@ -1549,7 +1549,7 @@ async def list_models() -> dict[str, Any]:
                     })
 
             elif btype in (OPENAI_BACKEND, "anthropic", "gemini",
-                           "responses", "azure", "vertex"):
+                           "responses", "azure", "vertex", "bedrock"):
                 # Cloud backend (openai-compatible or the v2.3 wire
                 # translators — same shape: {name: remote_id}; azure's
                 # remote_id is the DEPLOYMENT name)
@@ -1850,7 +1850,7 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     # Cloud-shaped path: openai backends, REMOTE llama-server, and runpod
     # SERVERLESS all speak OpenAI over HTTP with a bearer key.
     remote_id = backend["models"][model_key]
-    if btype in ("anthropic", "gemini", "responses", "vertex"):
+    if btype in ("anthropic", "gemini", "responses", "vertex", "bedrock"):
         # v2.3 wire-translator backends: OpenAI chat → the provider's
         # native wire format → OpenAI chat (gateway/wire.py). Same
         # budget/cost/logging posture as the openai path.
@@ -1867,6 +1867,11 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
                 cfg.queue["timeout_s"])
         elif btype == "vertex":
             d = await wire.vertex_chat(
+                backend, str(remote_id), body.messages,
+                body.temperature, body.max_tokens, body.tools,
+                cfg.queue["timeout_s"])
+        elif btype == "bedrock":
+            d = await wire.bedrock_converse(
                 backend, str(remote_id), body.messages,
                 body.temperature, body.max_tokens, body.tools,
                 cfg.queue["timeout_s"])
@@ -2378,7 +2383,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             usage = usage_out or _estimate_stream_usage(body, text_chars)
             cost = None
             if backend.get("type") in ("openai", "anthropic", "gemini",
-                                       "responses", "azure", "vertex"):
+                                       "responses", "azure", "vertex",
+                                       "bedrock"):
                 rid = str((backend.get("models") or {}).get(model_key) or "")
                 cost = _cost_usd(cfg, backend_name, rid, usage)
             _charge_request(cfg, backend_name, usage, cost)
@@ -2387,7 +2393,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
 
         try:
             if backend.get("type") in ("anthropic", "gemini", "responses",
-                                       "vertex"):
+                                       "vertex", "bedrock"):
                 # v2.3 wire-translator backends: complete fully, then
                 # emit ONE OpenAI-shaped chunk + [DONE] (valid streaming
                 # shape — every OpenAI client accepts single-chunk
@@ -5248,7 +5254,7 @@ async def admin_upsert_model(payload: ModelConfigPayload) -> Response:
         if payload.remote_id:
             model_cfg["name"] = payload.remote_id  # remote uses "name" key
     elif btype in (OPENAI_BACKEND, "anthropic", "gemini", "responses",
-                   "azure", "vertex"):
+                   "azure", "vertex", "bedrock"):
         # wire/cloud model: the remote id defaults to OUR name (identity
         # mapping — e.g. an Azure deployment named after the model), so
         # a model saved without remote_id never writes {} (which the
@@ -5310,10 +5316,12 @@ class BackendConfigPayload(BaseModel):
     # remote (llama-server remote, openai, runpod, wire types)
     base_url: str = ""
     api_key_env: str = ""
-    # azure classic (resource + api_version) / vertex (project)
+    # azure classic (resource + api_version) / vertex (project) /
+    # bedrock (region)
     resource: str = ""
     api_version: str = ""
     project: str = ""
+    region: str = ""
     # delete
     delete: bool = False
 
@@ -5379,6 +5387,15 @@ async def admin_upsert_backend(payload: BackendConfigPayload) -> Response:
         # Vertex AI Interactions: project + express key (or ADC)
         if payload.project:
             bcfg["project"] = payload.project
+        if payload.api_key_env:
+            bcfg["api_key_env"] = payload.api_key_env
+    elif payload.backend_type == "bedrock":
+        # AWS Bedrock Converse: region + SigV4 env chain (or x-api-key);
+        # base_url defaults to the regional bedrock-runtime endpoint
+        if payload.region:
+            bcfg["region"] = payload.region
+        if payload.base_url:
+            bcfg["base_url"] = payload.base_url.rstrip("/")
         if payload.api_key_env:
             bcfg["api_key_env"] = payload.api_key_env
 
