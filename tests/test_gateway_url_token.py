@@ -173,6 +173,24 @@ def test_no_cross_request_token_leakage(wired, gguf):  # noqa: F811
         assert r.status_code == 401
 
 
+def test_x_api_key_accepted(wired, gguf):  # noqa: F811
+    """Anthropic-protocol clients (the /v1/messages shim, Claude Code,
+    the Anthropic SDK) send x-api-key, not Authorization Bearer — same
+    resolution. Authorization, when present, still wins."""
+    wired(_secured_config(gguf))
+    with TestClient(gw_app.app) as client:
+        r = client.get("/v1/models", headers={"x-api-key": "admin-secret"})
+        assert r.status_code == 200, r.text
+        # Authorization (when present) is authoritative
+        r = client.get("/v1/models", headers={
+            "x-api-key": "admin-secret",
+            "Authorization": "Bearer wrong"})
+        assert r.status_code == 401
+        # unknown x-api-key is an auth failure
+        r = client.get("/v1/models", headers={"x-api-key": "nope"})
+        assert r.status_code == 401
+
+
 def test_open_mode_path_form_still_serves(wired, gguf):  # noqa: F811
     """Open mode (no keys configured): the rewrite happens but the
     token is moot — /anything/v1/... serves like /v1/...."""
