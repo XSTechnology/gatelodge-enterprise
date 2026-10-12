@@ -460,6 +460,17 @@ def build_router() -> APIRouter:
         if payload.delete:
             gw_app._mutate_config(_delete, f"team-delete {tid}")
             return {"deleted": tid}
+        # v2.2 scale caps: creating a NEW team beyond the licensed
+        # count refuses (updates to an existing team pass)
+        from gateway import licensing
+        if tid not in _STATE.definitions():
+            cap_ok, cap_limit = licensing.cap_allows(
+                "teams", len(_STATE.definitions()))
+            if not cap_ok:
+                return _error(403, f"license cap: team limit "
+                              f"({cap_limit}) reached — this deployment's "
+                              "license caps its team count",
+                              code="license_caps")
         admins = [a for a in (payload.admins or [])
                   if len(str(a)) == 64]
         tdef: dict[str, Any] = {"name": payload.name.strip() or tid,

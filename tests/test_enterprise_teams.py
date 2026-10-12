@@ -323,3 +323,30 @@ def test_triple_mount_coexistence(wired, gguf, monkeypatch):  # noqa: F811
             assert r.status_code == 200
     finally:
         gw_app.set_extra_router(None, prefix="/teams")
+
+
+def test_team_create_cap_enforced(wired, gguf):  # noqa: F811
+    """v2.2 scale caps: creating a NEW team beyond the licensed count
+    refuses (403 license_caps); UPDATING an existing team at the cap
+    still passes (the cap counts teams, not edits)."""
+    from gateway import licensing
+    _wire(wired, gguf)                    # config already has team "eng"
+    licensing.set_license_state({
+        "mode": "licensed", "edition": "enterprise",
+        "license": {"caps": {"teams": 1}}, "source": "file",
+        "detail": "", "trial": None})
+    try:
+        with TestClient(gw_app.app) as client:
+            # at the cap: a NEW team refuses (config already has eng
+            # + sales — hr is genuinely new)
+            r = client.post("/teams/hr", headers=_admin_headers(ADMIN),
+                            json={"name": "HR", "budget_usd_month": 1})
+            assert r.status_code == 403, r.text
+            assert r.json()["error"]["code"] == "license_caps"
+            # updating an EXISTING team at the cap passes
+            r2 = client.post("/teams/eng", headers=_admin_headers(ADMIN),
+                             json={"name": "Engineering",
+                                   "budget_usd_month": 2})
+            assert r2.status_code == 200, r2.text
+    finally:
+        licensing.reset_licensing()
