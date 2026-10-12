@@ -63,6 +63,7 @@ ROLES: dict[str, list[Rule]] = {
         ("allow", "POST", "/admin/keys"),
         ("allow", "GET", "/admin/stats"),
         ("allow", "GET", "/admin/secrets"),
+        ("allow", "POST", "/admin/secrets"),  # v2.2.1: console-pasted provider credentials
     ],
 }
 

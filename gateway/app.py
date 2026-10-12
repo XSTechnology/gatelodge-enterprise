@@ -5493,8 +5493,9 @@ async def admin_upsert_key(payload: ApiKeyPayload) -> Response:
 @app.get("/admin/secrets")
 async def admin_secrets() -> Response:
     """API-key STATUS for the console — which env vars the configured
-    backends need, and whether each is available (env, OS keyring via the
-    boot bridge, or missing). NEVER returns key values."""
+    backends need, and whether each is available (env, the console's
+    managed store, OS keyring via the boot bridge, or missing). NEVER
+    returns key values."""
     import os
 
     cfg = get_gateway_config()
@@ -5507,8 +5508,10 @@ async def admin_secrets() -> Response:
     rows = []
     for env_name, backends in sorted(needed.items()):
         in_env = bool(os.environ.get(env_name))
+        in_managed = (not in_env
+                      and bool(cloud.managed_secret(env_name)))
         in_keyring = False
-        if not in_env:
+        if not in_env and not in_managed:
             try:
                 import keyring
                 in_keyring = bool(keyring.get_password("Workshop", env_name))
@@ -5518,14 +5521,50 @@ async def admin_secrets() -> Response:
             "name": env_name,
             "backends": backends,
             "source": ("env" if in_env else
+                       "console" if in_managed else
                        "keyring" if in_keyring else "missing"),
         })
     return {"api_keys": rows,
             "gateway_keys_configured": bool(cfg.gateway_keys),
-            "hint": ("missing keys 502 on first use — supply the "
-                     "credential via the container environment (env var) "
-                     "or a mounted secret file referenced by the "
-                     "backend's api_key_file")}
+            "hint": ("missing keys 502 on first use — paste the "
+                     "credential below (console-managed), or supply it "
+                     "via the container environment (env var) / a "
+                     "mounted secret file (api_key_file)")}
+
+
+class SecretPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = ""
+    value: str = ""
+    delete: bool = False
+
+
+@app.post("/admin/secrets")
+async def admin_set_secret(payload: SecretPayload) -> Response:
+    """Set (or remove) a provider credential in the console-managed
+    store (data/secrets.json — never the config, never logged, never
+    returned by GET). Resolution: env var first, then this store, then
+    api_key_file/api_key_cmd/keyring — a pasted key works immediately
+    (read per-request), no restart. Audit-logged by NAME only."""
+    name = payload.name.strip()
+    if not name or not name.replace("_", "").isalnum() \
+            or name.upper() != name:
+        return _error(400, "name must be an ENV_VAR style identifier "
+                      "(A-Z, 0-9, _)", param="name")
+    if payload.delete:
+        existed = cloud.delete_managed_secret(name)
+        _audit_config(f"secret-remove {name}")
+        return {"removed": name, "existed": existed}
+    if not payload.value.strip():
+        return _error(400, "value must not be empty (use delete: true "
+                      "to remove)", param="value")
+    ok = cloud.set_managed_secret(name, payload.value.strip())
+    if not ok:
+        return _error(500, "secret store not writable", code="storage")
+    _audit_config(f"secret-set {name}")   # NAME only — never the value
+    return {"stored": name, "note": "resolves on the next request — "
+            "no restart needed"}
 
 
 # ── Admin: recovery actions ────────────────────────────────────────────────
