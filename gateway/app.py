@@ -1299,6 +1299,14 @@ async def list_models() -> dict[str, Any]:
         chain = alias.get("chain") or []
         if not chain:
             continue
+        # v2.2 don't-display: an alias lists when ANY chain entry is
+        # licensed (mixed chains serve their licensed part); an
+        # all-unlicensed alias is invisible — nothing to click.
+        if not any(licensing.provider_allowed(
+                c.partition(":")[0],
+                ((cfg.backends.get(c.partition(":")[0]) or {})
+                 .get("type") or "")) for c in chain):
+            continue
         primary_backend, _, primary_model = chain[0].partition(":")
         backend_cfg = cfg.backends.get(primary_backend, {})
         btype = backend_cfg.get("type", "gateway")
@@ -1343,6 +1351,11 @@ async def list_models() -> dict[str, Any]:
     # ── backend models ───────────────────────────────────────────────
     for bname, backend in cfg.backends.items():
         btype = backend.get("type")
+        # v2.2 don't-display: unlicensed cloud backends never list
+        # their models — consumers can't see (or click) what they
+        # can't serve. Local types are always licensed.
+        if not licensing.provider_allowed(bname, btype or ""):
+            continue
         models = backend.get("models") or {}
         label = _backend_label(btype, bname, cfg)
 
@@ -2020,13 +2033,16 @@ async def chat_completions(body: ChatRequest) -> Response:
     requested = body.model.strip() or cfg.default_alias
     try:
         plan = cfg.resolve_chain(requested)
-    except ProviderNotLicensedError as e:
-        # v2.2: found, but its backend is not license-entitled — no
-        # fallback (the model exists; the entitlement doesn't)
+    except ProviderNotLicensedError:
+        # v2.2 don't-display doctrine: unlicensed backends never list
+        # (see /v1/models) and a request for one is byte-for-byte the
+        # unknown-model answer — no existence leak, no license signal
         _log_request(requested, "", body.stream,
-                     int((time.perf_counter() - t0) * 1000), {}, 403,
+                     int((time.perf_counter() - t0) * 1000), {}, 400,
                      err="license")
-        return _error(403, str(e), code="license_providers")
+        return _error(400, f"unknown model: {requested!r} (not an alias "
+                      "or a backend model)", param="model",
+                      code="model_not_found")
     except GatewayConfigError as e:
         # Smart route? (aliases and backend models always win)
         plan = _smart_route_fallback(cfg, requested)
@@ -2596,11 +2612,15 @@ async def embeddings(body: EmbeddingRequest) -> Response:
 
     try:
         backend_name, model_key = cfg.resolve_embedding(requested)
-    except ProviderNotLicensedError as e:
+    except ProviderNotLicensedError:
+        # v2.2 don't-display: indistinguishable from unknown model
         _log_request(requested, "", False,
-                     int((time.perf_counter() - t0) * 1000), {}, 403,
+                     int((time.perf_counter() - t0) * 1000), {}, 400,
                      err="license")
-        return _error(403, str(e), code="license_providers")
+        return _error(400, f"unknown embedding model: {requested!r} "
+                      "(define it under backends.<local>.embedding_models "
+                      "or a cloud backend)", param="model",
+                      code="model_not_found")
     except GatewayConfigError as e:
         _log_request(requested, "", False,
                      int((time.perf_counter() - t0) * 1000), {}, 400)
@@ -2699,11 +2719,14 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     requested = body.model.strip() or cfg.default_alias
     try:
         plan = cfg.resolve_chain(requested)
-    except ProviderNotLicensedError as e:
+    except ProviderNotLicensedError:
+        # v2.2 don't-display: indistinguishable from unknown model
         _log_request(requested, "", body.stream,
-                     int((time.perf_counter() - t0) * 1000), {}, 403,
+                     int((time.perf_counter() - t0) * 1000), {}, 400,
                      err="license")
-        return _error(403, str(e), code="license_providers")
+        return _error(400, f"unknown model: {requested!r} (not an alias "
+                      "or a backend model)", param="model",
+                      code="model_not_found")
     except GatewayConfigError as e:
         plan = _smart_route_fallback(cfg, requested)
         if (plan is None and requested
@@ -3022,9 +3045,12 @@ async def images_generations(request: Request) -> Response:
     cfg.maybe_reload()
     try:
         plan = cfg.resolve_chain(requested)
-    except ProviderNotLicensedError as e:
-        _log_request(requested, "", False, 0, {}, 403, err="license")
-        return _error(403, str(e), code="license_providers")
+    except ProviderNotLicensedError:
+        # v2.2 don't-display: indistinguishable from unknown model
+        _log_request(requested, "", False, 0, {}, 400, err="license")
+        return _error(400, f"unknown model: {requested!r} (not an alias "
+                      "or a backend model)", param="model",
+                      code="model_not_found")
     except GatewayConfigError as e:
         _log_request(requested, "", False, 0, {}, 400)
         return _error(400, str(e), param="model", code="model_not_found")
@@ -3366,8 +3392,10 @@ async def _exec_chat_internal(cfg, model: str, messages: list,
     try:
         plan = cfg.resolve_chain(model)
     except ProviderNotLicensedError:
-        raise                    # license state is not a model problem —
-                                 # propagate to the calling surface
+        # v2.2 don't-display: re-raise as a plain unknown-model error
+        # so callers' generic handling stays byte-identical (no
+        # license signal, no existence leak)
+        raise GatewayConfigError(f"unknown model: {model!r}") from None
     except GatewayConfigError:
         plan = _smart_route_fallback(cfg, model)
     if plan is None:
@@ -3502,9 +3530,12 @@ async def create_batch(request: Request) -> Response:
     plan = None
     try:
         plan = cfg.resolve_chain(model)
-    except ProviderNotLicensedError as e:
-        _log_request(model, "", False, 0, {}, 403, err="license")
-        return _error(403, str(e), code="license_providers")
+    except ProviderNotLicensedError:
+        # v2.2 don't-display: indistinguishable from unknown model
+        _log_request(model, "", False, 0, {}, 400, err="license")
+        return _error(400, f"unknown model: {model!r} (not an alias or "
+                      "a backend model)", param="model",
+                      code="model_not_found")
     except GatewayConfigError:
         plan = _smart_route_fallback(cfg, model)
     if plan is None:
@@ -5205,6 +5236,10 @@ async def admin_remote_models(name: str) -> Response:
     cfg.maybe_reload()
     backend = cfg.backends.get(name)
     if not backend:
+        return _error(404, f"backend {name!r} not found", param="backend")
+    # v2.2 don't-display: an unlicensed backend's catalog is not
+    # offered — indistinguishable from a backend that doesn't exist
+    if not licensing.provider_allowed(name, backend.get("type") or ""):
         return _error(404, f"backend {name!r} not found", param="backend")
     if backend.get("type") != "openai":
         return _error(400, f"backend {name!r} is not an openai-type "

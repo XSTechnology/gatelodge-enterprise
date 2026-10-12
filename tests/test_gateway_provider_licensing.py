@@ -10,11 +10,15 @@ entitlement + the license claim shape:
 
     identity: business_name + contract_email surface via status();
 
-    enforcement (defense in depth): resolve_chain DROPS unlicensed
-    entries (mixed chains serve their licensed part), an all-
-    unlicensed plan raises ProviderNotLicensedError → HTTP 403
-    license_providers on every serving surface, and /admin/backends
-    carries a licensed:false flag for the console.
+    enforcement (don't-display doctrine): /v1/models never lists
+    unlicensed models (backend models AND all-unlicensed aliases);
+    resolve_chain DROPS unlicensed entries (mixed chains serve their
+    licensed part); an all-unlicensed plan raises
+    ProviderNotLicensedError which every serving surface maps to the
+    byte-for-byte UNKNOWN-MODEL answer (no 403, no license signal,
+    no existence leak); the remote-models catalog 404s; and
+    /admin/backends carries a licensed:false flag for the console
+    License pane.
 
 License minting uses a THROWAWAY keypair (set_license_public_key) —
 the vendor private key never touches a test run.
@@ -204,14 +208,29 @@ def test_resolve_chain_drops_unlicensed_entries(wired, gguf, keypair):
     assert len(cfg.resolve_chain("mixed")["entries"]) == 2
 
 
-def test_serving_403_license_providers(wired, gguf, keypair):
-    """HTTP 403 license_providers (not 400 model_not_found) on every
-    serving surface — the model exists, the entitlement doesn't. No
-    fallback: smart routes don't mask a licensing answer."""
+def test_serving_unlicensed_indistinguishable_from_unknown(wired, gguf,
+                                                           keypair):
+    """v2.2 don't-display doctrine: /v1/models never lists unlicensed
+    models, and requesting one returns the byte-for-byte UNKNOWN-MODEL
+    answer (400 model_not_found, generic message) — no 403, no license
+    signal, no existence leak. Smart routes don't mask it."""
     priv, pub = keypair
     wired(_cloud_config(gguf))
-    _activate(priv, pub)                              # groq not entitled
     with TestClient(gw_app.app) as client:
+        # unmanaged: the cloud model lists and serves-config resolves
+        r = client.get("/v1/models",
+                       headers={"Authorization": "Bearer admin-secret"})
+        ids = {m["id"] for m in r.json()["data"]}
+        assert "cloud-fast" in ids
+        # licensed WITHOUT the groq entitlement: gone from the list
+        _activate(priv, pub)                          # no providers
+        r = client.get("/v1/models",
+                       headers={"Authorization": "Bearer admin-secret"})
+        ids = {m["id"] for m in r.json()["data"]}
+        assert "cloud-fast" not in ids                # don't display
+        assert "fast" in ids                          # local always
+
+        # every serving surface: the generic unknown-model answer
         for path, body in (
                 ("/v1/chat/completions",
                  {"model": "groq:cloud-fast",
@@ -224,8 +243,14 @@ def test_serving_403_license_providers(wired, gguf, keypair):
                  {"model": "groq:cloud-fast", "prompt": "x"})):
             r = client.post(path, json=body,
                             headers={"Authorization": "Bearer admin-secret"})
-            assert r.status_code == 403, (path, r.status_code, r.text)
-            assert r.json()["error"]["code"] == "license_providers", path
+            assert r.status_code == 400, (path, r.status_code, r.text)
+            err = r.json()["error"]
+            assert err["code"] == "model_not_found", path
+            assert "licens" not in err["message"].lower(), path
+        # the remote catalog for an unlicensed backend: not found
+        r = client.get("/admin/backends/groq/remote-models",
+                       headers={"Authorization": "Bearer admin-secret"})
+        assert r.status_code == 404
         # local serving is untouched by the gate (502 here = no
         # llama_cpp in the test env — NOT a license error)
         r = client.post("/v1/chat/completions",
@@ -234,7 +259,25 @@ def test_serving_403_license_providers(wired, gguf, keypair):
                                             "content": "x"}]},
                         headers={"Authorization": "Bearer admin-secret"})
         assert (r.json().get("error") or {}).get("code") \
-            != "license_providers"
+            != "model_not_found"
+
+
+def test_models_list_hides_unlicensed_aliases(wired, gguf, keypair):
+    """All-unlicensed aliases vanish from /v1/models; mixed aliases
+    (licensed part servable) stay listed."""
+    priv, pub = keypair
+    cfgd = _cloud_config(gguf)
+    cfgd["aliases"] = {
+        "mixed": {"chain": ["local:fast", "groq:cloud-fast"], "hedge_s": 0},
+        "purecloud": {"chain": ["groq:cloud-fast"], "hedge_s": 0}}
+    wired(cfgd)
+    _activate(priv, pub)                       # groq not entitled
+    with TestClient(gw_app.app) as client:
+        r = client.get("/v1/models",
+                       headers={"Authorization": "Bearer admin-secret"})
+        ids = {m["id"] for m in r.json()["data"]}
+        assert "mixed" in ids                  # licensed part serves
+        assert "purecloud" not in ids          # nothing licensed to show
 
 
 def test_admin_backends_licensed_flag(wired, gguf, keypair):
