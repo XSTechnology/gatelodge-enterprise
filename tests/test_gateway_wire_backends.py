@@ -294,3 +294,137 @@ def test_wire_backend_licensing_dont_display(wired, gguf, monkeypatch):
             assert "licens" not in err["message"].lower()
     finally:
         licensing.reset_licensing()
+
+
+# ── responses (the OpenAI forward-path API; Bedrock mantle speaks it) ─────
+
+def _responses_config(gguf):
+    cfgd = _secured_config(gguf)
+    cfgd["backends"]["oairect"] = {
+        "type": "responses",
+        "api_key_env": "OPENAI_TEST_KEY",
+        "models": {"gpt": "gpt-6-astra"}}
+    return cfgd
+
+
+async def _fake_responses(url, headers, payload, timeout, provider):
+    assert payload["model"] == "gpt-6-astra"
+    assert payload["store"] is False
+    assert payload.get("instructions") in (None, "Be terse.")
+    assert headers["Authorization"] == "Bearer test-key"
+    assert url.endswith("/responses")
+    # tool flow when tools are offered; text otherwise
+    if payload.get("tools"):
+        return {"id": "resp_1", "status": "completed", "output": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Checking."}]},
+            {"type": "function_call", "call_id": "fc_1",
+             "name": payload["tools"][0]["name"],
+             "arguments": "{\"city\": \"Boston\"}"}],
+            "usage": {"input_tokens": 9, "output_tokens": 4,
+                      "total_tokens": 13}}
+    return {"id": "resp_2", "status": "completed", "output": [
+        {"type": "reasoning", "summary": []},      # skipped
+        {"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "RESP TRANSLATED"}]}],
+        "usage": {"input_tokens": 5, "output_tokens": 3,
+                  "total_tokens": 8}}
+
+
+def test_responses_translation_units():
+    instructions, items = wire._oai_messages_to_responses([
+        {"role": "system", "content": "Be terse."},
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello!",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "get_w",
+                                      "arguments": '{"c": "B"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "52F"}])
+    assert instructions == "Be terse."
+    assert items[0] == {"type": "message", "role": "user",
+                        "content": "Hi"}
+    fcs = [i for i in items if i["type"] == "function_call"]
+    assert fcs[0]["call_id"] == "c1" and fcs[0]["name"] == "get_w"
+    outs = [i for i in items if i["type"] == "function_call_output"]
+    assert outs[0]["call_id"] == "c1" and outs[0]["output"] == "52F"
+    tools = wire._oai_tools_to_responses([
+        {"type": "function", "function": {
+            "name": "get_w", "description": "w",
+            "parameters": {"type": "object"}}}])
+    assert tools == [{"type": "function", "name": "get_w",
+                      "description": "w",
+                      "parameters": {"type": "object"}}]
+
+
+def test_responses_backend_serves(wired, gguf, _mock_upstream,
+                                   monkeypatch):
+    wired(_responses_config(gguf))
+    monkeypatch.setenv("OPENAI_TEST_KEY", "test-key")
+    _entitle(monkeypatch, "oairect")
+    _mock_upstream(_fake_responses)
+    try:
+        with TestClient(gw_app.app) as client:
+            # plain text (with a reasoning Item in the output — skipped)
+            r = client.post("/v1/chat/completions",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"},
+                            json={"model": "oairect:gpt",
+                                  "max_tokens": 64,
+                                  "messages": [
+                                      {"role": "system",
+                                       "content": "Be terse."},
+                                      {"role": "user", "content": "Hi"}]})
+            assert r.status_code == 200, r.text
+            d = r.json()
+            assert d["choices"][0]["message"]["content"] \
+                == "RESP TRANSLATED"
+            assert d["usage"]["total_tokens"] == 8
+            # tool call round-trip
+            r2 = client.post("/v1/chat/completions",
+                             headers={"Authorization":
+                                      "Bearer admin-secret"},
+                             json={"model": "oairect:gpt",
+                                   "max_tokens": 64,
+                                   "messages": [{"role": "user",
+                                                 "content": "weather?"}],
+                                   "tools": [{
+                                       "type": "function",
+                                       "function": {
+                                           "name": "get_weather",
+                                           "description": "w",
+                                           "parameters": {
+                                               "type": "object"}}}]})
+            assert r2.status_code == 200, r2.text
+            m = r2.json()["choices"][0]["message"]
+            assert r2.json()["choices"][0]["finish_reason"] == "tool_calls"
+            assert m["tool_calls"][0]["function"]["name"] == "get_weather"
+            assert json.loads(
+                m["tool_calls"][0]["function"]["arguments"]) \
+                == {"city": "Boston"}
+            # model lists
+            r3 = client.get("/v1/models",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"})
+            assert "gpt" in [m["id"] for m in r3.json()["data"]]
+    finally:
+        reset_storage()
+        licensing.reset_licensing()
+
+
+def test_bedrock_mantle_sigv4_service_override():
+    """The Bedrock-mantle spike (v2.3): the OpenAI-compatible endpoint
+    signs SigV4 with service 'bedrock-mantle' — the backend config's
+    `service` field reaches the signer."""
+    import gateway.cloud as cloud_mod
+    from gateway.credchains import SigV4Auth
+    backend = {"base_url":
+               "https://bedrock-mantle.us-east-1.api.aws/v1",
+               "auth": "sigv4", "region": "us-east-1",
+               "service": "bedrock-mantle"}
+    client = cloud_mod.get_cloud_client("bedrock-test", backend)
+    # the httpx auth carries the configured service
+    auth = client._client.auth
+    assert isinstance(auth, SigV4Auth)
+    assert auth.service == "bedrock-mantle"
+    assert auth.region == "us-east-1"
+    cloud_mod.reset_clients()

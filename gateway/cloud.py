@@ -179,7 +179,9 @@ def get_cloud_client(name: str, backend: dict[str, Any],
     base_url = str(backend.get("base_url") or "").strip()
     key_env = str(backend.get("api_key_env") or "").strip()
     auth_mode = str(backend.get("auth") or "").strip().lower()
-    sig = f"{base_url}\x00{key_env}\x00{auth_mode}"
+    sig = "\x00".join((base_url, key_env, auth_mode,
+                       str(backend.get("region") or ""),
+                       str(backend.get("service") or "")))
     cached = _CLIENTS.get(name)
     if cached is not None and cached[0] == sig:
         return cached[1]
@@ -190,7 +192,12 @@ def get_cloud_client(name: str, backend: dict[str, Any],
                 base_url=base_url or None, api_key="sigv4",
                 timeout=timeout,
                 http_client=httpx.AsyncClient(auth=SigV4Auth(
-                    region=str(backend.get("region") or "")),
+                    region=str(backend.get("region") or ""),
+                    # v2.3: the service is configurable — Bedrock's
+                    # OpenAI-compatible mantle endpoint signs with
+                    # service "bedrock-mantle" (not "bedrock"); other
+                    # AWS services use their own names.
+                    service=str(backend.get("service") or "bedrock")),
                     timeout=timeout))
         elif auth_mode == "adc":
             from .credchains import ADCAuth

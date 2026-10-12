@@ -357,3 +357,162 @@ async def gemini_chat(backend: dict[str, Any], model: str,
          "content-type": "application/json"},
         payload, timeout, "gemini")
     return _gemini_to_oai(resp, model)
+
+
+# ── responses: OpenAI Chat → the Responses API → OpenAI Chat ──────────────
+#
+# The Responses API (/v1/responses) is OpenAI's forward path — new
+# capabilities (Ultrafast mode, latest-model tooling) land there first
+# and the Assistants API has been sunset. Bedrock's mantle endpoint
+# speaks it too. STATELESS here (store: false): the gateway owns the
+# transcript like every other backend — no previous_response_id, no
+# server-side state.
+
+def _oai_messages_to_responses(
+        messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """OpenAI messages → (instructions, input Items). System extracts
+    to the top-level instructions param; tool calls become
+    function_call Items; tool results become function_call_output
+    Items linked by call_id."""
+    system_parts: list[str] = []
+    items: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            if isinstance(content, str) and content.strip():
+                system_parts.append(content)
+            continue
+        if role == "tool":
+            items.append({
+                "type": "function_call_output",
+                "call_id": str(m.get("tool_call_id") or ""),
+                "output": content if isinstance(content, str)
+                else json.dumps(content)})
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            if isinstance(content, str) and content.strip():
+                items.append({"type": "message", "role": "assistant",
+                              "content": content})
+            for tc in m["tool_calls"]:
+                fn = (tc or {}).get("function") or {}
+                items.append({
+                    "type": "function_call",
+                    "call_id": str(tc.get("id") or ""),
+                    "name": fn.get("name") or "",
+                    "arguments": fn.get("arguments") or "{}"})
+            continue
+        items.append({
+            "type": "message",
+            "role": "user" if role == "user" else "assistant",
+            "content": content if isinstance(content, str)
+            else json.dumps(content) if content is not None else ""})
+    return "\n\n".join(system_parts), items
+
+
+def _oai_tools_to_responses(tools: list[dict[str, Any]]
+                            ) -> list[dict[str, Any]]:
+    """OpenAI's nested {type: function, function: {...}} → the
+    Responses flattened {type: function, name, description,
+    parameters}."""
+    out = []
+    for t in tools or []:
+        fn = (t or {}).get("function") or {}
+        if not fn.get("name"):
+            continue
+        out.append({"type": "function",
+                    "name": fn["name"],
+                    "description": fn.get("description") or "",
+                    "parameters": fn.get("parameters")
+                    or {"type": "object"}})
+    return out
+
+
+def _responses_to_oai(resp: dict[str, Any], model: str) -> dict[str, Any]:
+    """The typed output array → OpenAI chat-completion shape.
+    message Items carry output_text content; function_call Items carry
+    tool calls; reasoning Items are skipped (internal)."""
+    text_parts: list[str] = []
+    tool_calls = []
+    for item in (resp.get("output") or []):
+        itype = item.get("type")
+        if itype == "message":
+            for c in (item.get("content") or []):
+                if c.get("type") in ("output_text", "text"):
+                    text_parts.append(str(c.get("text") or ""))
+                elif isinstance(c.get("text"), str) and not c.get("type"):
+                    text_parts.append(c["text"])
+        elif itype == "function_call":
+            tool_calls.append({
+                "id": str(item.get("call_id")
+                          or f"call_{uuid4().hex[:12]}"),
+                "type": "function",
+                "function": {"name": item.get("name") or "",
+                             "arguments": str(
+                                 item.get("arguments") or "{}")}})
+    msg: dict[str, Any] = {
+        "role": "assistant",
+        "content": ("\n".join(text_parts) or None) if tool_calls
+        else ("\n".join(text_parts))}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    usage = resp.get("usage") or {}
+    status = str(resp.get("status") or "")
+    finish = ("tool_calls" if tool_calls
+              else "length" if status == "incomplete" else "stop")
+    return {
+        "id": str(resp.get("id") or f"chatcmpl-gw-{uuid4().hex[:12]}"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": msg,
+                     "finish_reason": finish}],
+        "usage": {
+            "prompt_tokens": int(usage.get("input_tokens") or 0),
+            "completion_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens")
+                                or (int(usage.get("input_tokens") or 0)
+                                    + int(usage.get("output_tokens")
+                                          or 0)))},
+    }
+
+
+async def responses_chat(backend: dict[str, Any], model: str,
+                         messages: list[dict[str, Any]],
+                         temperature: float | None,
+                         max_tokens: int | None,
+                         tools: list[dict[str, Any]] | None,
+                         timeout: float) -> dict[str, Any]:
+    """One Responses-API round-trip → OpenAI-shaped response.
+    STATELESS: store=false — the gateway owns the transcript, no
+    previous_response_id server state is created."""
+    api_key = cloud.resolve_backend_key(backend)
+    if not api_key:
+        env = backend.get("api_key_env") or "OPENAI_API_KEY"
+        raise cloud.CloudBackendError(
+            f"responses backend: no API key (set {env}, paste it in "
+            "the console, or mount api_key_file)")
+    base = str(backend.get("base_url")
+               or "https://api.openai.com/v1").rstrip("/")
+    instructions, items = _oai_messages_to_responses(messages)
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": items,
+        # stateless by design — the gateway manages history like
+        # every other backend
+        "store": False}
+    if instructions:
+        payload["instructions"] = instructions
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens:
+        payload["max_output_tokens"] = int(max_tokens)
+    r_tools = _oai_tools_to_responses(tools or [])
+    if r_tools:
+        payload["tools"] = r_tools
+    resp = await _post_json(
+        f"{base}/responses",
+        {"Authorization": f"Bearer {api_key}",
+         "content-type": "application/json"},
+        payload, timeout, "responses")
+    return _responses_to_oai(resp, model)
