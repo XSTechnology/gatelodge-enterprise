@@ -5522,9 +5522,10 @@ async def admin_secrets() -> Response:
         })
     return {"api_keys": rows,
             "gateway_keys_configured": bool(cfg.gateway_keys),
-            "hint": ("missing keys 502 on first use — set the env var or "
-                      "store it in the OS keyring (service 'Workshop', "
-                      "username = env var name) and restart the gateway")}
+            "hint": ("missing keys 502 on first use — supply the "
+                     "credential via the container environment (env var) "
+                     "or a mounted secret file referenced by the "
+                     "backend's api_key_file")}
 
 
 # ── Admin: recovery actions ────────────────────────────────────────────────

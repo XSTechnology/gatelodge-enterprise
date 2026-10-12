@@ -1140,7 +1140,7 @@ function onSvcBackendChange() {
       '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="(blank = none)"></div>';
   } else if (stype === 'runpod') {
     html += '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="RUNPOD_API_KEY" value="RUNPOD_API_KEY"></div>' +
-      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Key stored in OS keyring or env var. Models use endpoint_id or pod_id.</div>';
+      '<div class="muted" style="margin-left:148px;margin-bottom:6px">Key supplied via container env var or api_key_file. Models use endpoint_id or pod_id.</div>';
   } else if (stype === 'runpod-public') {
     html += '<div class="srow"><label>API key env var</label><input id="s-api_key_env" placeholder="RUNPOD_API_KEY" value="RUNPOD_API_KEY"></div>' +
       '<div class="muted" style="margin-left:148px;margin-bottom:6px">Pre-deployed RunPod models (Flux, Whisper, etc.). No endpoint or pod needed.</div>';
@@ -3432,8 +3432,9 @@ var _clLifecycle = null; // /admin/lifecycle response — watchdog, budgets, rul
 // One-click console presets for OpenAI-COMPATIBLE inference providers:
 // adding = a config backend {type: openai, base_url, api_key_env} — the
 // existing `openai` backend type serves them all (zero backend code).
-// The operator sets the env var / OS keyring entry named api_key_env,
-// then pulls models via the cloud catalog. Each preset is also a
+// The operator supplies the credential via the container environment
+// (env var) or a mounted secret file (api_key_file), then pulls models
+// via the cloud catalog. Each preset is also a
 // per-provider licensing lever: the backend serves only when its name
 // is in the license `providers` claim (see the License panel).
 var PROVIDER_PRESETS = [
@@ -3455,7 +3456,8 @@ function buildProviderPresetsWidget(defs, lic) {
   var trialAll = lic && (lic.mode === 'trial' || lic.mode === 'unmanaged');
   var html = '<div class="widget"><h3>⚡ Quick add — inference providers</h3>' +
     '<div class="muted" style="margin-bottom:8px">OpenAI-compatible serverless providers — one click adds the backend; ' +
-    'set the API key (env var or OS keyring, service <code>Workshop</code>) then load models from the catalog below. ' +
+    'supply its API key via the container environment (env var) or a mounted secret file ' +
+    '(the backend\'s <code>api_key_file</code>), then load models from the catalog below. ' +
     'Cloud providers serve only when their name is in your license\'s providers claim.</div><div class="chips">';
   PROVIDER_PRESETS.forEach(function (p) {
     if (existing[p.id]) {
@@ -4560,14 +4562,13 @@ function showKeys(ui) {
       html += '</tbody></table>';
     }
     html += '<div class="muted" style="margin-top:10px">' + esc(secrets.hint) + '</div></div>';
-    // How to set keys
-    html += '<div class="widget"><h3>Setting API keys</h3>' +
-      '<div class="kv"><b>Option 1 — Environment variable</b></div>' +
-      '<div class="muted">Set the env var before starting the gateway (e.g., <code>set GROQ_API_KEY=your_key</code> on Windows).</div>' +
-      '<div class="kv" style="margin-top:6px;"><b>Option 2 — OS Keyring</b></div>' +
-      '<div class="muted">Store in the OS keyring: service = <code>Workshop</code>, username = env var name (e.g., <code>RUNPOD_API_KEY</code>). The gateway reads from keyring at boot — restart after adding.</div>' +
-      '<div class="kv" style="margin-top:6px;"><b>Option 3 — Workshop secret</b></div>' +
-      '<div class="muted">Use the Workshop platform to store secrets. The gateway bridges Workshop keyring at startup.</div></div>';
+    // Provider API keys (deployment-supplied — v2.2.1 wording: the
+    // gateway never stores provider credentials itself)
+    html += '<div class="widget"><h3>Provider API keys</h3>' +
+      '<div class="muted">Backend service credentials (listed above) are supplied by the deployment: ' +
+      'environment variables on the container, or a mounted secret file referenced per backend ' +
+      'via <code>api_key_file</code>. They are never written into the gateway config. ' +
+      'A missing key answers 502 on first use. Gateway keys and virtual keys are managed in this panel.</div></div>';
     ui.body.innerHTML = html;
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
