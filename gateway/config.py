@@ -128,7 +128,8 @@ LLAMA_SERVER_BACKEND = "llama-server"
 RUNPOD_BACKEND = "runpod"
 RUNPOD_PUBLIC_BACKEND = "runpod-public"
 _BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
-                  RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND)
+                  RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND,
+                  "anthropic", "gemini")
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -457,8 +458,26 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                 }
             entry["models"] = rmodels
         else:  # openai-type cloud backend (executed in Stage 3)
-            entry["base_url"] = str(b.get("base_url") or "").strip()
-            entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
+            # v2.3 wire-translator backends share this openai SHAPE
+            # (base_url + api_key_env + models {name: remote_id}) —
+            # only the type marker and defaults differ; execution
+            # dispatches to gateway/wire.py for the translation.
+            if btype == "anthropic":
+                entry["base_url"] = str(
+                    b.get("base_url")
+                    or "https://api.anthropic.com").strip().rstrip("/")
+                entry["api_key_env"] = str(
+                    b.get("api_key_env") or "ANTHROPIC_API_KEY").strip()
+            elif btype == "gemini":
+                entry["base_url"] = str(
+                    b.get("base_url")
+                    or "https://generativelanguage.googleapis.com"
+                    ).strip().rstrip("/")
+                entry["api_key_env"] = str(
+                    b.get("api_key_env") or "GEMINI_API_KEY").strip()
+            else:
+                entry["base_url"] = str(b.get("base_url") or "").strip()
+                entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
             # Alternative key sources (tier B): read the key from a FILE
             # (Docker/K8s secrets, Vault Agent rendered files) or from a
             # COMMAND's stdout (vault CLI, aws secretsmanager, anything).

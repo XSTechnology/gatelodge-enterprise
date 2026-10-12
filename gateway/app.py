@@ -131,6 +131,7 @@ from . import licensing
 from . import llamaserver
 from . import semantic_cache
 from . import tracing
+from . import wire
 from . import modelsearch
 from . import providers
 from . import runpod
@@ -1846,6 +1847,28 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     # Cloud-shaped path: openai backends, REMOTE llama-server, and runpod
     # SERVERLESS all speak OpenAI over HTTP with a bearer key.
     remote_id = backend["models"][model_key]
+    if btype in ("anthropic", "gemini"):
+        # v2.3 wire-translator backends: OpenAI chat → the provider's
+        # native wire format → OpenAI chat (gateway/wire.py). Same
+        # budget/cost/logging posture as the openai path.
+        await _token_budget_gate(cfg, backend_name)
+        if btype == "anthropic":
+            d = await wire.anthropic_chat(
+                backend, str(remote_id), body.messages,
+                body.temperature, body.max_tokens, body.tools,
+                cfg.queue["timeout_s"])
+        else:
+            d = await wire.gemini_chat(
+                backend, str(remote_id), body.messages,
+                body.temperature, body.max_tokens, body.tools,
+                cfg.queue["timeout_s"])
+        d["model"] = requested  # consistent echo
+        usage = d.get("usage") or {}
+        cost = _cost_usd(cfg, backend_name, str(remote_id), usage)
+        if cost is not None:
+            d["cost_usd"] = round(cost, 6)
+        _charge_request(cfg, backend_name, usage, cost)
+        return d, backend_name, model_key
     client_name = backend_name
     cloud_backend = backend
     if btype == "runpod":
@@ -2332,7 +2355,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
         def _charge_and_log(ms: int) -> None:
             usage = usage_out or _estimate_stream_usage(body, text_chars)
             cost = None
-            if backend.get("type") == "openai":
+            if backend.get("type") in ("openai", "anthropic", "gemini"):
                 rid = str((backend.get("models") or {}).get(model_key) or "")
                 cost = _cost_usd(cfg, backend_name, rid, usage)
             _charge_request(cfg, backend_name, usage, cost)
@@ -2340,7 +2363,15 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                          cost_usd=cost)
 
         try:
-            if backend.get("type") == "embedded":
+            if backend.get("type") in ("anthropic", "gemini"):
+                # v2.3 wire-translator backends: complete fully, then
+                # emit ONE OpenAI-shaped chunk + [DONE] (valid streaming
+                # shape — every OpenAI client accepts single-chunk
+                # streams; the shared tail charges/logs).
+                resp, _, _ = await _exec_entry(cfg, entry, body, requested)
+                usage_out.update(resp.get("usage") or {})
+                yield "data: " + json.dumps(resp) + "\n\n"
+            elif backend.get("type") == "embedded":
                 engine = get_engine()
                 stream = await engine.chat.completions.create(
                     model=model_key,
