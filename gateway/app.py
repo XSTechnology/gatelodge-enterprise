@@ -5247,9 +5247,13 @@ async def admin_upsert_model(payload: ModelConfigPayload) -> Response:
     if btype == "llama-server" and bmode == "remote":
         if payload.remote_id:
             model_cfg["name"] = payload.remote_id  # remote uses "name" key
-    elif btype == "openai":
-        if payload.remote_id:
-            model_cfg["name"] = payload.remote_id
+    elif btype in (OPENAI_BACKEND, "anthropic", "gemini", "responses",
+                   "azure", "vertex"):
+        # wire/cloud model: the remote id defaults to OUR name (identity
+        # mapping — e.g. an Azure deployment named after the model), so
+        # a model saved without remote_id never writes {} (which the
+        # config normalizer would drop)
+        model_cfg["name"] = payload.remote_id.strip() or name
     elif btype == "runpod":
         if payload.endpoint_id:
             model_cfg["endpoint_id"] = payload.endpoint_id
@@ -5293,7 +5297,9 @@ def _remove_model_from_config(raw: dict, backend: str, name: str,
 class BackendConfigPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str = ""
-    backend_type: str = "embedded"  # embedded, llama-server, openai, runpod
+    backend_type: str = "embedded"  # embedded, llama-server, runpod, openai,
+    #                                    anthropic, gemini, responses, azure,
+    #                                    vertex, runpod-public
     # llama-server subprocess
     server_exe: str = ""
     host: str = ""
@@ -5301,9 +5307,13 @@ class BackendConfigPayload(BaseModel):
     start_timeout_s: float | None = None
     idle_timeout_s: float | None = None
     extra_args: str = ""  # space-separated, stored as list
-    # remote (llama-server remote, openai, runpod)
+    # remote (llama-server remote, openai, runpod, wire types)
     base_url: str = ""
     api_key_env: str = ""
+    # azure classic (resource + api_version) / vertex (project)
+    resource: str = ""
+    api_version: str = ""
+    project: str = ""
     # delete
     delete: bool = False
 
@@ -5347,9 +5357,28 @@ async def admin_upsert_backend(payload: BackendConfigPayload) -> Response:
                 bcfg["extra_args"] = payload.extra_args.split()
     elif payload.backend_type == RUNPOD_BACKEND:
         bcfg["api_key_env"] = payload.api_key_env or "RUNPOD_API_KEY"
-    elif payload.backend_type == OPENAI_BACKEND:
+    elif payload.backend_type in (OPENAI_BACKEND, "anthropic", "gemini",
+                                  "responses"):
+        # openai-SHAPE wire types: base_url + api_key_env. Type-specific
+        # defaults (api.anthropic.com, generativelanguage, openai/v1)
+        # are filled by the config normalizer when omitted.
         if payload.base_url:
             bcfg["base_url"] = payload.base_url.rstrip("/")
+        if payload.api_key_env:
+            bcfg["api_key_env"] = payload.api_key_env
+    elif payload.backend_type == "azure":
+        # Azure OpenAI classic: resource + api_version + api-key header;
+        # models (added via /admin/models) map our name → the DEPLOYMENT
+        if payload.resource:
+            bcfg["resource"] = payload.resource
+        if payload.api_version:
+            bcfg["api_version"] = payload.api_version
+        if payload.api_key_env:
+            bcfg["api_key_env"] = payload.api_key_env
+    elif payload.backend_type == "vertex":
+        # Vertex AI Interactions: project + express key (or ADC)
+        if payload.project:
+            bcfg["project"] = payload.project
         if payload.api_key_env:
             bcfg["api_key_env"] = payload.api_key_env
 

@@ -545,8 +545,13 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                 if isinstance(m, dict):
                     # "name" is what the console's model form writes —
                     # accept it or console-added cloud models silently
-                    # vanish on reload (observed bug)
-                    m = m.get("id") or m.get("model") or m.get("name") or ""
+                    # vanish on reload (observed bug). An entry with NO
+                    # usable id ({} — a model saved without a remote id)
+                    # keeps the entry with an IDENTITY mapping (our name
+                    # doubles as the remote id), matching the
+                    # runpod-public default — never silently dropped.
+                    m = (m.get("remote_id") or m.get("id")
+                         or m.get("model") or m.get("name") or mname or "")
                 if isinstance(m, str) and m.strip():
                     cmodels[str(mname)] = m.strip()
             entry["models"] = cmodels
