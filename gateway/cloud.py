@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 # reasoning_content and come back empty under a tight cap).
 CLOUD_MAX_TOKENS_CAP = 800
 
+# Azure OpenAI classic-API default (api-version-lifecycle doc; the
+# v1/Responses surface on Foundry is the newer alternative — the
+# classic deployment path is what every existing integration uses)
+AZURE_API_VERSION_DEFAULT = "2025-04-01-preview"
+
 
 class CloudBackendError(Exception):
     """Cloud backend unusable or its call failed — maps to HTTP 502."""
@@ -224,6 +229,42 @@ def get_cloud_client(name: str, backend: dict[str, Any],
     logger.info("cloud client ready: %s -> %s%s", name,
                 base_url or "(openai default)",
                 f" (auth: {auth_mode})" if auth_mode else "")
+    return client
+
+
+def get_azure_client(name: str, backend: dict[str, Any],
+                     deployment: str,
+                     timeout: float = 120.0) -> AsyncOpenAI:
+    """Cached AsyncOpenAI client for ONE Azure OpenAI deployment (the
+    classic API: deployment lives in the URL path, the resource key
+    rides the api-key HEADER — Azure ignores the SDK's Bearer when
+    api-key is present). Per-model clients, like runpod serverless."""
+    resource = str(backend.get("resource") or "").strip()
+    if not resource:
+        raise CloudBackendError(
+            f"azure backend {name!r}: resource is required (the Azure "
+            "OpenAI resource name)")
+    api_version = str(backend.get("api_version") or "").strip() \
+        or AZURE_API_VERSION_DEFAULT
+    base = f"https://{resource}.openai.azure.com/openai/deployments/" \
+           f"{deployment}"
+    api_key = resolve_backend_key(backend)
+    if not api_key:
+        key_env = str(backend.get("api_key_env")
+                      or "AZURE_OPENAI_API_KEY")
+        raise CloudBackendError(
+            f"azure backend {name!r}: no API key (set {key_env}, "
+            "paste it in the console, or mount api_key_file)")
+    sig = "\x00".join((resource, deployment, api_version, api_key))
+    cached = _CLIENTS.get(name)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    client = AsyncOpenAI(
+        base_url=base, api_key="azure",   # api-key header below is the
+        timeout=timeout,                  # real credential (Bearer is
+        default_headers={"api-key": api_key},   # ignored by Azure)
+        default_query={"api-version": api_version})
+    _CLIENTS[name] = (sig, client)
     return client
 
 

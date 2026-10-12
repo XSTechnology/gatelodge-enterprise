@@ -516,3 +516,59 @@ async def responses_chat(backend: dict[str, Any], model: str,
          "content-type": "application/json"},
         payload, timeout, "responses")
     return _responses_to_oai(resp, model)
+
+
+# ── vertex: the Gemini Interactions API on GCP (same payload, different
+# URL + Bearer auth). Preview: global location only.
+# https://aiplatform.googleapis.com/v1beta1/projects/{p}/locations/global/interactions
+
+async def vertex_chat(backend: dict[str, Any], model: str,
+                      messages: list[dict[str, Any]],
+                      temperature: float | None,
+                      max_tokens: int | None,
+                      tools: list[dict[str, Any]] | None,
+                      timeout: float) -> dict[str, Any]:
+    """Vertex AI Interactions (GCP) — the SAME wire shape as the AI
+    Studio gemini backend (payload differences are limited to the URL
+    and auth), so this reuses the gemini translators wholesale:
+    system_instruction + input turns + function tools, store=false,
+    steps timeline → OpenAI chat. Auth: an express-mode API key
+    (api_key_env) or the ADC/service-account Bearer token."""
+    project = str(backend.get("project") or "").strip()
+    if not project:
+        raise cloud.CloudBackendError(
+            "vertex backend: project is required (the GCP project id)")
+    # express-mode API key wins; ADC (service account / workload
+    # identity via credchains) fills the gap
+    api_key = cloud.resolve_backend_key(backend)
+    headers: dict[str, str] = {"content-type": "application/json"}
+    if api_key:
+        headers["x-goog-api-key"] = api_key
+    else:
+        try:
+            from .credchains import _adc_fetch_token
+            token, _ = _adc_fetch_token()
+            headers["Authorization"] = f"Bearer {token}"
+        except Exception as e:                       # noqa: BLE001
+            raise cloud.CloudBackendError(
+                f"vertex backend: no API key and ADC failed ({e}) "
+                "— set the express key or GOOGLE_APPLICATION_"
+                "CREDENTIALS") from e
+    system, turns = _oai_messages_to_gemini(messages)
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": turns,
+        "store": False}          # stateless — the gateway owns history
+    if system:
+        payload["system_instruction"] = system
+    g_tools = _oai_tools_to_gemini(tools or [])
+    if g_tools:
+        payload["tools"] = g_tools
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens:
+        payload["max_output_tokens"] = int(max_tokens)
+    url = (f"https://aiplatform.googleapis.com/v1beta1/projects/"
+           f"{project}/locations/global/interactions")
+    resp = await _post_json(url, headers, payload, timeout, "vertex")
+    return _gemini_to_oai(resp, model)
