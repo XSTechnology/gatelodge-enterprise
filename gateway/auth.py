@@ -162,6 +162,8 @@ def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     configured (open mode) everything passes with key_id=''.
 
     Token precedence: Authorization header (explicit, never logged)
+    → x-api-key (Anthropic-protocol clients — the /v1/messages shim;
+    same resolution, just a different transport)
     → URL path form /<token>/v1/... (set by apply_url_token_forms)
     → query ?key= (only when auth.token_forms lists "query" — the
     token surfaces in proxy logs, hence the separate gate).
@@ -173,6 +175,8 @@ def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
         return None
     auth = request.headers.get("authorization") or ""
     token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not token:
+        token = (request.headers.get("x-api-key") or "").strip()
     if not token:
         token = _REQUEST_URL_TOKEN.get()      # path form (middleware)
     if not token and "query" in (cfg.auth_token_forms or ()):
