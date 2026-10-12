@@ -220,16 +220,18 @@ select.lc-in { width:auto; padding-right:4px; }
     <span class="cat-icon">📊</span><span>Performance</span></button>
   <button class="cat-btn dashed" onclick="showPanel('syslog')" title="Live gateway log events">
     <span class="cat-icon">📋</span><span>Syslog</span></button>
-  <button class="cat-btn" onclick="showPanel('params')" title="Port, bind, queue, models_dir, gateway keys + raw config JSON">
+  <button class="cat-btn" onclick="showPanel('params')" title="Port, bind, queue, models_dir + raw config JSON">
     <span class="cat-icon">⚙️</span><span>Parameters</span></button>
-  <button class="cat-btn" onclick="showPanel('keys')" title="API key status per backend (env / keyring / missing)">
-    <span class="cat-icon">🔑</span><span>API Keys</span></button>
+  <button class="cat-btn" onclick="showPanel('keys')" title="Gateway keys, virtual keys, provider credentials — the full access surface">
+    <span class="cat-icon">🔑</span><span>Access</span></button>
   <button class="cat-btn" onclick="showPanel('health')" title="Health overview + recovery: stop children, stop pods, unload all, reload config">
     <span class="cat-icon">🩺</span><span>Health &amp; Recovery</span></button>
   <button class="cat-btn" onclick="showPanel('aliases')" title="Alias chains with hedge racing">
     <span class="cat-icon">🧭</span><span>Aliases</span></button>
   <button class="cat-btn" onclick="showPanel('governance')" title="Guardrails, smart routes, batch jobs, eval reports">
     <span class="cat-icon">🛡️</span><span>Governance</span></button>
+  <button class="cat-btn" onclick="showPanel('license')" title="License status — edition, features, provider entitlements, scale caps, expiry">
+    <span class="cat-icon">🪪</span><span>License</span></button>
 </div>
 
 <div class="modal-overlay" id="modal">
@@ -317,6 +319,34 @@ function notify(msg, isErr) {
 function fmtMB(mb) { return mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB'; }
 
 // ---------- boot ----------
+// v2.2 role-aware tiles: don't DISPLAY what the role can't use. The
+// SERVER stays the enforcement boundary; this only stops offering
+// panels the role would hit error-boxes on (e.g. key_manager opening
+// Models). Unknown roles see everything (server decides per request).
+var _TILE_POLICY = {
+  models:     { ops_readonly: 1, key_manager: 0 },
+  services:   { ops_readonly: 1, key_manager: 0 },
+  cloud:      { ops_readonly: 1, key_manager: 0 },
+  perf:       { ops_readonly: 1, key_manager: 1 },
+  syslog:     { ops_readonly: 1, key_manager: 0 },
+  params:     { ops_readonly: 0, key_manager: 0 },   // raw config read
+  keys:       { ops_readonly: 1, key_manager: 1 },
+  health:     { ops_readonly: 1, key_manager: 0 },
+  aliases:    { ops_readonly: 1, key_manager: 0 },
+  governance: { ops_readonly: 1, key_manager: 0 },
+  license:    { ops_readonly: 1, key_manager: 0 }
+};
+function applyTilePolicy() {
+  if (!ROLE || ROLE === 'full_admin') return;
+  var btns = document.querySelectorAll('.cat-btn');
+  for (var i = 0; i < btns.length; i++) {
+    var m = /showPanel\('(\w+)'\)/.exec(btns[i].getAttribute('onclick') || '');
+    if (!m) continue;
+    var pol = _TILE_POLICY[m[1]];
+    var visible = pol ? (pol[ROLE] !== 0) : true;
+    btns[i].style.display = visible ? '' : 'none';
+  }
+}
 function fetchWhoami() {
   api('/admin/whoami').then(function (d) {
     ROLE = d.role || null;
@@ -326,6 +356,7 @@ function fetchWhoami() {
       ? ('🔑 ' + d.identity.email + ' · ' + ROLE)
       : ('role: ' + ROLE);
     el.title = 'via ' + d.via + ' — ' + d.who;
+    applyTilePolicy();
   }).catch(function () {
     ROLE = null;                    // no/invalid key or virtual key — server decides
     var el = document.getElementById('role');
@@ -359,6 +390,116 @@ function refreshHeader() {
   }).catch(function (e) { setConn('bad', '✗ ' + e.message); });
 }
 
+// ---------- License (v2.2) ----------
+function showLicense(ui) {
+  ui.title.textContent = '🪪 License';
+  Promise.all([api('/admin/license'), api('/admin/backends')])
+    .then(function (r) {
+      ui.body.innerHTML = licenseHtml(r[0], r[1]);
+    })
+    .catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+function _licBadge(mode) {
+  if (mode === 'licensed') return '<span class="badge ok">licensed</span>';
+  if (mode === 'trial') return '<span class="badge warn">trial</span>';
+  if (mode === 'expired') return '<span class="badge err">expired</span>';
+  if (mode === 'unlicensed') return '<span class="badge err">unlicensed</span>';
+  return '<span class="badge">unmanaged</span>';
+}
+function licenseHtml(L, defs) {
+  var mode = L.mode || 'unmanaged';
+  var html = '';
+  // status + identity
+  html += '<div class="widget"><h3>Status</h3>' +
+    '<div class="kv">' + _licBadge(mode) + ' ' + esc(L.license_edition || L.edition || '—') +
+    (L.serial ? ' · serial <code>' + esc(L.serial) + '</code>' : '') + '</div>';
+  if (L.business_name)
+    html += '<div class="kv"><b>' + esc(L.business_name) + '</b>' +
+      (L.contract_email ? ' · <code>' + esc(L.contract_email) + '</code>' : '') +
+      (L.vendor ? ' · channel: ' + esc(L.vendor) : '') +
+      (L.support ? ' · <span class="badge ok">vendor support</span>' : '') + '</div>';
+  if (mode === 'unmanaged')
+    html += '<div class="muted" style="margin-top:6px">Running from source — no license state installed. Compiled binaries enforce the trial/license gate at boot.</div>';
+  // expiry + renewal
+  if (L.expires_at) {
+    var warnCls = L.expiry_warning === 1 ? 'err' : (L.expiry_warning ? 'warn' : 'ok');
+    html += '<div class="kv" style="margin-top:6px"><span class="badge ' + warnCls + '">expires ' +
+      esc(L.expires_at) + '</span> ' +
+      (L.days_left != null ? esc(String(L.days_left)) + ' day(s) left' : '') + '</div>';
+    if (L.expiry_warning)
+      html += '<div class="dw-msg err" style="margin-top:8px"><b>Renew soon</b> — drop the new ' +
+        'data/license.json in place; the gateway hot-reloads it (no restart).</div>';
+  } else if (mode === 'licensed') {
+    html += '<div class="kv" style="margin-top:6px"><span class="badge ok">perpetual</span></div>';
+  }
+  if (L.trial_days_left != null)
+    html += '<div class="kv" style="margin-top:6px"><span class="badge warn">trial</span> ' +
+      esc(String(L.trial_days_left)) + ' day(s) left</div>';
+  html += '</div>';
+  // feature codes Y/N
+  var codes = L.feature_codes || [];
+  if (codes.length) {
+    html += '<div class="widget"><h3>Feature entitlements</h3><table>' +
+      '<thead><tr><th>Feature code</th><th>Enabled</th></tr></thead><tbody>';
+    var fmap = L.features || {};
+    codes.forEach(function (c) {
+      var on = !!fmap[c];
+      html += '<tr><td><code>' + esc(c) + '</code></td><td>' +
+        (on ? '<span class="badge ok">Y</span>' : '<span class="badge err">N</span>') +
+        '</td></tr>';
+    });
+    // any licensed feature outside the registry (forward compat)
+    Object.keys(fmap).forEach(function (c) {
+      if (codes.indexOf(c) < 0)
+        html += '<tr><td><code>' + esc(c) + '</code></td><td>' +
+          (fmap[c] ? '<span class="badge ok">Y</span>' : '<span class="badge err">N</span>') +
+          '</td></tr>';
+    });
+    html += '</tbody></table><div class="muted" style="margin-top:6px">' +
+      'Enterprise modules wire at boot per these claims (tier_d, scim, session_budgets, mcp, teams).</div></div>';
+  }
+  // provider entitlements + configured backends
+  html += '<div class="widget"><h3>Provider entitlements</h3>' +
+    '<div class="muted" style="margin-bottom:6px">Local compute (<code>' +
+    esc((L.local_provider_types || []).join(', ')) +
+    '</code>) is always allowed. Cloud backends serve only when named in the license:</div>';
+  var provs = L.providers || [];
+  var bs = (defs && defs.backends) || [];
+  var cloud = bs.filter(function (b) {
+    return (L.cloud_provider_types || []).indexOf(b.type) >= 0;
+  });
+  if (!cloud.length && !provs.length)
+    html += '<div class="muted">No cloud backends configured, none entitled.</div>';
+  else {
+    html += '<table><thead><tr><th>Backend</th><th>Type</th><th>Status</th></tr></thead><tbody>';
+    cloud.forEach(function (b) {
+      var entitled = b.licensed !== false;
+      html += '<tr><td><code>' + esc(b.name) + '</code></td><td>' + esc(b.type) +
+        '</td><td>' + (entitled
+          ? '<span class="badge ok">entitled</span>'
+          : '<span class="badge err">NOT LICENSED</span>') + '</td></tr>';
+    });
+    html += '</tbody></table>';
+  }
+  if (provs.length)
+    html += '<div class="muted" style="margin-top:6px">Entitled names: <code>' +
+      esc(provs.join(', ')) + '</code></div>';
+  html += '</div>';
+  // scale caps
+  var caps = L.caps || {};
+  var kinds = L.cap_kinds || ['keys', 'instances', 'teams', 'gpus'];
+  html += '<div class="widget"><h3>Scale caps</h3><table>' +
+    '<thead><tr><th>Kind</th><th>Limit</th></tr></thead><tbody>';
+  kinds.forEach(function (k) {
+    html += '<tr><td>' + esc(k) + '</td><td>' +
+      (caps[k] != null ? '<b>' + esc(String(caps[k])) + '</b>' : '<span class="muted">unlimited</span>') +
+      '</td></tr>';
+  });
+  html += '</tbody></table><div class="muted" style="margin-top:6px">' +
+    'Enforced at virtual-key create, instance load and team create (403 license_caps).</div></div>';
+  return html;
+}
+
 // ---------- modal ----------
 function showPanel(name) {
   document.getElementById('modal').classList.add('show');
@@ -368,7 +509,7 @@ function showPanel(name) {
   ({models: showModels, services: showServices, cloud: showCloud, perf: showPerf,
     syslog: showSyslog, params: showParams, keys: showKeys,
     health: showHealth, aliases: showAliases,
-    governance: showGovernance}[name] || function(){})(
+    governance: showGovernance, license: showLicense}[name] || function(){})(
       {title: t, body: b});
 }
 function closeModal() {
@@ -386,41 +527,74 @@ var _editModelName = null; // tracks which model we're editing
 function showModels(ui) {
   ui.title.textContent = '🧠 Models';
   _editModelName = null;
-  Promise.all([api('/admin/models'), api('/admin/backends')]).then(function (r) {
+  // v2.2 per-widget resilience: one failing fetch must not kill the
+  // whole panel (the old Promise.all → errBox did exactly that).
+  Promise.all([
+    api('/admin/models').catch(function (e) { return { __err: e.message }; }),
+    api('/admin/backends').catch(function (e) {
+      return { __err: e.message, backends: [] }; })
+  ]).then(function (r) {
     var d = r[0], defs = r[1];
     // Store backend info for form rendering
     _modelBackends = {};
     (defs.backends || []).forEach(function (b) {
       _modelBackends[b.name] = {type: b.type, mode: b.mode};
     });
+    // v2.2 provider entitlement: pickers below never OFFER models on
+    // unlicensed cloud backends (don't-display); the table tags them.
+    var licensedB = {};
+    (defs.backends || []).forEach(function (b) {
+      licensedB[b.name] = (b.licensed !== false);
+    });
+    if (d.__err || defs.__err) {
+      var msg = '<div class="dw-msg err" style="margin-bottom:8px"><b>partial data</b> — ' +
+        esc(d.__err || defs.__err) + '</div>';
+      d = (d.__err ? { discovered: [], loaded: [] } : d);
+      defs = (defs.__err ? { backends: [] } : defs);
+    } else { var msg = ''; }
     var configured = {}; // name -> {backend, role, cfg}
     (defs.backends || []).forEach(function (b) {
       var mm = Object.assign({}, b.models || {}, b.embedding_models || {});
       Object.keys(mm).forEach(function (n) {
-        configured[n] = {backend: b.name, role: (b.embedding_models && b.embedding_models[n]) ? 'embed' : 'chat', cfg: mm[n], btype: b.type, bmode: b.mode};
+        configured[n] = {backend: b.name, role: (b.embedding_models && b.embedding_models[n]) ? 'embed' : 'chat', cfg: mm[n], btype: b.type, bmode: b.mode, licensed: licensedB[b.name] !== false};
       });
     });
     _configuredModels = configured;
-    var html = buildModelForm(defs, d.discovered || []) +
-      buildCloudCatalogWidget(defs) +
-      buildConfiguredTable(configured, d) +
-      buildLoadedTable(d.loaded || []) +
-      buildDiscoveredChips(d.discovered || [], configured) +
+    // Acquire-first (v2.2 console regroup): local model lifecycle —
+    // download → on-disk → configured → add/edit → loaded → playground.
+    // Cloud catalogs + deploy live in the Cloud panel; the finder's
+    // local-download action links back here.
+    var html = (typeof msg !== 'undefined' ? msg : '') +
       buildDownloadWidget() +
+      buildDiscoveredChips(d.discovered || [], configured) +
+      buildConfiguredTable(configured, d) +
+      buildModelForm(defs, d.discovered || []) +
+      buildLoadedTable(d.loaded || []) +
       buildTryItWidget(configured);
     ui.body.innerHTML = html;
+    // a catalog pick from the Cloud panel lands here — apply it once
+    // the form (and its dynamic fields) exist
+    if (_pendingCatalogPick) {
+      var pick = _pendingCatalogPick;
+      _pendingCatalogPick = null;
+      setTimeout(function () { _applyCatalogPick(pick.backend, pick.suffix, pick.id); }, 60);
+    }
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
 }
 
 function buildModelForm(defs, discovered) {
   var backends = defs.backends || [];
+  // v2.2 don't-display: the picker never OFFERS unlicensed backends —
+  // nothing unauthorized to select. (Configure entitlements via the
+  // license providers claim; see the License panel.)
+  var usable = backends.filter(function (b) { return b.licensed !== false; });
   var ggufNames = (discovered || []).map(function (g) { return g.name; });
   var html = '<div class="widget"><h3>' + (_editModelName ? 'Edit model' : 'Add / Edit model') + '</h3>';
   // Name
   html += '<div class="srow"><label>Name</label><input id="m-name" placeholder="my-model"></div>';
   // Backend selector
   html += '<div class="srow"><label>Backend</label><select id="m-backend" onchange="onBackendChange()">';
-  backends.forEach(function (b) {
+  usable.forEach(function (b) {
     var label = b.name + ' (' + b.type;
     if (b.mode) label += ' ' + b.mode;
     label += ')';
@@ -532,12 +706,19 @@ function buildConfiguredTable(configured, data) {
       // Check if loaded
       var loaded = (data.loaded || []).find(function (m) { return m.alias === n; });
       var statusBadge = loaded ? '<span class="badge ok">loaded</span>' : '<span class="badge dim">not loaded</span>';
-      html += '<tr><td><b>' + esc(n) + '</b> ' + statusBadge + '</td>' +
+      // v2.2: config truth stays VISIBLE for the licensee, tagged —
+      // but unlicensed models carry no edit/delete actions (nothing
+      // unauthorized to click) and never appear in pickers.
+      var licBadge = (info.licensed === false)
+        ? ' <span class="badge err" title="backend not entitled — the license providers claim does not include it">NOT LICENSED</span>' : '';
+      var actions = (info.licensed === false) ? '<span class="muted">—</span>' :
+        ('<button class="btn btn-sm" onclick="editModel(\'' + esc(n) + '\',\'' + esc(info.backend) + '\',\'' + esc(info.role) + '\')">edit</button> ' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteModel(\'' + esc(n) + '\',\'' + esc(info.backend) + '\',\'' + esc(info.role) + '\')">delete</button>');
+      html += '<tr><td><b>' + esc(n) + '</b> ' + statusBadge + licBadge + '</td>' +
         '<td><span class="badge ' + esc(info.btype) + '">' + esc(info.backend) + '</span></td>' +
         '<td>' + esc(info.role) + '</td>' +
         '<td class="muted">' + (details.length ? details.join(' · ') : '—') + '</td>' +
-        '<td><button class="btn btn-sm" onclick="editModel(\'' + esc(n) + '\',\'' + esc(info.backend) + '\',\'' + esc(info.role) + '\')">edit</button> ' +
-        '<button class="btn btn-sm btn-danger" onclick="deleteModel(\'' + esc(n) + '\',\'' + esc(info.backend) + '\',\'' + esc(info.role) + '\')">delete</button></td></tr>';
+        '<td>' + actions + '</td></tr>';
     });
     html += '</tbody></table>';
   }
@@ -605,7 +786,8 @@ function downloadModel() {
 var _catalogModels = null;
 function buildCloudCatalogWidget(defs) {
   var cloudBackends = (defs.backends || []).filter(function (b) {
-    return b.type === 'openai';
+    // v2.2 don't-display: unlicensed backends never list here
+    return b.type === 'openai' && b.licensed !== false;
   });
   if (!cloudBackends.length) return '';
   var html = '<div class="widget"><h3>☁️ Cloud catalog</h3>';
@@ -626,7 +808,7 @@ function buildCloudCatalogWidget(defs) {
       '<option value=":cerebras">:cerebras</option>' +
       '<option value=":together">:together</option>' +
     '</select></div>';
-  html += '<div id="cat-status" class="muted" style="margin-top:6px">Live model list fetched server-side — the API key never reaches this page.</div>';
+  html += '<div id="cat-status" class="muted" style="margin-top:6px">Live model list fetched server-side — the API key never reaches this page. Click ＋ to prefill the Add-model form (Models panel).</div>';
   html += '<div id="cat-list" style="margin-top:8px;max-height:40vh;overflow-y:auto;"></div>';
   html += '</div>';
   return html;
@@ -687,11 +869,23 @@ function renderCatalog() {
   list.innerHTML = html;
 }
 
+var _pendingCatalogPick = null;
 function pickCatalogModel(id) {
-  var backend = document.getElementById('cat-backend').value;
+  var backendEl = document.getElementById('cat-backend');
   var suffix = document.getElementById('cat-suffix').value || '';
-  // Prefill the Add / Edit model form (rendered above the catalog):
-  // select the backend first so its dynamic fields exist, then fill.
+  var backend = backendEl ? backendEl.value : '';
+  if (!document.getElementById('m-backend')) {
+    // The Add/Edit form lives in the MODELS panel (v2.2 regroup) —
+    // stash the pick and open it; the prefill applies after render.
+    _pendingCatalogPick = { backend: backend, suffix: suffix, id: id };
+    showPanel('models');
+    return;
+  }
+  _applyCatalogPick(backend, suffix, id);
+}
+function _applyCatalogPick(backend, suffix, id) {
+  // Prefill the Add / Edit model form: select the backend first so
+  // its dynamic fields exist, then fill.
   document.getElementById('m-backend').value = backend;
   document.getElementById('m-role').value = 'chat';
   onBackendChange();
@@ -708,7 +902,8 @@ function buildTryItWidget(configured) {
   var chatModels = [];
   Object.keys(configured || {}).forEach(function (n) {
     var c = configured[n];
-    if (c.role === 'chat') {
+    // v2.2 don't-display: models on unlicensed backends never list
+    if (c.role === 'chat' && c.licensed !== false) {
       chatModels.push({id: c.backend + ':' + n});
     }
   });
@@ -896,8 +1091,7 @@ function showServices(ui) {
     _svcBackends = {};
     (defs.backends || []).forEach(function (b) { _svcBackends[b.name] = b; });
     var html = buildBackendForm(defs) +
-      buildBackendTable(defs) +
-      buildLiveChildren(children);
+      buildBackendTable(defs);
     ui.body.innerHTML = html;
     setTimeout(function () { onSvcBackendChange(); }, 50);
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
@@ -972,14 +1166,20 @@ function buildBackendTable(defs) {
         settings.push('url: ' + esc(b.base_url || ''), 'key: ' + esc(b.api_key_env || ''));
       }
       var modelCount = Object.keys(b.models || {}).length + Object.keys(b.embedding_models || {}).length;
-      var actions = '<button class="btn btn-sm" onclick="editBackend(\'' + esc(b.name) + '\')">edit</button> ' +
-        '<button class="btn btn-sm btn-danger" onclick="deleteBackend(\'' + esc(b.name) + '\')">delete</button>';
+      // v2.2: unlicensed backends stay VISIBLE (config truth) tagged
+      // NOT LICENSED with no actions — nothing unauthorized to click.
+      var unlicensed = (b.licensed === false);
+      var licTag = unlicensed
+        ? ' <span class="badge err" title="the license providers claim does not include this backend">NOT LICENSED</span>' : '';
+      var actions = unlicensed ? '<span class="muted">—</span>' :
+        ('<button class="btn btn-sm" onclick="editBackend(\'' + esc(b.name) + '\')">edit</button> ' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteBackend(\'' + esc(b.name) + '\')">delete</button>');
       if (b.type === 'runpod') {
         actions += ' <button class="btn btn-sm" onclick="checkRunpodInventory()">🔍 inventory</button> ' +
           '<button class="btn btn-sm" onclick="showDeployPod()">+ deploy</button> ' +
           '<button class="btn btn-sm" onclick="showAddServerless()">+ serverless</button>';
       }
-      html += '<tr><td><b>' + esc(b.name) + '</b> <span class="muted">(' + modelCount + ' models)</span></td>' +
+      html += '<tr><td><b>' + esc(b.name) + '</b> <span class="muted">(' + modelCount + ' models)</span>' + licTag + '</td>' +
         '<td><span class="badge ' + esc(b.type) + '">' + esc(b.type) + '</span></td>' +
         '<td>' + esc(b.mode || '—') + '</td>' +
         '<td class="muted">' + (settings.length ? settings.join(' · ') : '—') + '</td>' +
@@ -1803,6 +2003,32 @@ function fmRenderConfig(preHtml) {
   if (!box) return;
   box.innerHTML = (preHtml != null) ? preHtml : fmConfigHtml();
 }
+function fmLocalDownload() {
+  // Local acquire for a finder pick: download the chosen GGUF into
+  // models_dir (the cloud deploy stays a separate action). The
+  // server streams the file — the button shows progress state and
+  // the file appears in Models → On-disk GGUFs on completion.
+  var p = _fmPick;
+  if (!p || !p.repoId) return;
+  var name = p.file && p.file.name ? p.file.name : '';
+  fmRenderConfig('<div class="kv"><span class="badge ok">downloading</span> ' +
+                 '<code>' + esc(name || p.repoId) + '</code> → models_dir… ' +
+                 '<span class="muted">large files take a while — the list in ' +
+                 'Models → On-disk GGUFs refreshes on open.</span></div>');
+  api('/admin/models/download', {method: 'POST', body: {
+    repo_id: p.repoId, filename: name}}).then(function () {
+    notify('✓ downloaded: ' + (name || p.repoId) + ' — see Models → On-disk GGUFs');
+    fmRenderConfig('<div class="kv"><span class="badge ok">downloaded</span> ' +
+                   '<code>' + esc(name || p.repoId) + '</code> is on disk — ' +
+                   'load it from Models → On-disk GGUFs.</div>');
+  }).catch(function (e) {
+    notify('✗ download failed: ' + e.message, true);
+    fmRenderConfig('<div class="dw-msg err"><b>download failed</b> — ' +
+                   esc(e.message) + '</div>' +
+                   '<div style="margin:6px 0">' +
+                   '<button class="btn btn-sm" onclick="fmRenderConfig()">back</button></div>');
+  });
+}
 function fmConfigHtml() {
   var p = _fmPick;
   if (!p) return '';
@@ -1815,6 +2041,12 @@ function fmConfigHtml() {
     '</code> (' + esc(String(p.file.size_gb)) + ' GB' +
     (p.repoId ? ' · from ' + esc(p.repoId) : '') + ')' +
     (p.mmproj ? ' · 👁 +mmproj ' + esc(String(p.mmproj.size_gb)) + ' GB' : '') + '</div>';
+  // Local acquire (v2.2): the same pick can download straight into
+  // models_dir — no cloud needed. Runs next to the deploy flow so one
+  // search serves both targets.
+  if (p.repoId)
+    html += '<div style="margin:6px 0"><button class="btn btn-sm" onclick="fmLocalDownload()">⬇ Download locally</button>' +
+      '<span class="muted" style="margin-left:8px">into models_dir — appears in Models → On-disk GGUFs</span></div>';
   if (p.upload)
     html += '<div class="muted">from local upload — receiver pod <code>' + esc(p.podId) +
       '</code> · ' + fmCleanBtnHtml() + '</div>';
@@ -3199,9 +3431,14 @@ function showCloud(ui) {
   _clVolMsg = null;
   _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
   _clLifecycle = null;
-  api('/admin/providers').then(function (d) {
+  Promise.all([api('/admin/providers'), api('/admin/backends')]).then(function (r) {
+    var d = r[0], defs = r[1];
     var ps = d.providers || [];
+    // v2.2 regroup: the CLOUD catalog (openai-type backends — HF
+    // router etc.) lives HERE, next to the deploy machinery; the
+    // Models panel stays local-lifecycle only.
     var html = '<div id="cl-alerts"></div>' +
+      buildCloudCatalogWidget(defs) +
       '<div class="widget"><h3>Provider</h3>' +
       '<div class="srow"><label for="cl-provider">Cloud provider</label>' +
       '<select id="cl-provider" onchange="clOnProviderChange()">';
@@ -3910,11 +4147,38 @@ function showPerf(ui) {
       });
       html += '</tbody></table></div>';
       html += buildBenchmarkWidget();
+      html += buildTracingWidget();
       ui.body.innerHTML = html;
     }).catch(function (e) { ui.body.innerHTML = errBox(e); });
   };
   render();
   _perfTimer = setInterval(render, 5000);
+}
+
+function buildTracingWidget() {
+  // v2.2: tracing status is async — the widget fills itself in
+  setTimeout(function () {
+    var box = document.getElementById('tracing-body');
+    if (!box) return;
+    api('/admin/tracing').then(function (t) {
+      var html = '<div class="kv">' + (t.enabled
+        ? '<span class="badge ok">enabled</span> sampling ' + esc(String(t.sample_ratio)) +
+          ' · <code>' + esc(t.endpoint || '(default)') + '</code>'
+        : '<span class="badge">disabled</span> (otel section in the config; restart to change)') +
+        '</div>';
+      if (t.enabled || (t.exported || 0) + (t.dropped || 0) > 0)
+        html += '<div class="kv" style="margin-top:6px">spans: <b>' +
+          esc(String(t.exported || 0)) + '</b> exported · ' +
+          esc(String(t.buffered || 0)) + ' buffered · <b>' +
+          esc(String(t.dropped || 0)) + '</b> dropped · ' +
+          esc(String(t.export_errors || 0)) + ' export errors</div>';
+      box.innerHTML = html;
+    }).catch(function (e) { box.innerHTML = '<div class="muted">' + esc(e.message) + '</div>'; });
+  }, 0);
+  return '<div class="widget"><h3>🔭 Tracing (OTLP)</h3>' +
+    '<div id="tracing-body"><div class="muted">loading…</div></div>' +
+    '<div class="muted" style="margin-top:6px">W3C traceparent continues caller traces; ' +
+    'spans export to the configured OTLP/HTTP endpoint (otel.enabled/endpoint/sample_ratio).</div></div>';
 }
 
 function buildBenchmarkWidget() {
@@ -4019,36 +4283,9 @@ function showParams(ui) {
       '<button class="btn btn-primary" onclick="saveParams()">Save &amp; apply</button>' +
       '<button class="btn" onclick="reloadConfig()">↻ Reload from disk</button>' +
       '</div></div>';
-    // Gateway keys
-    html += '<div class="widget"><h3>Gateway access keys</h3>';
-    html += d.gateway_keys_configured
-      ? '<div class="kv"><span class="badge ok">secured</span> Bearer auth active</div>'
-      : '<div class="kv"><span class="badge warn">open</span> No keys — trusts localhost</div>';
-    html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">' +
-      '<input id="pm-key-input" type="text" placeholder="Add key…" style="width:200px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);font-size:.85rem;font-family:inherit;">' +
-      '<button class="btn btn-sm btn-primary" onclick="addGatewayKey()">Add</button></div>';
-    // Show existing keys
-    api('/admin/config').then(function (c) {
-      try {
-        var cfg = JSON.parse(c.text);
-        var keys = cfg.gateway_keys || [];
-        if (keys.length) {
-          html += '<div style="margin-top:8px;"><table><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>';
-          keys.forEach(function (k) {
-            var masked = k.substring(0, 4) + '••••' + k.substring(k.length - 4);
-            html += '<tr><td><code>' + esc(masked) + '</code></td>' +
-              '<td><button class="btn btn-sm btn-danger" onclick="removeGatewayKey(\'' + esc(k) + '\')">remove</button></td></tr>';
-          });
-          html += '</tbody></table></div>';
-        }
-      } catch (e) { /* ignore parse error */ }
-      // Inject keys table into the widget
-      var widgetEls = document.querySelectorAll('.widget');
-      if (widgetEls.length >= 3) {
-        // Already built, append to last widget
-      }
-    });
-    html += '<div class="muted" style="margin-top:6px">Keys are stored in the config file — restart the gateway or reload to apply.</div></div>';
+    // Gateway access keys moved to the Access panel (v2.2 regroup —
+    // one surface for every credential); this panel keeps server +
+    // queue only.
     // Raw config (collapsible)
     html += '<div class="widget"><h3 style="cursor:pointer;" onclick="toggleRawConfig()">Raw config JSON <span class="muted" id="raw-toggle">[click to expand]</span></h3>' +
       '<div id="raw-config-section" style="display:none;margin-top:8px;">' +
@@ -4099,17 +4336,18 @@ function reloadConfig() {
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 function addGatewayKey() {
-  var input = document.getElementById('pm-key-input');
+  var input = document.getElementById('gk-input');
+  if (!input) return;
   var key = input.value.trim();
   if (!key) { notify('Enter a key value', true); return; }
   api('/admin/gateway-keys', {method: 'POST', body: {key: key}})
-    .then(function () { notify('✓ key added'); input.value = ''; showPanel('params'); })
+    .then(function () { notify('✓ key added'); input.value = ''; showPanel('keys'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 function removeGatewayKey(key) {
   if (!confirm('Remove gateway key ' + key.substring(0, 8) + '…?')) return;
   api('/admin/gateway-keys', {method: 'POST', body: {key: key, delete: true}})
-    .then(function () { notify('✓ key removed'); showPanel('params'); })
+    .then(function () { notify('✓ key removed'); showPanel('keys'); })
     .catch(function (e) { notify('✗ ' + e.message, true); });
 }
 
@@ -4208,13 +4446,37 @@ function showKeys(ui) {
     // Consumer (virtual) keys
     html += renderApiKeys(vkeys.api_keys || []);
     if (vkeys.api_keys && vkeys.api_keys.length && !vkeys.admin_keys_configured)
-      html += '<div class="widget"><div class="kv"><span class="badge warn">no admin key</span> virtual keys are active but gateway_keys is empty — add an admin key via <b>Parameters</b> or the admin surface stays locked.</div></div>';
-    // Gateway access section
+      html += '<div class="widget"><div class="kv"><span class="badge warn">no admin key</span> virtual keys are active but gateway_keys is empty — add an admin key below or the admin surface stays locked.</div></div>';
+    // Gateway access section (v2.2 regroup: the full credential
+    // surface — add/remove bearer keys lives HERE, not in Parameters)
     html += '<div class="widget"><h3>Gateway access (bearer keys)</h3>';
     html += secrets.gateway_keys_configured
       ? '<div class="kv"><span class="badge ok">secured</span> Requests need <b>Authorization: Bearer &lt;key&gt;</b></div>'
-      : '<div class="kv"><span class="badge warn">open</span> No gateway_keys configured — trusts localhost. Add keys via <b>Parameters → Gateway access keys</b>.</div>';
-    html += '</div>';
+      : '<div class="kv"><span class="badge warn">open</span> No gateway_keys configured — trusts localhost</div>';
+    html += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">' +
+      '<input id="gk-input" type="text" placeholder="Add gateway key…" style="width:220px;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text);font-size:.85rem;font-family:inherit;">' +
+      '<button class="btn btn-sm btn-primary" onclick="addGatewayKey()">Add</button></div>';
+    // existing keys (hashed-at-rest entries render masked)
+    api('/admin/config').then(function (c) {
+      try {
+        var cfg = JSON.parse(c.text);
+        var keys = cfg.gateway_keys || [];
+        var box = document.getElementById('gk-list');
+        if (!box) return;
+        if (!keys.length) { box.innerHTML = ''; return; }
+        var t = '<table><thead><tr><th>Key</th><th></th></tr></thead><tbody>';
+        keys.forEach(function (k) {
+          var masked = String(k).length > 12
+            ? String(k).substring(0, 6) + '••••' + String(k).substring(String(k).length - 4)
+            : String(k);
+          t += '<tr><td><code>' + esc(masked) + '</code></td>' +
+            '<td><button class="btn btn-sm btn-danger" onclick="removeGatewayKey(\'' + esc(String(k)) + '\')">remove</button></td></tr>';
+        });
+        box.innerHTML = t + '</tbody></table>';
+      } catch (e) { /* config pane needs full admin — ignore */ }
+    });
+    html += '<div id="gk-list" style="margin-top:8px"></div>' +
+      '<div class="muted" style="margin-top:6px">Keys apply on reload/restart. Long random values; sha256-hex entries stay hashed.</div></div>';
     // Backend service credentials
     html += '<div class="widget"><h3>Backend service credentials</h3>';
     if (!(secrets.api_keys || []).length)
@@ -4417,8 +4679,47 @@ function showGovernance(ui) {
     }
     html += '</div>';
 
+    // ── Audit chain (v2.2): hash-chained config mutations ──
+    html += buildAuditWidget();
     ui.body.innerHTML = html;
+    // the audit widget fills itself async (separate fetch)
+    api('/admin/audit').then(function (a) {
+      var box = document.getElementById('audit-body');
+      if (!box) return;
+      var ch = a.chain || {};
+      var valid = ch.valid !== false;
+      var html2 = '<div class="kv">' + (valid
+        ? '<span class="badge ok">chain intact</span>'
+        : '<span class="badge err">CHAIN BREAK</span>') +
+        ' ' + esc(String(ch.chained || 0)) + ' chained record(s)' +
+        ((ch.breaks || []).length
+          ? ' — first break: ' + esc(JSON.stringify(ch.breaks[0]).slice(0, 120))
+          : '') + '</div>';
+      var rows = (a.audit || []).slice(0, 10);
+      if (rows.length) {
+        html2 += '<table style="margin-top:8px"><thead><tr><th>ts</th><th>key</th><th>action</th></tr></thead><tbody>';
+        rows.forEach(function (m) {
+          html2 += '<tr><td class="muted">' + esc(m.ts || '') + '</td><td>' +
+            esc(m.key || '') + '</td><td><code>' + esc(String(m.action || '').slice(0, 60)) +
+            '</code></td></tr>';
+        });
+        html2 += '</tbody></table>';
+      } else {
+        html2 += '<div class="muted" style="margin-top:6px">No config mutations recorded yet.</div>';
+      }
+      box.innerHTML = html2;
+    }).catch(function (e) {
+      var box = document.getElementById('audit-body');
+      if (box) box.innerHTML = '<div class="muted">' + esc(e.message) + '</div>';
+    });
   }).catch(function (e) { ui.body.innerHTML = errBox(e); });
+}
+
+function buildAuditWidget() {
+  return '<div class="widget"><h3>Audit chain</h3>' +
+    '<div id="audit-body"><div class="muted">loading…</div></div>' +
+    '<div class="muted" style="margin-top:6px">Every config mutation appends a hash-chained ' +
+    'record (config-audit.jsonl) — tamper-evident; the chain verifies on every open.</div></div>';
 }
 
 function errBox(e) { return '<div style="color:var(--danger);padding:12px;">✗ ' + esc(e.message) + '</div>'; }
