@@ -36,9 +36,14 @@ contract_email, vendor?, support, features {code: Y/N} over
 FEATURE_CODES (v1 list = all Y), providers [backend names] —
 PER-BACKEND cloud entitlement: embedded + llama-server are FREE
 (local compute); openai / runpod / runpod-public backends serve only
-when their NAME is in the claim (provider_allowed). exp? (absent =
-perpetual; the tool issues 30d/60d/90d/1y/2y/3y presets), nbf, iat,
-node? (node-lock fingerprint).
+when their NAME is in the claim (provider_allowed). caps {keys,
+instances, teams, gpus} — scale limits (absent = unlimited; trial =
+unlimited). serial — unique issuance id (GL-…; vendor ledger).
+exp? (absent = perpetual; the tool issues 30d/60d/90d/1y/2y/3y
+presets), nbf, iat, node? (node-lock fingerprint). The JWT HEADER
+carries kid — the signing key's id (sha16 of its public DER); the
+gateway trusts a LIST of keys and selects by kid (rotation without
+bricking deployed binaries).
 
 The signing keypair comes from ``scripts/license_tool.py keygen``;
 the PRIVATE half lives in vendor_keys/ (gitignored — offline
@@ -105,8 +110,33 @@ FwIDAQAB
 # ── module state (seam-style: injected at boot, swappable in tests) ────────
 
 _PUBLIC_KEY_PEM: str = _EMBEDDED_PUBLIC_KEY_PEM
+# Key rotation (v2.2): ALL trusted verification keys, newest first.
+# A license's ``kid`` claim (sha16 of the signing public key) selects
+# its key; kid-less tokens (v1 and early v2) try keys in order. A
+# rotation = keygen a new pair, embed BOTH publics, re-issue with kid.
+_TRUSTED_KEYS: list[str] = [_EMBEDDED_PUBLIC_KEY_PEM]
 _STATE: dict[str, Any] | None = None    # None = unmanaged (source/tests)
 _CACHE: tuple[float, tuple[bool, str]] | None = None
+_LICENSE_MTIME: float | None = None     # hot-reload watch (file mtime)
+
+
+def key_id(pem: str) -> str:
+    """A signing key's id: sha16 of the public key DER (the ``kid``
+    claim; license_tool keygen prints it)."""
+    from cryptography.hazmat.primitives import serialization
+    pub = serialization.load_pem_public_key(pem.encode("ascii"))
+    der = pub.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()[:16]
+
+
+def set_license_public_keys(pems: list[str]) -> None:
+    """Replace the trusted-key LIST (rotation: old + new side by
+    side; newest first for kid-less fallback)."""
+    global _PUBLIC_KEY_PEM, _TRUSTED_KEYS
+    _TRUSTED_KEYS = [p for p in pems if p and p.strip()]
+    _PUBLIC_KEY_PEM = _TRUSTED_KEYS[0] if _TRUSTED_KEYS else ""
 
 
 def _default_license_path() -> Path:
@@ -149,6 +179,20 @@ def _read_license_file(p: Path) -> tuple[str | None, str]:
     return (text or None), ""
 
 
+def _resolved_license_path(explicit: Path | None = None) -> Path | None:
+    """The FILE the active license came from (hot-reload watch), by
+    the same precedence as _load_license_token: explicit → env file →
+    default. None for env-inline / no license."""
+    if explicit is not None:
+        return explicit
+    env = (os.environ.get("GATELODGE_LICENSE") or "").strip()
+    if env:
+        p = Path(env)
+        return p if p.is_file() else None
+    default = _default_license_path()
+    return default if default.is_file() else None
+
+
 def _load_license_token(explicit_path: Path | None
                         ) -> tuple[str | None, str | None, str]:
     """Resolve the license token: explicit path → GATELODGE_LICENSE
@@ -172,18 +216,43 @@ def _load_license_token(explicit_path: Path | None
 
 
 def _verify_token(token: str, now: datetime) -> tuple[dict | None, str]:
-    """RS256 verification against the ACTIVE public key + claim sanity:
-    the license is plaintext claims; the SHA-256 hash of the contents
-    is signed with the vendor private key and verified here with the
-    embedded public key. PyJWT enforces exp/nbf; alg confusion is
-    impossible (algorithms is pinned). Returns (claims, '') or
-    (None, reason)."""
+    """RS256 verification against the TRUSTED keys + claim sanity: the
+    license is plaintext claims; the SHA-256 hash of the contents is
+    signed with the vendor private key and verified here with an
+    embedded public key. Key selection: the ``kid`` claim (sha16 of
+    the signing public key) picks the exact key — kid-less tokens
+    (v1, early v2) try keys newest-first. PyJWT enforces exp/nbf; alg
+    confusion is impossible (algorithms is pinned). Returns (claims,
+    '') or (None, reason)."""
+    # kid pre-pass (unverified header read — selection only, never trust)
+    kid: str | None = None
     try:
-        claims = jwt.decode(token, _PUBLIC_KEY_PEM, algorithms=["RS256"])
-    except jwt.ExpiredSignatureError:
-        return None, "license expired"
-    except jwt.InvalidTokenError as e:
-        return None, f"invalid license ({e.__class__.__name__})"
+        import base64 as _b64
+        h = token.split(".")[0]
+        kid = (json.loads(_b64.urlsafe_b64decode(h + "=="))
+               .get("kid") or None)
+    except Exception:                                      # noqa: BLE001
+        kid = None
+    candidates: list[str]
+    if kid:
+        candidates = [k for k in _TRUSTED_KEYS if key_id(k) == kid]
+        if not candidates:
+            return None, f"unknown signing key (kid {kid!r})"
+    else:
+        candidates = list(_TRUSTED_KEYS)
+    claims = None
+    last_err = "invalid license (InvalidTokenError)"
+    for pem in candidates:
+        try:
+            claims = jwt.decode(token, pem, algorithms=["RS256"])
+            break
+        except jwt.ExpiredSignatureError:
+            return None, "license expired"
+        except jwt.InvalidTokenError as e:
+            last_err = f"invalid license ({e.__class__.__name__})"
+            claims = None
+    if claims is None:
+        return None, last_err
     if claims.get("product") != PRODUCT:
         return None, "license is for a different product"
     if claims.get("edition") not in EDITIONS:
@@ -283,12 +352,25 @@ def bootstrap(*, edition: str = "community",
         _STATE = {"edition": edition, "mode": "licensed", "license": claims,
                   "source": source, "detail": "", "trial": None}
         logger.info(
-            "License: %s-edition license active (customer=%r vendor=%r "
-            "support=%s expires=%s)", claims.get("edition"),
-            claims.get("customer"), claims.get("vendor") or "-",
+            "License: %s-edition license active (serial=%s customer=%r "
+            "vendor=%r support=%s expires=%s)",
+            claims.get("edition"), claims.get("serial") or "-",
+            claims.get("business_name") or claims.get("customer"),
+            claims.get("vendor") or "-",
             bool(claims.get("support")),
             "perpetual" if exp is None
             else datetime.fromtimestamp(exp, tz=timezone.utc).isoformat())
+        # hot-reload watch: remember the FILE behind this license (env
+        # inline tokens have none — no hot reload for those)
+        lic_path = (license_path if license_path is not None
+                    else _resolved_license_path())
+        if lic_path is not None:
+            _STATE["path"] = str(lic_path)
+            try:
+                global _LICENSE_MTIME
+                _LICENSE_MTIME = lic_path.stat().st_mtime
+            except OSError:
+                pass
     elif edition == "enterprise":
         # enterprise binaries never trial — the entry point's boot gate
         # turns this state into a refusal to serve at all.
@@ -421,6 +503,118 @@ def provider_allowed(name: str, ptype: str) -> bool:
             and str(name) in [str(p) for p in providers])
 
 
+# ── scale caps (v2.2 — tiered deployments; absent claim = unlimited) ──────
+
+CAP_KINDS = ("keys", "instances", "teams", "gpus")
+
+
+def caps() -> dict[str, int]:
+    """ACTIVE scale caps from the license ``caps`` claim, normalized:
+    {"keys": 50, "instances": 4, ...}. Unmanaged/trial → {} (the full
+    product); invalid values drop (that cap = unlimited)."""
+    state = _STATE
+    if not state or state.get("mode") != "licensed":
+        return {}
+    raw = (state.get("license") or {}).get("caps")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for kind in CAP_KINDS:
+        try:
+            v = int(raw.get(kind))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out[kind] = v
+    return out
+
+
+def cap_allows(kind: str, current: int) -> tuple[bool, int | None]:
+    """(allowed, limit) for creating ONE more of ``kind`` given the
+    CURRENT count. No cap → (True, None). Trial/unmanaged → always
+    allowed (the full product)."""
+    limit = caps().get(kind)
+    if limit is None:
+        return True, None
+    return (int(current) < int(limit), limit)
+
+
+# ── expiry early-warning (30/7/1 days) ────────────────────────────────────
+
+def expiry_warning() -> dict[str, Any] | None:
+    """The current license-expiry warning level, or None. {"level":
+    30|7|1, "days_left": float} — surfaced by the app on level CHANGE
+    (event ring + log); the console banner rides /admin/license."""
+    state = _STATE
+    if not state or state.get("mode") != "licensed":
+        return None
+    exp = (state.get("license") or {}).get("exp")
+    if exp is None:
+        return None                     # perpetual
+    try:
+        days = (float(exp) - time.time()) / 86400.0
+    except (TypeError, ValueError):
+        return None
+    if days < 0:
+        return None                     # expired — the gate handles it
+    for level in (1, 7, 30):
+        if days <= level:
+            return {"level": level, "days_left": round(days, 1)}
+    return None
+
+
+# ── license hot-reload (drop-in renewal, no restart) ──────────────────────
+
+def maybe_reload_license() -> bool:
+    """Pick up a RENEWED license file in place (mtime watch). Swaps
+    the state ONLY when the new token verifies AND satisfies the
+    binary's edition requirement (an enterprise binary stays
+    enterprise-gated); a broken/partial file keeps the OLD state and
+    warns — a botched renewal must never make serving worse. Env-
+    inline licenses have no file: no-op. True when the state changed."""
+    global _STATE, _CACHE, _LICENSE_MTIME
+    state = _STATE
+    if not state or state.get("mode") != "licensed":
+        return False
+    path_raw = state.get("path")
+    if not path_raw:
+        return False                    # env-inline (no file)
+    p = Path(path_raw)
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return False
+    if mtime == _LICENSE_MTIME:
+        return False
+    old_state = dict(state)
+    edition = state.get("edition") or "community"
+    try:
+        new = bootstrap(edition=edition, license_path=p)
+    except Exception as e:                               # noqa: BLE001
+        logger.warning("License hot-reload failed (%s) — keeping the "
+                       "current license", e)
+        _STATE = old_state
+        _CACHE = None
+        _LICENSE_MTIME = mtime           # don't re-try until it changes
+        return False
+    ok = (new.get("mode") == "licensed"
+          and (edition != "enterprise"
+               or new.get("license_edition") == "enterprise"))
+    if not ok:
+        logger.warning("License hot-reload rejected (mode=%s "
+                       "license_edition=%s detail=%s) — keeping the "
+                       "current license", new.get("mode"),
+                       new.get("license_edition"), new.get("detail"))
+        _STATE = old_state
+        _CACHE = None
+        _LICENSE_MTIME = mtime           # don't re-try until it changes
+        return False
+    logger.info("License hot-reloaded (serial=%s expires=%s)",
+                (new.get("serial") or "-"),
+                new.get("expires_at") or "perpetual")
+    return True
+
+
 def status() -> dict[str, Any]:
     """Public licensing status (GET /admin/license). Claims are safe to
     surface here — the endpoint sits behind the admin pipeline + RBAC
@@ -435,10 +629,12 @@ def status() -> dict[str, Any]:
     providers = [str(p) for p in (lic.get("providers") or [])
                  if str(p).strip()]
     business = lic.get("business_name") or lic.get("customer")
+    warn = expiry_warning()
     return {
         "mode": state.get("mode"),
         "edition": state.get("edition"),
         "license_edition": lic.get("edition"),
+        "serial": lic.get("serial"),
         "business_name": business,
         "contract_email": lic.get("contract_email"),
         "customer": business,           # legacy alias
@@ -449,9 +645,14 @@ def status() -> dict[str, Any]:
         "providers": providers,
         "local_provider_types": sorted(LOCAL_PROVIDER_TYPES),
         "cloud_provider_types": sorted(CLOUD_PROVIDER_TYPES),
+        "caps": caps(),
+        "cap_kinds": list(CAP_KINDS),
         "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
         if exp is not None else None,
         "perpetual": bool(lic) and exp is None,
+        "days_left": (warn or {}).get("days_left")
+        if exp is not None else None,
+        "expiry_warning": (warn or {}).get("level") if warn else None,
         "node_locked": bool(lic.get("node")),
         "trial_days_left": trial.get("days_left"),
         "source": state.get("source"),
@@ -494,9 +695,11 @@ def enterprise_boot_gate(state: dict[str, Any] | None = None) -> None:
 
 def set_license_public_key(pem: str) -> None:
     """Swap the verification key (tests mint licenses with their OWN
-    throwaway keypair — the vendor private key never touches a test)."""
-    global _PUBLIC_KEY_PEM
+    throwaway keypair — the vendor private key never touches a test).
+    Replaces the whole trusted list with this one key."""
+    global _PUBLIC_KEY_PEM, _TRUSTED_KEYS
     _PUBLIC_KEY_PEM = pem
+    _TRUSTED_KEYS = [pem]
 
 
 def set_license_state(state: dict[str, Any] | None) -> None:
@@ -509,7 +712,9 @@ def set_license_state(state: dict[str, Any] | None) -> None:
 
 def reset_licensing() -> None:
     """Restore the embedded key + unmanaged state (test teardown)."""
-    global _PUBLIC_KEY_PEM, _STATE, _CACHE
+    global _PUBLIC_KEY_PEM, _TRUSTED_KEYS, _STATE, _CACHE, _LICENSE_MTIME
     _PUBLIC_KEY_PEM = _EMBEDDED_PUBLIC_KEY_PEM
+    _TRUSTED_KEYS = [_EMBEDDED_PUBLIC_KEY_PEM]
     _STATE = None
     _CACHE = None
+    _LICENSE_MTIME = None
