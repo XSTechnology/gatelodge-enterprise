@@ -93,7 +93,9 @@ FEATURE_CODES = ("tier_d", "scim", "session_budgets", "mcp", "teams")
 # Provider entitlement (v2.2): local compute is FREE; cloud provider
 # backends serve only under their per-backend license claim.
 LOCAL_PROVIDER_TYPES = frozenset({"embedded", "llama-server"})
-CLOUD_PROVIDER_TYPES = frozenset({"openai", "runpod", "runpod-public"})
+CLOUD_PROVIDER_TYPES = frozenset({"openai", "runpod", "runpod-public",
+                                  "anthropic", "gemini", "responses",
+                                  "azure", "vertex"})
 
 # The vendor's PUBLIC license-signing key (scripts/license_tool.py
 # keygen prints it; the private half never leaves vendor_keys/).
