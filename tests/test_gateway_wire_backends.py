@@ -428,3 +428,125 @@ def test_bedrock_mantle_sigv4_service_override():
     assert auth.service == "bedrock-mantle"
     assert auth.region == "us-east-1"
     cloud_mod.reset_clients()
+
+
+# ── azure (classic deployment-path API) + vertex (GCP Interactions) ──────
+
+def test_azure_client_construction(monkeypatch):
+    """Azure per-model client: deployment in the URL path, the resource
+    key on the api-key HEADER (Azure ignores the SDK Bearer), the
+    required api-version query param, per-deployment caching."""
+    import gateway.cloud as cloud_mod
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-key-123")
+    backend = {"resource": "myres", "api_key_env": "AZURE_OPENAI_API_KEY"}
+    client = cloud_mod.get_azure_client("az-t1", backend, "gpt4o-deploy")
+    base = str(client.base_url).rstrip("/")
+    assert base == ("https://myres.openai.azure.com/openai/deployments/"
+                    "gpt4o-deploy")
+    assert client.api_key == "azure"          # the header carries the real key
+    # default_headers/query land on the SDK's _custom_* maps (merged
+    # into each request) — not the raw httpx client headers
+    assert client._custom_headers.get("api-key") == "az-key-123"
+    assert dict(client._custom_query or {}).get("api-version") \
+        == cloud_mod.AZURE_API_VERSION_DEFAULT
+    # per-deployment cache: a second deployment gets its own client
+    c2 = cloud_mod.get_azure_client("az-t2", backend, "other-deploy")
+    assert str(c2.base_url).rstrip("/").endswith("other-deploy")
+    cloud_mod.reset_clients()
+
+
+def test_azure_backend_serves(wired, gguf, monkeypatch):
+    """End-to-end: an azure backend routes chat through the shared
+    openai execution path with the per-model deployment client."""
+    cfgd = _secured_config(gguf)
+    cfgd["backends"]["az"] = {
+        "type": "azure", "resource": "myres",
+        "api_key_env": "AZURE_OPENAI_API_KEY",
+        "models": {"gpt4o": "gpt4o-deploy"}}
+    wired(cfgd)
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-key-123")
+    _entitle(monkeypatch, "az")
+
+    # mock the openai SDK client the azure branch constructs
+    class _FakeCompletions:
+        async def create(self, **kwargs):
+            assert kwargs["model"] == "gpt4o-deploy"
+            return {"id": "chatcmpl-az", "object": "chat.completion",
+                    "model": kwargs["model"],
+                    "choices": [{"index": 0,
+                                 "message": {"role": "assistant",
+                                             "content": "AZURE OK"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+                              "total_tokens": 5}}
+    import gateway.cloud as cloud_mod
+    class _FakeClient:
+        chat = type("C", (), {"completions": _FakeCompletions()})()
+    monkeypatch.setattr(cloud_mod, "get_azure_client",
+                        lambda n, b, d, timeout=120: _FakeClient())
+    try:
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"},
+                            json={"model": "az:gpt4o", "max_tokens": 32,
+                                  "messages": [{"role": "user",
+                                                "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert r.json()["choices"][0]["message"]["content"] == "AZURE OK"
+            assert r.json()["usage"]["total_tokens"] == 5
+            # models listed (deployment-mapped)
+            r2 = client.get("/v1/models",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"})
+            assert "gpt4o" in [m["id"] for m in r2.json()["data"]]
+    finally:
+        reset_storage()
+        licensing.reset_licensing()
+        cloud_mod.reset_clients()
+
+
+def _vertex_config(gguf):
+    cfgd = _secured_config(gguf)
+    cfgd["backends"]["vg"] = {
+        "type": "vertex", "project": "acme-proj",
+        "api_key_env": "VERTEX_EXPRESS_KEY",
+        "models": {"flash": "gemini-3.8-flash"}}
+    return cfgd
+
+
+async def _fake_vertex(url, headers, payload, timeout, provider):
+    assert url == ("https://aiplatform.googleapis.com/v1beta1/projects/"
+                   "acme-proj/locations/global/interactions")
+    assert payload["model"] == "gemini-3.8-flash"
+    assert payload["store"] is False
+    assert headers["x-goog-api-key"] == "vx-key"   # express key path
+    return {"id": "int_v", "steps": [
+        {"type": "model_output",
+         "content": [{"type": "text", "text": "VERTEX OK"}]}],
+        "usage": {"prompt_tokens": 6, "completion_tokens": 2,
+                  "total_tokens": 8}}
+
+
+def test_vertex_backend_serves(wired, gguf, _mock_upstream, monkeypatch):
+    """Vertex Interactions: same payload as the gemini type, GCP URL +
+    project, express-key (x-goog-api-key) or ADC Bearer auth."""
+    wired(_vertex_config(gguf))
+    monkeypatch.setenv("VERTEX_EXPRESS_KEY", "vx-key")
+    _entitle(monkeypatch, "vg")
+    _mock_upstream(_fake_vertex)
+    try:
+        with TestClient(gw_app.app) as client:
+            r = client.post("/v1/chat/completions",
+                            headers={"Authorization":
+                                     "Bearer admin-secret"},
+                            json={"model": "vg:flash", "max_tokens": 32,
+                                  "messages": [{"role": "user",
+                                                "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert r.json()["choices"][0]["message"]["content"] \
+                == "VERTEX OK"
+            assert r.json()["usage"]["total_tokens"] == 8
+    finally:
+        reset_storage()
+        licensing.reset_licensing()

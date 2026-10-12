@@ -1549,9 +1549,10 @@ async def list_models() -> dict[str, Any]:
                     })
 
             elif btype in (OPENAI_BACKEND, "anthropic", "gemini",
-                           "responses"):
+                           "responses", "azure", "vertex"):
                 # Cloud backend (openai-compatible or the v2.3 wire
-                # translators — same shape: {name: remote_id})
+                # translators — same shape: {name: remote_id}; azure's
+                # remote_id is the DEPLOYMENT name)
                 remote_id = mcfg if isinstance(mcfg, str) else mcfg.get("name", mname)
                 _add({
                     "id": mname,
@@ -1849,7 +1850,7 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     # Cloud-shaped path: openai backends, REMOTE llama-server, and runpod
     # SERVERLESS all speak OpenAI over HTTP with a bearer key.
     remote_id = backend["models"][model_key]
-    if btype in ("anthropic", "gemini", "responses"):
+    if btype in ("anthropic", "gemini", "responses", "vertex"):
         # v2.3 wire-translator backends: OpenAI chat → the provider's
         # native wire format → OpenAI chat (gateway/wire.py). Same
         # budget/cost/logging posture as the openai path.
@@ -1861,6 +1862,11 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
                 cfg.queue["timeout_s"])
         elif btype == "gemini":
             d = await wire.gemini_chat(
+                backend, str(remote_id), body.messages,
+                body.temperature, body.max_tokens, body.tools,
+                cfg.queue["timeout_s"])
+        elif btype == "vertex":
+            d = await wire.vertex_chat(
                 backend, str(remote_id), body.messages,
                 body.temperature, body.max_tokens, body.tools,
                 cfg.queue["timeout_s"])
@@ -1896,8 +1902,17 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
     if btype == "openai":
         # monthly token budget (503 budget_exceeded when exhausted)
         await _token_budget_gate(cfg, backend_name)
-    client = cloud.get_cloud_client(client_name, cloud_backend,
-                                    timeout=client_timeout)
+    if btype == "azure":
+        # v2.3: Azure OpenAI — per-model client (the deployment lives
+        # in the URL path); the shared openai execution path below
+        # serves it (model in body = the deployment name).
+        await _token_budget_gate(cfg, backend_name)
+        client = cloud.get_azure_client(
+            f"azure-{backend_name}-{model_key}", backend,
+            str(remote_id), timeout=client_timeout)
+    else:
+        client = cloud.get_cloud_client(client_name, cloud_backend,
+                                        timeout=client_timeout)
     kwargs: dict[str, Any] = {
         "model": remote_id,  # remote model id
         "messages": body.messages,
@@ -1931,7 +1946,7 @@ async def _exec_entry(cfg, entry: tuple[str, str], body: ChatRequest,
          if hasattr(resp, "model_dump_json") else dict(resp))
     d["model"] = requested  # consistent echo; served_by carries the truth
     usage = d.get("usage") or {}
-    if btype == "openai":
+    if btype in ("openai", "azure"):
         cost = _cost_usd(cfg, backend_name, str(remote_id), usage)
         if cost is not None:
             d["cost_usd"] = round(cost, 6)  # estimate rides to the caller
@@ -2363,7 +2378,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
             usage = usage_out or _estimate_stream_usage(body, text_chars)
             cost = None
             if backend.get("type") in ("openai", "anthropic", "gemini",
-                                       "responses"):
+                                       "responses", "azure", "vertex"):
                 rid = str((backend.get("models") or {}).get(model_key) or "")
                 cost = _cost_usd(cfg, backend_name, rid, usage)
             _charge_request(cfg, backend_name, usage, cost)
@@ -2371,7 +2386,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                          cost_usd=cost)
 
         try:
-            if backend.get("type") in ("anthropic", "gemini", "responses"):
+            if backend.get("type") in ("anthropic", "gemini", "responses",
+                                       "vertex"):
                 # v2.3 wire-translator backends: complete fully, then
                 # emit ONE OpenAI-shaped chunk + [DONE] (valid streaming
                 # shape — every OpenAI client accepts single-chunk
@@ -2616,9 +2632,14 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                                       or cfg.queue["timeout_s"])
                 client = cloud.get_cloud_client(client_name, cloud_backend,
                                                 timeout=stream_timeout)
-                if backend.get("type") == "openai":
+                if backend.get("type") in ("openai", "azure"):
                     # monthly token budget — 503-shaped mid-stream event
                     await _token_budget_gate(cfg, backend_name)
+                if backend.get("type") == "azure":
+                    # per-model client (deployment in the URL path)
+                    client = cloud.get_azure_client(
+                        f"azure-{backend_name}-{model_key}", backend,
+                        str(remote_id), timeout=stream_timeout)
                 kwargs: dict[str, Any] = {
                     "model": remote_id,
                     "messages": body.messages, "stream": True,

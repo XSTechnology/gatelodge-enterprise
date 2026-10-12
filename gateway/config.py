@@ -129,7 +129,7 @@ RUNPOD_BACKEND = "runpod"
 RUNPOD_PUBLIC_BACKEND = "runpod-public"
 _BACKEND_TYPES = (EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
                   RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND,
-                  "anthropic", "gemini", "responses")
+                  "anthropic", "gemini", "responses", "azure", "vertex")
 
 # Out-of-the-box config: deliberately model-free — no baked-in models or
 # aliases. GGUFs in models_dir are auto-discovered (servable by stem);
@@ -481,6 +481,23 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                     or "https://api.openai.com/v1").strip().rstrip("/")
                 entry["api_key_env"] = str(
                     b.get("api_key_env") or "OPENAI_API_KEY").strip()
+            elif btype == "azure":
+                # Azure OpenAI (classic deployment-path API): resource +
+                # api_version + api-key header; models map our name →
+                # the DEPLOYMENT name (per-model clients, like runpod
+                # serverless — the deployment lives in the URL path).
+                entry["resource"] = str(b.get("resource") or "").strip()
+                entry["api_version"] = str(
+                    b.get("api_version") or "").strip()
+                entry["api_key_env"] = str(
+                    b.get("api_key_env")
+                    or "AZURE_OPENAI_API_KEY").strip()
+            elif btype == "vertex":
+                # Vertex AI Interactions (GCP): same payload as the
+                # gemini type; project + Bearer-ADC or express key.
+                entry["project"] = str(b.get("project") or "").strip()
+                entry["api_key_env"] = str(
+                    b.get("api_key_env") or "").strip()
             else:
                 entry["base_url"] = str(b.get("base_url") or "").strip()
                 entry["api_key_env"] = str(b.get("api_key_env") or "").strip()
