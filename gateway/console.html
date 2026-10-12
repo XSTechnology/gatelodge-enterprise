@@ -3428,6 +3428,66 @@ var _clVolMsg = null;    // {type:'ok'|'err', text} — volume manager result ba
 var _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
 var _clLifecycle = null; // /admin/lifecycle response — watchdog, budgets, rules, alerts
 
+// ---------- provider presets (v2.2.1 Tier-0) ----------
+// One-click console presets for OpenAI-COMPATIBLE inference providers:
+// adding = a config backend {type: openai, base_url, api_key_env} — the
+// existing `openai` backend type serves them all (zero backend code).
+// The operator sets the env var / OS keyring entry named api_key_env,
+// then pulls models via the cloud catalog. Each preset is also a
+// per-provider licensing lever: the backend serves only when its name
+// is in the license `providers` claim (see the License panel).
+var PROVIDER_PRESETS = [
+  {id: 'groq',      name: 'Groq',        base_url: 'https://api.groq.com/openai/v1',        api_key_env: 'GROQ_API_KEY'},
+  {id: 'together',  name: 'Together AI', base_url: 'https://api.together.xyz/v1',           api_key_env: 'TOGETHER_API_KEY'},
+  {id: 'fireworks', name: 'Fireworks',   base_url: 'https://api.fireworks.ai/inference/v1', api_key_env: 'FIREWORKS_API_KEY'},
+  {id: 'deepinfra', name: 'DeepInfra',   base_url: 'https://api.deepinfra.com/v1/openai',   api_key_env: 'DEEPINFRA_API_KEY'},
+  {id: 'novita',    name: 'Novita',      base_url: 'https://api.novita.ai/v3/openai',       api_key_env: 'NOVITA_API_KEY'},
+  {id: 'openrouter',name: 'OpenRouter',  base_url: 'https://openrouter.ai/api/v1',          api_key_env: 'OPENROUTER_API_KEY'},
+  {id: 'cerebras',  name: 'Cerebras',    base_url: 'https://api.cerebras.ai/v1',            api_key_env: 'CEREBRAS_API_KEY'},
+  {id: 'nebius',    name: 'Nebius',      base_url: 'https://api.studio.nebius.ai/v1',       api_key_env: 'NEBIUS_API_KEY'},
+  {id: 'mistral',   name: 'Mistral',     base_url: 'https://api.mistral.ai/v1',             api_key_env: 'MISTRAL_API_KEY'},
+  {id: 'sambanova', name: 'SambaNova',   base_url: 'https://api.sambanova.ai/v1',           api_key_env: 'SAMBANOVA_API_KEY'}
+];
+function buildProviderPresetsWidget(defs, lic) {
+  var existing = {};
+  (defs.backends || []).forEach(function (b) { existing[b.name] = true; });
+  var provs = (lic && lic.providers) || [];
+  var trialAll = lic && (lic.mode === 'trial' || lic.mode === 'unmanaged');
+  var html = '<div class="widget"><h3>⚡ Quick add — inference providers</h3>' +
+    '<div class="muted" style="margin-bottom:8px">OpenAI-compatible serverless providers — one click adds the backend; ' +
+    'set the API key (env var or OS keyring, service <code>Workshop</code>) then load models from the catalog below. ' +
+    'Cloud providers serve only when their name is in your license\'s providers claim.</div><div class="chips">';
+  PROVIDER_PRESETS.forEach(function (p) {
+    if (existing[p.id]) {
+      html += '<span class="chip"><b>' + esc(p.name) + '</b>' +
+        '<span class="badge ok">added</span></span>';
+    } else {
+      var ent = trialAll || provs.indexOf(p.id) >= 0;
+      html += '<span class="chip"><b>' + esc(p.name) + '</b>' +
+        '<span class="muted">' + esc(p.api_key_env) + '</span>' +
+        (ent ? '' : ' <span class="badge warn" title="add the name to the license providers claim to serve">license</span>') +
+        '<button onclick="addProviderPreset(\'' + esc(p.id) + '\')">add</button></span>';
+    }
+  });
+  html += '</div></div>';
+  return html;
+}
+function addProviderPreset(id) {
+  var p = null;
+  for (var i = 0; i < PROVIDER_PRESETS.length; i++)
+    if (PROVIDER_PRESETS[i].id === id) p = PROVIDER_PRESETS[i];
+  if (!p) return;
+  api('/admin/backends', {method: 'POST', body: {
+    name: p.id, backend_type: 'openai',
+    base_url: p.base_url, api_key_env: p.api_key_env}})
+    .then(function () {
+      notify('✓ ' + p.name + ' added — set ' + p.api_key_env +
+             ' (env/keyring), then load the catalog');
+      showPanel('cloud');
+    })
+    .catch(function (e) { notify('✗ ' + e.message, true); });
+}
+
 function showCloud(ui) {
   ui.title.textContent = '☁ Cloud';
   _clProvider = null;
@@ -3436,13 +3496,15 @@ function showCloud(ui) {
   _clVolMsg = null;
   _clVolForm = { name: '', dcId: '', sizeGb: 100, type: 'STANDARD' };
   _clLifecycle = null;
-  Promise.all([api('/admin/providers'), api('/admin/backends')]).then(function (r) {
-    var d = r[0], defs = r[1];
+  Promise.all([api('/admin/providers'), api('/admin/backends'),
+               api('/admin/license')]).then(function (r) {
+    var d = r[0], defs = r[1], lic = r[2];
     var ps = d.providers || [];
-    // v2.2 regroup: the CLOUD catalog (openai-type backends — HF
-    // router etc.) lives HERE, next to the deploy machinery; the
-    // Models panel stays local-lifecycle only.
+    // v2.2 regroup: presets (acquire) → the CLOUD catalog (openai-type
+    // backends — HF router etc.) → the provider panel (deploy
+    // machinery). The Models panel stays local-lifecycle only.
     var html = '<div id="cl-alerts"></div>' +
+      buildProviderPresetsWidget(defs, lic) +
       buildCloudCatalogWidget(defs) +
       '<div class="widget"><h3>Provider</h3>' +
       '<div class="srow"><label for="cl-provider">Cloud provider</label>' +
