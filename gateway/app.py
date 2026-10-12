@@ -144,8 +144,9 @@ from .auth import (AuthPipeline, get_auth_pipeline, set_auth_pipeline,
                    _REQUEST_KEY_ID, _REQUEST_ID, _REQUEST_SESSION_ID,
                    _REQUEST_TEAM, _resolve_bearer, _sha256_hex,
                    apply_url_token_forms, session_id_from_header)
-from .config import (PROJECT_ROOT, GatewayConfigError, default_config_raw,
-                     get_gateway_config,
+from .config import (PROJECT_ROOT, GatewayConfigError,
+                     ProviderNotLicensedError, default_config_raw,
+                     get_gateway_config, set_backend_filter,
                      EMBEDDED_BACKEND, OPENAI_BACKEND, LLAMA_SERVER_BACKEND,
                      RUNPOD_BACKEND, RUNPOD_PUBLIC_BACKEND)
 from .models import (EmbeddedEngine, EmbeddedLLMError, detect_gpus,
@@ -428,6 +429,47 @@ async def _configure_tracing() -> None:
 
 
 @app.on_event("startup")
+async def _install_provider_gate() -> None:
+    """v2.2 provider entitlement: install licensing.provider_allowed
+    as the config backend filter (cloud backends serve only under
+    their per-backend license claim) and surface the unlicensed set
+    in the log at boot. Idempotent; inert when unlicensed backends
+    don't exist."""
+    set_backend_filter(licensing.provider_allowed)
+    cfg = get_gateway_config()
+    _log_unlicensed_backends(cfg)
+
+
+def _unlicensed_backends(cfg) -> list[str]:
+    """Cloud backends the current license does NOT entitle (sorted)."""
+    try:
+        out = [name for name, b in (cfg.backends or {}).items()
+               if not licensing.provider_allowed(
+                   name, b.get("type") or "")]
+        return sorted(out)
+    except Exception:                                      # noqa: BLE001
+        return []
+
+
+_UNLICENSED_SEEN: list[str] | None = None
+
+
+def _log_unlicensed_backends(cfg) -> None:
+    """Warn ONCE per set-change (boot + hot-reload) — not per request."""
+    global _UNLICENSED_SEEN
+    current = _unlicensed_backends(cfg)
+    if current != _UNLICENSED_SEEN:
+        _UNLICENSED_SEEN = current
+        if current:
+            logger.warning(
+                "license: %d cloud backend(s) NOT entitled and dropped "
+                "from serving — add their names to the license providers "
+                "claim: %s (local backends embedded/llama-server are "
+                "always allowed)", len(current), ", ".join(current))
+    return
+
+
+@app.on_event("startup")
 async def _start_lifecycle_watchdog() -> None:
     """v3: the pod lifecycle watchdog runs from BOOT, not lazily from
     request paths — no traffic must never mean no protection (a
@@ -634,7 +676,11 @@ def _rid_response(resp: Response, rid: str) -> Response:
 @app.middleware("http")
 async def _bearer_auth(request: Request, call_next):
     cfg = get_gateway_config()
-    cfg.maybe_reload()
+    if cfg.maybe_reload():
+        # hot-reload: re-surface the unlicensed-backend set (the
+        # resolve_chain filter reads the licensing state live — this
+        # only refreshes the boot-time warning)
+        _log_unlicensed_backends(cfg)
     # URL-token auth (v2.x): /<token>/v1/... → canonical /v1/... with
     # the token riding _REQUEST_URL_TOKEN into the auth pipeline
     # (query form ?key= is read inside resolve_key_link). Runs BEFORE
@@ -1974,6 +2020,13 @@ async def chat_completions(body: ChatRequest) -> Response:
     requested = body.model.strip() or cfg.default_alias
     try:
         plan = cfg.resolve_chain(requested)
+    except ProviderNotLicensedError as e:
+        # v2.2: found, but its backend is not license-entitled — no
+        # fallback (the model exists; the entitlement doesn't)
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 403,
+                     err="license")
+        return _error(403, str(e), code="license_providers")
     except GatewayConfigError as e:
         # Smart route? (aliases and backend models always win)
         plan = _smart_route_fallback(cfg, requested)
@@ -2543,6 +2596,11 @@ async def embeddings(body: EmbeddingRequest) -> Response:
 
     try:
         backend_name, model_key = cfg.resolve_embedding(requested)
+    except ProviderNotLicensedError as e:
+        _log_request(requested, "", False,
+                     int((time.perf_counter() - t0) * 1000), {}, 403,
+                     err="license")
+        return _error(403, str(e), code="license_providers")
     except GatewayConfigError as e:
         _log_request(requested, "", False,
                      int((time.perf_counter() - t0) * 1000), {}, 400)
@@ -2641,6 +2699,11 @@ async def legacy_completions(body: CompletionRequest) -> Response:
     requested = body.model.strip() or cfg.default_alias
     try:
         plan = cfg.resolve_chain(requested)
+    except ProviderNotLicensedError as e:
+        _log_request(requested, "", body.stream,
+                     int((time.perf_counter() - t0) * 1000), {}, 403,
+                     err="license")
+        return _error(403, str(e), code="license_providers")
     except GatewayConfigError as e:
         plan = _smart_route_fallback(cfg, requested)
         if (plan is None and requested
@@ -2959,6 +3022,9 @@ async def images_generations(request: Request) -> Response:
     cfg.maybe_reload()
     try:
         plan = cfg.resolve_chain(requested)
+    except ProviderNotLicensedError as e:
+        _log_request(requested, "", False, 0, {}, 403, err="license")
+        return _error(403, str(e), code="license_providers")
     except GatewayConfigError as e:
         _log_request(requested, "", False, 0, {}, 400)
         return _error(400, str(e), param="model", code="model_not_found")
@@ -3299,6 +3365,9 @@ async def _exec_chat_internal(cfg, model: str, messages: list,
     plan = None
     try:
         plan = cfg.resolve_chain(model)
+    except ProviderNotLicensedError:
+        raise                    # license state is not a model problem —
+                                 # propagate to the calling surface
     except GatewayConfigError:
         plan = _smart_route_fallback(cfg, model)
     if plan is None:
@@ -3433,6 +3502,9 @@ async def create_batch(request: Request) -> Response:
     plan = None
     try:
         plan = cfg.resolve_chain(model)
+    except ProviderNotLicensedError as e:
+        _log_request(model, "", False, 0, {}, 403, err="license")
+        return _error(403, str(e), code="license_providers")
     except GatewayConfigError:
         plan = _smart_route_fallback(cfg, model)
     if plan is None:
@@ -4888,9 +4960,12 @@ async def admin_backends() -> Response:
     cloud/runpod backends carry only the env-var NAME (api_key_env)."""
     cfg = get_gateway_config()
     cfg.maybe_reload()
+    unlicensed = set(_unlicensed_backends(cfg))
     out = []
     for name, b in cfg.backends.items():
         entry: dict[str, Any] = {"name": name, "type": b.get("type")}
+        # v2.2 provider entitlement — the console greys these out
+        entry["licensed"] = name not in unlicensed
         if b.get("type") == "embedded":
             entry["models"] = b.get("models") or {}
             entry["embedding_models"] = b.get("embedding_models") or {}
