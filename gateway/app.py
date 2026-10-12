@@ -159,7 +159,7 @@ from .storage import NamespaceDict, NamespaceSet, get_storage, reset_storage
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Gatelodge", version="2.2.0")
+app = FastAPI(title="Gatelodge", version="2.2.1")
 
 # ── extra-router seam — the fourth enterprise extension point ──────────────
 # Mount an additional APIRouter (enterprise: SCIM, later the MCP
