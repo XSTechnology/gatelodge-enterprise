@@ -165,7 +165,7 @@ def test_kid_rotation_two_trusted_keys():
 
 def test_expiry_warning_levels():
     for days, level in ((40, None), (29, 30), (20, 30), (6, 7),
-                        (0.5, 1), (-1, None)):
+                        (0.5, 1), (-1, 0), (-4, None)):
         state = {"mode": "licensed", "edition": "community",
                  "license": {"exp": int(time.time() + days * 86400)},
                  "source": "file", "detail": "", "trial": None}
@@ -175,6 +175,14 @@ def test_expiry_warning_levels():
             assert w is None, days
         else:
             assert w and w["level"] == level, (days, w)
+    # -1 day is INSIDE the default 72h grace → level 0 (grace: True)
+    licensing.set_license_state({"mode": "licensed", "edition": "community",
+                                 "license": {"exp": int(time.time() - 86400)},
+                                 "source": "file", "detail": "",
+                                 "trial": None})
+    w = licensing.expiry_warning()
+    assert w and w["level"] == 0 and w["grace"] is True
+    assert 47 < w["hours_left"] <= 71
     # perpetual: no warning
     licensing.set_license_state({"mode": "licensed", "edition": "community",
                                  "license": {}, "source": "file",
@@ -307,3 +315,185 @@ def test_admin_load_instances_cap(wired, gguf):
             assert r.status_code == 403, r.text
             assert r.json()["error"]["code"] == "license_caps"
     _with_fake_llama(fn)
+
+
+# ── expiry grace window (#7) ───────────────────────────────────────────────
+
+def _licensed_state(exp_ts):
+    return {"mode": "licensed", "edition": "enterprise",
+            "license": {"serial": "GL-GRACE0000001",
+                        "exp": exp_ts},
+            "source": "file", "detail": "", "trial": None}
+
+
+def test_grace_window_serves_and_warns():
+    """Expired INSIDE the default 72h window: serving continues (mode
+    'grace'), the warning escalates to level 0, status/healthz carry
+    the hours left."""
+    exp = int(time.time()) - 600              # expired 10 minutes ago
+    licensing.set_license_state(_licensed_state(exp))
+    ok, mode = licensing.request_allowed()
+    assert ok and mode == "grace"
+    w = licensing.expiry_warning()
+    assert w and w["level"] == 0 and w["grace"] is True
+    assert 71 < w["hours_left"] <= 72
+    st = licensing.status()
+    assert st["grace"]["grace_hours"] == 72
+    assert st["grace_hours"] == 72            # absent claim → default
+    assert st["expiry_warning"] == 0
+    hz = licensing.healthz_license()
+    assert hz["grace_hours_left"] == w["hours_left"]
+
+
+def test_grace_disabled_and_custom_window():
+    """grace_hours=0 = hard stop at exp; a custom window bounds the
+    soft period."""
+    # disabled
+    s = _licensed_state(int(time.time()) - 60)
+    s["license"]["grace_hours"] = 0
+    licensing.set_license_state(s)
+    ok, mode = licensing.request_allowed()
+    assert not ok and mode == "expired"
+    assert licensing.expiry_warning() is None
+    # custom 1h window: inside serves, beyond stops
+    s2 = _licensed_state(int(time.time()) - 1800)     # 30 min ago
+    s2["license"]["grace_hours"] = 1
+    licensing.set_license_state(s2)
+    ok, mode = licensing.request_allowed()
+    assert ok and mode == "grace"
+    s3 = _licensed_state(int(time.time()) - 7200)     # 2h ago
+    s3["license"]["grace_hours"] = 1
+    licensing.set_license_state(s3)
+    ok, mode = licensing.request_allowed()
+    assert not ok and mode == "expired"
+    # pre-expiry is untouched by grace config
+    s4 = _licensed_state(int(time.time()) + 5 * 86400)
+    licensing.set_license_state(s4)
+    ok, mode = licensing.request_allowed()
+    assert ok and mode == "licensed"
+
+
+# ── signed revocation list (#6) ────────────────────────────────────────────
+
+def _mint_crl(priv, pub, revoked, version=1):
+    return jwt.encode({"crl": True, "revoked": list(revoked),
+                       "version": version, "iat": int(time.time())},
+                      priv, algorithm="RS256",
+                      headers={"kid": key_id(pub)})
+
+
+def _write_crl(path, token):
+    path.write_text(json.dumps({"crl": token}), encoding="utf-8")
+
+
+def test_crl_revoked_at_bootstrap(tmp_path, monkeypatch):
+    """A serial on the CRL never installs as licensed — community
+    flips to revoked mode, enterprise boot gate refuses."""
+    priv, pub = _keypair()
+    crl = tmp_path / "revocations.json"
+    _write_crl(crl, _mint_crl(priv, pub, ["GL-GRACE0000001"]))
+    monkeypatch.setattr(licensing, "_crl_path", lambda: crl)
+    licensing.set_license_public_key(pub)
+    lic = tmp_path / "license.json"
+    lic.write_text(json.dumps({"license": _mint(
+        priv, pub, serial="GL-GRACE0000001")}), encoding="utf-8")
+    st = licensing.bootstrap(edition="enterprise", license_path=lic)
+    assert st["mode"] == "revoked"
+    assert "revoked" in (st["detail"] or "")
+    ok, mode = licensing.request_allowed()
+    assert not ok and mode == "revoked"
+
+
+def test_crl_runtime_flip(tmp_path, monkeypatch):
+    """A CRL dropped in place revokes a RUNNING license (mtime watch
+    → immediate flip, no restart)."""
+    priv, pub = _keypair()
+    licensing.set_license_public_key(pub)
+    lic = tmp_path / "license.json"
+    _activate_file(lic, priv, pub)           # licensed, serial GL-…
+    crl = tmp_path / "revocations.json"
+    monkeypatch.setattr(licensing, "_crl_path", lambda: crl)
+    assert licensing.maybe_reload_crl() is False    # no file yet
+    ok, _ = licensing.request_allowed()
+    assert ok
+    serial = licensing.status()["serial"]
+    _write_crl(crl, _mint_crl(priv, pub, [serial]))
+    assert licensing.maybe_reload_crl() is True
+    ok, mode = licensing.request_allowed()
+    assert not ok and mode == "revoked"
+
+
+def test_crl_non_revoked_and_broken_files(tmp_path, monkeypatch):
+    """Other serials serve on; corrupt/unsigned CRLs are IGNORED
+    (fail-open for the file — never brick serving on a bad CRL)."""
+    priv, pub = _keypair()
+    licensing.set_license_public_key(pub)
+    lic = tmp_path / "license.json"
+    _activate_file(lic, priv, pub)
+    crl = tmp_path / "revocations.json"
+    monkeypatch.setattr(licensing, "_crl_path", lambda: crl)
+
+    # a DIFFERENT serial revoked — active license unaffected
+    _write_crl(crl, _mint_crl(priv, pub, ["GL-SOMEONEELSE1"]))
+    assert licensing.maybe_reload_crl() is True
+    ok, mode = licensing.request_allowed()
+    assert ok and mode == "licensed"
+
+    # corrupt file → ignored, prior CRL stays (deleting can't un-revoke)
+    crl.write_text(json.dumps({"crl": "not-a-jwt"}), encoding="utf-8")
+    time.sleep(0.02)
+    assert licensing.maybe_reload_crl() is False
+    assert ok
+
+    # UNSIGNED CRL (wrong key) → ignored
+    priv2, pub2 = _keypair()
+    _write_crl(crl, _mint_crl(priv2, pub2, [
+        licensing.status()["serial"]]))
+    time.sleep(0.02)
+    assert licensing.maybe_reload_crl() is False
+    ok, mode = licensing.request_allowed()
+    assert ok and mode == "licensed"
+
+
+def test_tool_revoke_and_grace_options(tmp_path, monkeypatch):
+    """license_tool revoke appends + bumps the CRL version + ledgers
+    it; issue --grace-hours stamps the claim."""
+    import license_tool as tool
+    priv, pub = _keypair()
+    keyfile = tmp_path / "signing.pem"
+    keyfile.write_text(priv, encoding="ascii")
+    monkeypatch.setattr(tool, "KEY_PATH", keyfile)
+    monkeypatch.setattr(tool, "LEDGER_PATH", tmp_path / "ledger.jsonl")
+    crl = tmp_path / "revocations.json"
+
+    rc = tool.main(["revoke", "--serial", "GL-AAA111111111",
+                    "--out", str(crl)])
+    assert rc == 0
+    rc = tool.main(["revoke", "--serial", "GL-BBB222222222",
+                    "--out", str(crl)])
+    assert rc == 0
+    token = json.loads(crl.read_text())["crl"]
+    claims = jwt.decode(token, pub, algorithms=["RS256"])
+    assert claims["revoked"] == ["GL-AAA111111111", "GL-BBB222222222"]
+    assert claims["version"] == 2
+    # idempotent re-revoke
+    rc = tool.main(["revoke", "--serial", "GL-AAA111111111",
+                    "--out", str(crl)])
+    assert rc == 0
+    assert jwt.decode(json.loads(crl.read_text())["crl"],
+                      pub, algorithms=["RS256"])["version"] == 2
+
+    # grace-hours stamping
+    out = tmp_path / "lic.json"
+    rc = tool.main(["issue", "--edition", "enterprise",
+                    "--business-name", "X", "--duration", "1y",
+                    "--grace-hours", "0", "--out", str(out)])
+    assert rc == 0
+    c1 = jwt.decode(json.loads(out.read_text())["license"],
+                    pub, algorithms=["RS256"])
+    assert c1["grace_hours"] == 0
+    # ledger carries the revocations
+    lines = (tmp_path / "ledger.jsonl").read_text().strip().splitlines()
+    revoked_entries = [json.loads(l) for l in lines if "revoked" in l]
+    assert len(revoked_entries) == 2
+    assert revoked_entries[0]["revoked"] == "GL-AAA111111111"

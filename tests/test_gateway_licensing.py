@@ -151,7 +151,7 @@ def test_invalid_signature_falls_to_trial(keypair, tmp_path):
                              trial_days=30, now=NOW)
     assert st["mode"] == "trial"
     assert st["trial_days_left"] == 30
-    assert "invalid license" in (st["detail"] or "")
+    assert "invalid token" in (st["detail"] or "")
     assert licensing.allows("sso") is False
 
 
@@ -283,10 +283,21 @@ def test_enterprise_boot_gate(keypair, tmp_path):
 # ── runtime re-evaluation + middleware enforcement ─────────────────────────
 
 def test_request_allowed_license_expires_midrun():
+    # v2.2 grace: expired 5s ago is INSIDE the default 72h window —
+    # serving continues under mode "grace"
     licensing.set_license_state({
         "mode": "licensed", "edition": "community",
         "license": {"exp": int((datetime.now(timezone.utc)
                                 - timedelta(seconds=5)).timestamp())},
+        "trial": None})
+    ok, mode = licensing.request_allowed()
+    assert ok is True and mode == "grace"
+    # grace disabled → the hard stop at exp is back
+    licensing.set_license_state({
+        "mode": "licensed", "edition": "community",
+        "license": {"exp": int((datetime.now(timezone.utc)
+                                - timedelta(seconds=5)).timestamp()),
+                    "grace_hours": 0},
         "trial": None})
     ok, mode = licensing.request_allowed()
     assert ok is False and mode == "expired"

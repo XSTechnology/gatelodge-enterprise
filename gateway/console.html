@@ -420,13 +420,18 @@ function licenseHtml(L, defs) {
       (L.support ? ' · <span class="badge ok">vendor support</span>' : '') + '</div>';
   if (mode === 'unmanaged')
     html += '<div class="muted" style="margin-top:6px">Running from source — no license state installed. Compiled binaries enforce the trial/license gate at boot.</div>';
-  // expiry + renewal
+  // expiry + renewal (level 0 = inside the post-expiry grace window)
   if (L.expires_at) {
-    var warnCls = L.expiry_warning === 1 ? 'err' : (L.expiry_warning ? 'warn' : 'ok');
+    var w = L.expiry_warning;
+    var warnCls = (w === 0 || w === 1) ? 'err' : (w ? 'warn' : 'ok');
     html += '<div class="kv" style="margin-top:6px"><span class="badge ' + warnCls + '">expires ' +
       esc(L.expires_at) + '</span> ' +
       (L.days_left != null ? esc(String(L.days_left)) + ' day(s) left' : '') + '</div>';
-    if (L.expiry_warning)
+    if (w === 0 || (L.grace && L.grace.hours_left != null))
+      html += '<div class="dw-msg err" style="margin-top:8px"><b>EXPIRED — grace window</b> · ' +
+        esc(String((L.grace || {}).hours_left != null ? L.grace.hours_left : '?')) +
+        ' hour(s) of serving left. Renew and drop the new data/license.json in place — it hot-reloads.</div>';
+    else if (w)
       html += '<div class="dw-msg err" style="margin-top:8px"><b>Renew soon</b> — drop the new ' +
         'data/license.json in place; the gateway hot-reloads it (no restart).</div>';
   } else if (mode === 'licensed') {

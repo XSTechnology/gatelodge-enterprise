@@ -694,31 +694,57 @@ def _rid_response(resp: Response, rid: str) -> Response:
 
 
 _EXPIRY_LEVEL_SEEN: int | None = None
+_REVOKED_SEEN: bool = False
 
 
 def _license_watch() -> None:
     """Per-request license watch (cheap): hot-reload a renewed license
-    file in place, then surface expiry warnings on level CHANGE (30→7→1
-    days) — event ring + log once per crossing, not per request."""
-    global _EXPIRY_LEVEL_SEEN
+    file + the revocation list in place, then surface expiry/grace/
+    revocation on level CHANGE — event ring + log once per crossing,
+    not per request."""
+    global _EXPIRY_LEVEL_SEEN, _REVOKED_SEEN
     if licensing.maybe_reload_license():
         # entitlements may have changed with the renewal — re-surface
         _log_unlicensed_backends(get_gateway_config())
+    if licensing.maybe_reload_crl():
+        st = licensing.status()
+        if st.get("mode") == "revoked" and not _REVOKED_SEEN:
+            _REVOKED_SEEN = True
+            msg = ("license REVOKED by the vendor's revocation list "
+                   f"(serial {st.get('serial')}) — serving disabled")
+            logger.error("License: %s", msg)
+            try:
+                _event_ring().push({
+                    "ts": datetime.now().isoformat(),
+                    "event": "license_revoked",
+                    "serial": st.get("serial"),
+                    "message": msg})
+            except Exception:                              # noqa: BLE001
+                pass
+        if st.get("mode") != "revoked":
+            _REVOKED_SEEN = False
     warn = licensing.expiry_warning()
     level = (warn or {}).get("level")
     if level != _EXPIRY_LEVEL_SEEN:
         _EXPIRY_LEVEL_SEEN = level
         if warn is not None:
-            msg = (f"license expires in {warn['days_left']} day(s) "
-                   f"(level {level}) — renew and drop the new "
-                   "data/license.json in place (hot-reloads, no "
-                   "restart needed)")
+            if warn.get("grace"):
+                msg = (f"license EXPIRED — grace window: "
+                       f"{warn['hours_left']} hour(s) of serving left; "
+                       "renew and drop the new data/license.json in "
+                       "place (hot-reloads, no restart)")
+            else:
+                msg = (f"license expires in {warn['days_left']} day(s) "
+                       f"(level {level}) — renew and drop the new "
+                       "data/license.json in place (hot-reloads, no "
+                       "restart needed)")
             logger.warning("License: %s", msg)
             try:
                 _event_ring().push({"ts": datetime.now().isoformat(),
                                     "event": "license_expiry_warning",
                                     "level": level,
-                                    "days_left": warn["days_left"],
+                                    "days_left": warn.get("days_left"),
+                                    "hours_left": warn.get("hours_left"),
                                     "message": msg})
             except Exception:                              # noqa: BLE001
                 pass
