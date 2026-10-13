@@ -1,0 +1,286 @@
+"""Gatelodge licensing service — trial download + (phase 2) paid-key issuance.
+
+Endpoints:
+  GET  /healthz               — liveness
+  GET  /api/config            — public config for the site (payment link etc.)
+  POST /api/trial-request     — email capture (Turnstile-verified) -> lead
+                                record -> download grant
+  GET  /download/community    — streams the community binary (rate limited)
+  POST /api/stripe/webhook    — phase 2: payment -> perpetual license key
+                                (activates when STRIPE_WEBHOOK_SECRET set)
+
+Env:
+  TURNSTILE_SECRET     — Cloudflare Turnstile secret key (unset = dev mode,
+                         verification skipped with a warning)
+  ALLOWED_ORIGINS      — comma-separated CORS origins
+  BINARY_PATH          — path to the community .exe served for download
+  DATA_DIR             — writable dir for the sqlite lead store
+  PAYMENT_LINK         — Stripe payment-link URL shown by the site ("" = none)
+  STRIPE_WEBHOOK_SECRET— Stripe signing secret (phase 2; unset = 503)
+  LICENSE_PRIVATE_KEY  — path to the RS256 private key PEM (phase 2)
+  PORT                 — default 8100
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import time
+from pathlib import Path
+
+import httpx
+import jwt
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+
+# ── config ────────────────────────────────────────────────────────────────
+
+TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")
+ALLOWED_ORIGINS = [o.strip() for o in
+                   os.environ.get("ALLOWED_ORIGINS",
+                                  "https://datagatelodge.com").split(",")
+                   if o.strip()]
+BINARY_PATH = os.environ.get("BINARY_PATH", "")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+PAYMENT_LINK = os.environ.get("PAYMENT_LINK", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+LICENSE_PRIVATE_KEY = os.environ.get("LICENSE_PRIVATE_KEY", "")
+PORT = int(os.environ.get("PORT", "8100"))
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB = DATA_DIR / "leads.db"
+
+ALL_CLOUD_PROVIDERS = ["openai", "anthropic", "gemini", "responses",
+                       "azure", "vertex", "bedrock", "runpod",
+                       "runpod-public"]
+
+app = FastAPI(title="Gatelodge Licensing", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# ── lead store (sqlite; phase 3 migrates to Postgres) ─────────────────────
+
+
+def db() -> sqlite3.Connection:
+    c = sqlite3.connect(DB)
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
+
+
+def init_db() -> None:
+    with db() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            business_name TEXT DEFAULT '',
+            serial TEXT DEFAULT '',
+            edition TEXT DEFAULT 'community-trial',
+            source TEXT DEFAULT 'website',
+            ip TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            serial TEXT UNIQUE NOT NULL,
+            email TEXT NOT NULL,
+            edition TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            stripe_event TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+
+
+init_db()
+
+# ── naive rate limiting (per-IP, in-memory; fronted by Cloudflare anyway) ─
+
+_HITS: dict[str, list[float]] = {}
+
+
+def rate_ok(ip: str, limit: int, window_s: int = 3600) -> bool:
+    now = time.time()
+    hits = [t for t in _HITS.get(ip, []) if now - t < window_s]
+    if len(hits) >= limit:
+        _HITS[ip] = hits
+        return False
+    hits.append(now)
+    _HITS[ip] = hits
+    return True
+
+
+def client_ip(request: Request) -> str:
+    return (request.headers.get("cf-connecting-ip")
+            or request.client.host if request.client else "?")
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# ── turnstile ─────────────────────────────────────────────────────────────
+
+
+async def turnstile_ok(token: str, ip: str) -> bool:
+    if not TURNSTILE_SECRET:
+        print("WARNING: TURNSTILE_SECRET unset — verification SKIPPED "
+              "(dev mode)")
+        return True
+    try:
+        r = await _client().post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={"secret": TURNSTILE_SECRET, "response": token,
+                  "remoteip": ip})
+        return bool(r.json().get("success"))
+    except Exception:
+        return False
+
+
+def _client() -> httpx.AsyncClient:
+    # lazy per-request client (module-level client blocks test teardown)
+    return httpx.AsyncClient(timeout=15)
+
+
+# ── endpoints ─────────────────────────────────────────────────────────────
+
+
+class TrialRequest(BaseModel):
+    email: str = ""
+    business_name: str = ""
+    turnstile_token: str = ""
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "service": "gatelodge-licensing"}
+
+
+@app.get("/api/config")
+async def config():
+    return {"payment_link": PAYMENT_LINK,
+            "turnstile_sitekey": os.environ.get("TURNSTILE_SITEKEY", "")}
+
+
+@app.post("/api/trial-request")
+async def trial_request(body: TrialRequest, request: Request):
+    ip = client_ip(request)
+    if not rate_ok(ip, limit=5):
+        raise HTTPException(429, "too many requests — try again later")
+    email = body.email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "a valid email address is required")
+    if not await turnstile_ok(body.turnstile_token, ip):
+        raise HTTPException(403, "verification failed — please retry")
+
+    with db() as c:
+        c.execute("INSERT INTO leads (email, business_name, ip) "
+                  "VALUES (?, ?, ?)",
+                  (email, body.business_name.strip()[:120], ip))
+    return {
+        "ok": True,
+        "download": "/download/community",
+        "note": ("The Community binary runs a full-feature 30-day trial "
+                 "from first boot — no license file needed."),
+    }
+
+
+@app.get("/download/community")
+async def download_community(request: Request):
+    ip = client_ip(request)
+    if not rate_ok(ip, limit=10):
+        raise HTTPException(429, "too many downloads — try again later")
+    if not BINARY_PATH or not os.path.exists(BINARY_PATH):
+        raise HTTPException(404, "binary not configured")
+    return FileResponse(
+        BINARY_PATH,
+        media_type="application/octet-stream",
+        filename="gatelodge-community.exe",
+    )
+
+
+# ── phase 2: stripe webhook -> perpetual community license key ────────────
+
+
+def issue_paid_key(email: str, stripe_event: str = "") -> dict:
+    """Mint a perpetual community License Key (all cloud providers named).
+
+    Claims mirror scripts/license_tool.py: RS256, kid = sha16 of the public
+    key DER. Requires LICENSE_PRIVATE_KEY."""
+    if not LICENSE_PRIVATE_KEY or not os.path.exists(LICENSE_PRIVATE_KEY):
+        raise HTTPException(503, "license issuance not configured")
+    import hashlib
+    import secrets
+
+    from cryptography.hazmat.primitives import serialization
+
+    with open(LICENSE_PRIVATE_KEY, "rb") as f:
+        priv = serialization.load_pem_private_key(f.read(), password=None)
+    pub_der = priv.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo)
+    kid = hashlib.sha256(pub_der).hexdigest()[:16]
+
+    now = int(time.time())
+    serial = "GL-" + secrets.token_hex(6).upper()
+    claims = {
+        "product": "gatelodge",
+        "edition": "community",
+        "serial": serial,
+        "business_name": "",
+        "contract_email": email,
+        "vendor": "-",
+        "support": False,
+        "providers": ALL_CLOUD_PROVIDERS,
+        "grace_hours": 0,
+        "iat": now,
+        "nbf": now,
+        "exp": now + 100 * 365 * 24 * 3600,   # effectively perpetual
+    }
+    token = jwt.encode(claims, priv, algorithm="RS256",
+                       headers={"kid": kid})
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO licenses "
+                  "(serial, email, edition, kind, stripe_event) "
+                  "VALUES (?, ?, 'community', 'paid-key', ?)",
+                  (serial, email, stripe_event))
+    return {"serial": serial, "license_json": json.dumps(
+        {"license": token}, indent=2)}
+
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(503, "stripe not configured")
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    # verify signature (Stripe's t=...,v1=... scheme)
+    import hashlib
+    import hmac
+    try:
+        parts = dict(p.split("=", 1) for p in sig.split(","))
+        t, v1 = parts["t"], parts["v1"]
+    except Exception:
+        raise HTTPException(400, "bad signature header")
+    signed = f"{t}.".encode() + payload
+    expect = hmac.new(STRIPE_WEBHOOK_SECRET.encode(), signed,
+                      hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, v1):
+        raise HTTPException(400, "signature mismatch")
+
+    event = json.loads(payload)
+    if event.get("type") == "checkout.session.completed":
+        session = event.get("data", {}).get("object", {})
+        email = (session.get("customer_details") or {}).get("email", "")
+        if email:
+            return issue_paid_key(email, event.get("id", ""))
+    return {"received": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
