@@ -82,9 +82,10 @@ def build(edition: str, debug: bool) -> int:
            "--include-package=keyring.backends",
            # Windows version metadata
            # Windows version metadata — company/product split:
-           # CompanyName = the vendor (Data Gatelodge); ProductName =
+           # CompanyName = the legal vendor (XS Technologies Inc. —
+           # DataGateLodge is a division); ProductName =
            # the product (Gatelodge <edition>).
-           f"--company-name=Data Gatelodge",
+           f"--company-name=XS Technologies Inc.",
            f"--product-name=Gatelodge {edition.title()}",
            f"--product-version={version}",
            f"--file-version={version}",
