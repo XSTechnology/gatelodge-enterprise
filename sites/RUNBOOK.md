@@ -25,6 +25,17 @@ curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
 - **Never give the panel a public hostname.** LAN-only, or behind Cloudflare
   Access if remote admin is needed. This panel controls every container.
 
+**Alternative — copy the rehearsal VM (verified platform, faster):** copy
+`C:\Users\dlang\VMs\coolify-rehearsal` to the production box and boot it
+("I copied it" → new MAC/UUID → new DHCP IP). Everything proven carries over
+(Coolify + Gitea + the deployed app). Then adjust:
+1. Note the new IP (DHCP reservation in the Unifi router recommended)
+2. Update Gitea `ROOT_URL` env + restart
+3. Create the production named tunnel; swap the VM's `cloudflared` token
+4. Point real hostnames at the new IP (the cutover)
+5. Shut down the dev-box rehearsal VM (keep as cold fallback snapshot)
+6. Resize the VM (8 vCPU / 16–32 GB) before interactive features arrive
+
 ## Part 2 — Git source for the sites (once)
 
 Coolify deploys applications from git. Two options — pick A:
