@@ -112,6 +112,38 @@ Per-site effort once the platform is up: **about two minutes.**
 For large counts of pure-static sites (20+), consider consolidating them into
 one nginx/Caddy container with vhosts instead of one app each.
 
+## Appendix A — API-driven deployment (verified in rehearsal, 2026-10-13)
+
+The full deploy can be driven from the dev box without touching the UI.
+Verified working on Coolify v4.4.6:
+
+```
+Coolify API:  http://<vm>:8000/api/v1      (Bearer token; NOT /api/v4)
+              Keys & Tokens → API Tokens in the UI
+Gitea:        http://<vm>:3000  (container `gitea`, admin user, repo `sites`)
+```
+
+1. **Create app + deploy in one call:**
+   `POST /applications/public` with `{project_uuid, server_uuid,
+   environment_name, destination_uuid, name, git_repository (the Gitea http
+   URL), git_branch: "main", build_pack: "dockerfile", ports_exposes: "80",
+   domains: "http://<hostname>", instant_deploy: true}` → returns app uuid
+2. **Redeploy:** `POST /applications/{uuid}/start` → "Deployment request
+   queued". NOTE: changing `domains` via PATCH requires a re-deploy
+   (Traefik labels are set at container creation).
+3. **Gitea repo ops:** basic-auth API at `/api/v1` (create repo
+   `POST /user/repos`); pushes with the password URL-encoded
+   (`http://user:%40pass@<vm>:3000/...` — `@` → `%40`).
+4. **Rehearsal tunnel:** `cloudflared tunnel --url http://<vm>:80` (quick
+   tunnel, no CF token, random trycloudflare.com URL) + add that URL to the
+   app's domains for Host-header routing. Production uses a named tunnel +
+   real hostname instead.
+
+Rehearsal artifacts on the dev-box VM (coolify-rehearsal, Ubuntu 24.04.5,
+4 vCPU/6GB, IP 10.1.2.217, user `coolify`): Coolify project `sites`
+(kyeaggtdddyorvy4kiatpdpj), app `datagatelodge`
+(znuob7xhhw5sky9kzmaay2ue) serving the site from the Gitea `sites` repo.
+
 ## Notes
 
 - Gatelodge gateway instances (closed Docker image) deploy as Coolify apps the
