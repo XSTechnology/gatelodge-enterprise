@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Gatelodge — the self-hosted AI gateway. Every model, one endpoint, fully governed. Keys, budgets, and an audit trail your security team signs off on.">
+<meta name="theme-color" content="#0e1411">
+<title>datagatelodge.solutions — The front door for your AI</title>
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%230e1411"/><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="%23d4af37" stroke-width="4"/><rect x="26" y="30" width="12" height="20" rx="1" fill="%23d4af37"/></svg>'>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav" id="top">
+  <a class="brand" href="#top" aria-label="datagatelodge.solutions home">
+    <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
+    <span>datagatelodge.solutions</span>
+  </a>
+  <div class="nav-links">
+    <a href="#problem">The Problem</a>
+    <a href="#capabilities">Capabilities</a>
+    <a href="#roi">ROI</a>
+    <a href="#editions">Editions</a>
+    <a href="#partners">Partners</a>
+  </div>
+  <a class="nav-cta" href="#contact">Request access</a>
+</nav>
+
+<header class="hero">
+  <div class="arch" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <div class="hero-copy">
+      <p class="kicker">Self-hosted AI gateway · one binary · your perimeter</p>
+      <h1>Every model.<br>One gateway.<br><em>Fully governed.</em></h1>
+      <p class="lede">Gatelodge sits in front of every LLM your teams use — cloud or on-prem —
+        behind a single OpenAI-compatible endpoint, with the keys, budgets, and
+        tamper-evident audit trail your security team already demands.
+        The data never leaves your estate.</p>
+      <div class="hero-actions">
+        <a class="btn btn-brass" href="#contact">Request access</a>
+        <a class="btn btn-ghost" href="#problem">What it solves ↓</a>
+      </div>
+      <ul class="hero-facts mono">
+        <li>10 backend types</li>
+        <li>Embedded local inference</li>
+        <li>Audit chain, not just logs</li>
+        <li>Boots in one command</li>
+      </ul>
+    </div>
+
+    <aside class="ticket" aria-label="Example request pass">
+      <div class="ticket-head">
+        <span class="mono">DATAGATELODGE.SOLUTIONS · REQUEST PASS</span>
+        <span class="mono">#4F2A-9C</span>
+      </div>
+      <dl class="ticket-rows mono">
+        <div><dt>requester</dt><dd>team:payments · svc-quotes</dd></div>
+        <div><dt>model</dt><dd>sonnet → chain “smart”</dd></div>
+        <div><dt>routed</dt><dd>cloud:anthropic (fallback armed)</dd></div>
+        <div><dt>tokens</dt><dd>812 in · 431 out</dd></div>
+        <div><dt>budget</dt><dd>$18.40 / $50.00 monthly — ok</dd></div>
+        <div><dt>audit</dt><dd>8d1f…c4a2 → chained ✓</dd></div>
+      </dl>
+      <div class="ticket-stamp" aria-hidden="true">CLEARED</div>
+      <p class="ticket-foot mono">append-only ledger · hash-linked · tamper-evident</p>
+    </aside>
+  </div>
+</header>
+
+<main>
+
+<!-- ── The problem ─────────────────────────────────────────────────────── -->
+<section class="section" id="problem">
+  <p class="section-label mono">Checkpoint 01 — The problem</p>
+  <h2>You know these pains.<br><em>Your teams live them.</em></h2>
+  <p class="section-lede">Every organization building AI features hits the same wall —
+    usually in the same order.</p>
+
+  <div class="ledger">
+    <div class="ledger-row reveal">
+      <div class="ledger-no mono">01</div>
+      <div class="ledger-pain"><h3>API keys pasted into scripts, shared over Slack</h3>
+        <p>No rotation, no per-team accounting, no idea who can spend what.</p></div>
+      <div class="ledger-fix"><p class="mono">→ Gateway keys per team and role ·
+        central credential vault · provider keys never appear in config or logs</p></div>
+    </div>
+    <div class="ledger-row reveal">
+      <div class="ledger-no mono">02</div>
+      <div class="ledger-pain"><h3>The inference invoice is a surprise every month</h3>
+        <p>No budgets, no cost attribution, no levers to pull when the number doubles.</p></div>
+      <div class="ledger-fix"><p class="mono">→ Monthly token budgets with hard stops ·
+        per-team &amp; per-request cost accounting · semantic cache — hits never bill</p></div>
+    </div>
+    <div class="ledger-row reveal">
+      <div class="ledger-no mono">03</div>
+      <div class="ledger-pain"><h3>“Who called which model, with what data?” — silence</h3>
+        <p>Compliance (SOC 2, EU AI Act) is arriving and AI usage leaves no record.</p></div>
+      <div class="ledger-fix"><p class="mono">→ Per-request structured logs ·
+        hash-chained audit trail — tamper-evident by construction, not by policy</p></div>
+    </div>
+    <div class="ledger-row reveal">
+      <div class="ledger-no mono">04</div>
+      <div class="ledger-pain"><h3>Locked into whichever SDK the first dev picked</h3>
+        <p>Every provider change means application surgery across the codebase.</p></div>
+      <div class="ledger-fix"><p class="mono">→ One OpenAI-compatible endpoint in front of
+        OpenAI, Anthropic, Gemini, Azure, Vertex, Bedrock, RunPod &amp; local models ·
+        swap per-task with alias chains — zero app changes</p></div>
+    </div>
+    <div class="ledger-row reveal">
+      <div class="ledger-no mono">05</div>
+      <div class="ledger-pain"><h3>Employees using random AI services with company data</h3>
+        <p>Shadow AI: ungoverned, unlogged, unowned.</p></div>
+      <div class="ledger-fix"><p class="mono">→ Self-hosted gateway, allowlisted backends ·
+        unapproved models don’t even display — they can’t be clicked</p></div>
+    </div>
+    <div class="ledger-row reveal">
+      <div class="ledger-no mono">06</div>
+      <div class="ledger-pain"><h3>Provider outages take the product down</h3>
+        <p>One upstream hiccup and the feature pages go dark.</p></div>
+      <div class="ledger-fix"><p class="mono">→ Hedge routing — a slow primary loses the race to its
+        fallback · chain plans with automatic failover</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Capabilities ────────────────────────────────────────────────────── -->
+<section class="section section-alt" id="capabilities">
+  <p class="section-label mono">Checkpoint 02 — Capabilities</p>
+  <h2>Five pillars.<br><em>One gatehouse.</em></h2>
+  <p class="section-lede">Everything below ships in the binary you download —
+    the free edition carries the full governance stack.</p>
+
+  <div class="pillars">
+    <article class="pillar reveal">
+      <p class="pillar-tag mono">Routing &amp; scale</p>
+      <h3>Every model behind one door</h3>
+      <p>OpenAI-compatible, Anthropic Messages, Gemini Interactions, OpenAI Responses,
+        Azure OpenAI, Vertex AI, Bedrock Converse, RunPod pods &amp; serverless, and
+        embedded local GGUF inference. Alias chains route per task; hedges and fallbacks
+        ride along. Tier&nbsp;D replicas share state over Redis.</p>
+    </article>
+    <article class="pillar reveal">
+      <p class="pillar-tag mono">Governance</p>
+      <h3>Proof, not promises</h3>
+      <p>Role-based access (admin, read-only ops, key-manager), SSO/OIDC, SCIM
+        provisioning, team workspaces, per-team and per-session budgets, full key
+        lifecycle with revocation — and an append-only, hash-linked audit chain.</p>
+    </article>
+    <article class="pillar reveal">
+      <p class="pillar-tag mono">Cost control</p>
+      <h3>Spend you can steer</h3>
+      <p>A semantic cache where hits never bill. Monthly token budgets that stop
+        overruns cold. Per-request, per-team, per-backend cost accounting. Route
+        the cheap tasks to small or local models — flagship only when it matters.</p>
+    </article>
+    <article class="pillar reveal">
+      <p class="pillar-tag mono">Observability</p>
+      <h3>See every request</h3>
+      <p>OTLP tracing export, Prometheus metrics, per-request JSONL logs, and a live
+        admin console — health, performance, syslog, governance, and license in one pane.
+        The audit-chain widget renders tamper evidence visually.</p>
+    </article>
+    <article class="pillar reveal">
+      <p class="pillar-tag mono">Security posture</p>
+      <h3>Inside your walls</h3>
+      <p>Self-hosted — prompts never leave your perimeter. Closed distribution:
+        a machine-code binary, no source to fork or leak. Secrets resolve from
+        env, files, commands, or the console-managed store — never committed,
+        never logged.</p>
+    </article>
+    <article class="pillar reveal pillar-quiet">
+      <p class="pillar-tag mono">Also at the desk</p>
+      <h3>The small things that make it operations</h3>
+      <p>MCP tool-call governance · one-click provider presets · model finder and
+        downloader · RunPod deploy wizard · hot-reloading config and licenses ·
+        tamper-evident revocation list · Windows &amp; Linux · single-file install.</p>
+    </article>
+  </div>
+</section>
+
+<!-- ── ROI ─────────────────────────────────────────────────────────────── -->
+<section class="section" id="roi">
+  <p class="section-label mono">Checkpoint 03 — Return on investment</p>
+  <h2>The math of<br><em>the front door</em></h2>
+  <p class="section-lede">Direct savings from caching and routing, cost avoidance from
+    audit readiness, and one governance layer across every provider.</p>
+
+  <div class="roi-grid">
+    <div class="calc reveal">
+      <p class="calc-title mono">Estimate your payback</p>
+      <div class="calc-field">
+        <label for="team">Team size <output id="team-out" for="team">25</output></label>
+        <input type="range" id="team" min="5" max="200" step="5" value="25">
+      </div>
+      <div class="calc-field">
+        <label for="spend">Monthly inference spend <output id="spend-out" for="spend">$5,000</output></label>
+        <input type="range" id="spend" min="500" max="50000" step="500" value="5000">
+      </div>
+      <div class="calc-field">
+        <label for="cache">Cache hit rate <output id="cache-out" for="cache">15%</output></label>
+        <input type="range" id="cache" min="0" max="40" step="5" value="15">
+      </div>
+      <div class="calc-field">
+        <label for="route">Savings from model routing <output id="route-out" for="route">45%</output></label>
+        <input type="range" id="route" min="0" max="70" step="5" value="45">
+      </div>
+    </div>
+
+    <div class="calc-result reveal">
+      <table class="calc-table mono" aria-live="polite">
+        <tr><th scope="row">gross monthly savings</th><td id="r-gross">$2,913</td></tr>
+        <tr><th scope="row">gateway cost (enterprise)</th><td id="r-cost">$975</td></tr>
+        <tr class="calc-net"><th scope="row">net monthly</th><td id="r-net">$1,938</td></tr>
+        <tr><th scope="row">return multiple</th><td id="r-mult">3.0×</td></tr>
+      </table>
+      <p class="calc-note mono">estimate — rates validated with design partners.
+        community edition: the gateway itself is free; every dollar saved is kept.</p>
+      <div class="calc-stamp mono" aria-hidden="true">SOUND MATH</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Editions ────────────────────────────────────────────────────────── -->
+<section class="section section-alt" id="editions">
+  <p class="section-label mono">Checkpoint 04 — Editions</p>
+  <h2>Free at the gate.<br><em>Paid at the estate.</em></h2>
+  <p class="section-lede">One product, two editions. The free binary is the full
+    governance stack — not a demo.</p>
+
+  <div class="editions">
+    <article class="edition reveal">
+      <p class="edition-tag mono">Community — free</p>
+      <h3>The full gatehouse, self-serve</h3>
+      <p class="edition-price">Free <span>· 30-day trial of serving, one-time key removes the limit</span></p>
+      <ul class="edition-list">
+        <li>Full governance: RBAC, audit chain, budgets, keys</li>
+        <li>Observability &amp; cost-saver included</li>
+        <li>Local inference + named cloud providers</li>
+        <li>Single instance, closed binary</li>
+      </ul>
+      <a class="btn btn-ghost wide" href="#contact">Request access</a>
+    </article>
+
+    <article class="edition edition-primary reveal">
+      <p class="edition-tag mono">Enterprise — paid</p>
+      <h3>For the whole estate</h3>
+      <p class="edition-price">from $39 <span>/user/month · or tiered per deployment ($499–$1,499/mo) · volume breaks</span></p>
+      <ul class="edition-list">
+        <li>Everything in Community</li>
+        <li>Multi-replica tier D with shared state</li>
+        <li>SCIM provisioning · SSO · teams &amp; workspaces</li>
+        <li>Session budgets · MCP gateway governance</li>
+        <li>Support, compliance &amp; audit assistance</li>
+      </ul>
+      <a class="btn btn-brass wide" href="#contact">Book a walkthrough</a>
+    </article>
+  </div>
+
+  <p class="edition-fine mono">Self-hosted always. No SaaS tier — your prompts never
+    transit our infrastructure, because there is no “our infrastructure.”</p>
+</section>
+
+<!-- ── Partners ────────────────────────────────────────────────────────── -->
+<section class="section" id="partners">
+  <p class="section-label mono">Checkpoint 05 — Channel partners</p>
+  <h2>Your inference.<br><em>Our gatehouse. Co-branded.</em></h2>
+  <p class="section-lede">For inference platforms without a governance layer —
+    which is all of them — Gatelodge ships as a 90-day co-branded trial for your
+    customers. One binary, a license carrying your name, your endpoints pre-entitled.</p>
+
+  <div class="partner-strip mono reveal">
+    <span>Your brand on the license</span>
+    <span>·</span>
+    <span>Only your backends entitled</span>
+    <span>·</span>
+    <span>90-day trial, hard stop</span>
+    <span>·</span>
+    <span>20–30% first-year revenue share on conversion</span>
+  </div>
+
+  <div class="partner-why">
+    <div class="reveal">
+      <h3>Why partners hand it out</h3>
+      <p>A governed gateway configured for your endpoints locks the customer’s
+        workflow onto your platform. Governance is the stickiness raw API access
+        never had — and it gets you into procurement conversations that tokens
+        alone never see.</p>
+    </div>
+    <div class="reveal">
+      <h3>Why customers keep it</h3>
+      <p>Budgets, audit trail, key management, cost accounting — on day one,
+        self-hosted, in their perimeter. Post-trial they buy the key; you keep
+        the inference and a share of the license.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Contact ─────────────────────────────────────────────────────────── -->
+<section class="section section-alt" id="contact">
+  <p class="section-label mono">The lodge — Contact</p>
+  <h2>Knock.<br><em>The gate opens.</em></h2>
+  <p class="section-lede">Request the community binary, book an enterprise walkthrough,
+    or talk channel trials. We answer within a business day.</p>
+
+  <div class="contact-row">
+    <a class="contact-card reveal" href="mailto:hello@datagatelodge.com">
+      <p class="mono contact-tag">General</p>
+      <p class="contact-val">hello@datagatelodge.com</p>
+    </a>
+    <a class="contact-card reveal" href="mailto:partners@datagatelodge.com">
+      <p class="mono contact-tag">Channel partners</p>
+      <p class="contact-val">partners@datagatelodge.com</p>
+    </a>
+    <a class="contact-card reveal" href="mailto:security@datagatelodge.com">
+      <p class="mono contact-tag">Security &amp; compliance</p>
+      <p class="contact-val">security@datagatelodge.com</p>
+    </a>
+  </div>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="footer-brand">
+      <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
+      <div>
+        <p class="footer-name">datagatelodge.solutions</p>
+        <p class="footer-co mono">a division of XS Technologies Inc., a Delaware corporation</p>
+        <p class="footer-co mono">© 2026 XS Technologies Inc.</p>
+      </div>
+    </div>
+    <div class="footer-domains mono">
+      <span>datagatelodge.com</span>
+      <span>data-gate-lodge.com</span>
+      <span>datagatelodge.solutions</span>
+    </div>
+    <p class="footer-line mono">Every model. One gateway. Fully governed.</p>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>
