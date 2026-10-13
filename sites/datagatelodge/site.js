@@ -1,8 +1,88 @@
-/* Gatelodge site — ROI calculator + scroll reveals. No dependencies. */
+/* Gatelodge site — ROI calculator + trial download + buy wiring. */
 (function () {
   "use strict";
 
   var ENTERPRISE_PER_USER = 39;   // $/user/month
+
+  /* ── licensing service wiring ──────────────────────────────────────── */
+  // The licensing service (get.datagatelodge.com in production). Override
+  // with window.TRIAL_API_BASE for local testing.
+  var API = window.TRIAL_API_BASE || "https://get.datagatelodge.com";
+  var turnstileWidgetId = null;
+
+  // fetch config (payment link + turnstile sitekey) when the page loads
+  function wireConfig() {
+    fetch(API + "/api/config").then(function (r) { return r.json(); })
+      .then(function (cfg) {
+        if (cfg.payment_link) {
+          var buy = document.getElementById("buy-key-btn");
+          if (buy) {
+            buy.href = cfg.payment_link;
+            buy.hidden = false;
+          }
+          var note = document.getElementById("buy-note");
+          if (note) note.textContent = "one-time · secure checkout · instant key";
+        }
+        if (cfg.turnstile_sitekey && window.turnstile) {
+          turnstileWidgetId = window.turnstile.render(
+            ".cf-turnstile",
+            { sitekey: cfg.turnstile_sitekey, theme: "dark" });
+        }
+      }).catch(function () {
+        // service unreachable — form still shows, submit will error clearly
+      });
+  }
+
+  function wireTrialForm() {
+    var form = document.getElementById("trial-form");
+    if (!form) return;
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var email = document.getElementById("trial-email").value.trim();
+      var biz = document.getElementById("trial-biz").value.trim();
+      var msg = document.getElementById("trial-msg");
+      var btn = document.getElementById("trial-submit");
+      var token = (turnstileWidgetId !== null &&
+                   window.turnstile)
+        ? window.turnstile.getResponse(turnstileWidgetId) : "";
+      if (!email) return;
+      btn.disabled = true;
+      btn.textContent = "Checking…";
+      msg.hidden = true;
+      fetch(API + "/api/trial-request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: email, business_name: biz, turnstile_token: token }),
+      }).then(function (r) {
+        if (r.status === 429) throw new Error(
+          "Too many requests — please wait a while and try again.");
+        if (!r.ok) return r.json().then(function (e) {
+          throw new Error((e.detail && e.detail.message) ||
+                          "request failed"); });
+        return r.json();
+      }).then(function (data) {
+        var card = document.getElementById("trial-card");
+        var link = document.getElementById("trial-download-link");
+        link.href = API + (data.download || "/download/community");
+        form.hidden = true;
+        document.getElementById("trial-success").hidden = false;
+        var mailed = document.getElementById("trial-email-note");
+        if (mailed) mailed.hidden = !data.email_sent;
+      }).catch(function (e) {
+        msg.textContent = e.message || "something went wrong — try again";
+        msg.hidden = false;
+        btn.disabled = false;
+        btn.textContent = "Get the download";
+        if (window.turnstile && turnstileWidgetId !== null) {
+          window.turnstile.reset(turnstileWidgetId);
+        }
+      });
+    });
+  }
+
+  wireConfig();
+  wireTrialForm();
 
   var $ = function (id) { return document.getElementById(id); };
 

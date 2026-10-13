@@ -4,10 +4,12 @@ Endpoints:
   GET  /healthz               — liveness
   GET  /api/config            — public config for the site (payment link etc.)
   POST /api/trial-request     — email capture (Turnstile-verified) -> lead
-                                record -> download grant
+                                record -> download grant (+ emailed
+                                download link when Resend configured)
   GET  /download/community    — streams the community binary (rate limited)
   POST /api/stripe/webhook    — phase 2: payment -> perpetual license key
-                                (activates when STRIPE_WEBHOOK_SECRET set)
+                                + delivery email (activates when
+                                STRIPE_WEBHOOK_SECRET set)
 
 Env:
   TURNSTILE_SECRET     — Cloudflare Turnstile secret key (unset = dev mode,
@@ -18,6 +20,10 @@ Env:
   PAYMENT_LINK         — Stripe payment-link URL shown by the site ("" = none)
   STRIPE_WEBHOOK_SECRET— Stripe signing secret (phase 2; unset = 503)
   LICENSE_PRIVATE_KEY  — path to the RS256 private key PEM (phase 2)
+  EMAIL_PROVIDER       — "resend" to enable transactional email (see
+                         emailer.py for RESEND_API_KEY, EMAIL_FROM,
+                         EMAIL_REPLY_TO, PUBLIC_BASE_URL, SITE_URL;
+                         unset = email disabled, everything else works)
   PORT                 — default 8100
 """
 from __future__ import annotations
@@ -31,6 +37,8 @@ from pathlib import Path
 
 import httpx
 import jwt
+
+import emailer
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -95,6 +103,20 @@ def init_db() -> None:
             stripe_event TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS email_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            to_addr TEXT NOT NULL,
+            serial TEXT DEFAULT '',
+            ok INTEGER DEFAULT 0,
+            detail TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        try:      # migration for stores created before key-email delivery
+            c.execute("ALTER TABLE licenses "
+                      "ADD COLUMN license_json TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
 
 
 init_db()
@@ -180,9 +202,22 @@ async def trial_request(body: TrialRequest, request: Request):
         c.execute("INSERT INTO leads (email, business_name, ip) "
                   "VALUES (?, ?, ?)",
                   (email, body.business_name.strip()[:120], ip))
+    email_sent = False
+    if emailer.configured():
+        subject, html_body, text_body = emailer.render_trial()
+        email_sent, detail = await emailer.send(email, subject, html_body,
+                                                text_body)
+        print(f"[email] trial -> {email}: "
+              f"{'OK ' + detail if email_sent else 'FAIL ' + detail}")
+        with db() as c:
+            c.execute("INSERT INTO email_log "
+                      "(kind, to_addr, serial, ok, detail) "
+                      "VALUES ('trial', ?, '', ?, ?)",
+                      (email, int(email_sent), detail[:300]))
     return {
         "ok": True,
         "download": "/download/community",
+        "email_sent": email_sent,
         "note": ("The Community binary runs a full-feature 30-day trial "
                  "from first boot — no license file needed."),
     }
@@ -208,8 +243,19 @@ async def download_community(request: Request):
 def issue_paid_key(email: str, stripe_event: str = "") -> dict:
     """Mint a perpetual community License Key (all cloud providers named).
 
-    Claims mirror scripts/license_tool.py: RS256, kid = sha16 of the public
-    key DER. Requires LICENSE_PRIVATE_KEY."""
+    Idempotent per Stripe event — a retried webhook delivery returns the
+    key minted for that event instead of issuing a second one. Claims
+    mirror scripts/license_tool.py: RS256, kid = sha16 of the public key
+    DER. Requires LICENSE_PRIVATE_KEY."""
+    if stripe_event:
+        with db() as c:
+            row = c.execute(
+                "SELECT serial, license_json FROM licenses "
+                "WHERE stripe_event = ? AND kind = 'paid-key'",
+                (stripe_event,)).fetchone()
+        if row and row[1]:
+            return {"serial": row[0], "license_json": row[1],
+                    "email": email}
     if not LICENSE_PRIVATE_KEY or not os.path.exists(LICENSE_PRIVATE_KEY):
         raise HTTPException(503, "license issuance not configured")
     import hashlib
@@ -242,13 +288,42 @@ def issue_paid_key(email: str, stripe_event: str = "") -> dict:
     }
     token = jwt.encode(claims, priv, algorithm="RS256",
                        headers={"kid": kid})
+    license_json = json.dumps({"license": token}, indent=2)
     with db() as c:
         c.execute("INSERT OR IGNORE INTO licenses "
-                  "(serial, email, edition, kind, stripe_event) "
-                  "VALUES (?, ?, 'community', 'paid-key', ?)",
-                  (serial, email, stripe_event))
-    return {"serial": serial, "license_json": json.dumps(
-        {"license": token}, indent=2)}
+                  "(serial, email, edition, kind, stripe_event, "
+                  "license_json) "
+                  "VALUES (?, ?, 'community', 'paid-key', ?, ?)",
+                  (serial, email, stripe_event, license_json))
+    return {"serial": serial, "license_json": license_json,
+            "email": email}
+
+
+async def deliver_purchase(rec: dict) -> None:
+    """Email the license key. Never raises — a failed email must not fail
+    the webhook (the key stays in the store for a later resend)."""
+    if not emailer.configured():
+        print(f"[email] purchase {rec['serial']} -> {rec['email']}: "
+              "SKIPPED (emailer disabled)")
+        return
+    with db() as c:
+        sent = c.execute(
+            "SELECT 1 FROM email_log "
+            "WHERE serial = ? AND kind = 'purchase' AND ok = 1",
+            (rec["serial"],)).fetchone()
+    if sent:
+        return                        # already delivered for this key
+    subject, html_body, text_body = emailer.render_purchase(
+        rec["serial"], rec["license_json"])
+    ok, detail = await emailer.send(rec["email"], subject, html_body,
+                                    text_body)
+    print(f"[email] purchase {rec['serial']} -> {rec['email']}: "
+          f"{'OK ' + detail if ok else 'FAIL ' + detail}")
+    with db() as c:
+        c.execute("INSERT INTO email_log "
+                  "(kind, to_addr, serial, ok, detail) "
+                  "VALUES ('purchase', ?, ?, ?, ?)",
+                  (rec["email"], rec["serial"], int(ok), detail[:300]))
 
 
 @app.post("/api/stripe/webhook")
@@ -277,7 +352,9 @@ async def stripe_webhook(request: Request):
         session = event.get("data", {}).get("object", {})
         email = (session.get("customer_details") or {}).get("email", "")
         if email:
-            return issue_paid_key(email, event.get("id", ""))
+            rec = issue_paid_key(email, event.get("id", ""))
+            await deliver_purchase(rec)
+            return rec
     return {"received": True}
 
 

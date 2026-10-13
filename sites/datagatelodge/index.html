@@ -11,6 +11,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
 
@@ -25,6 +26,7 @@
     <a href="#roi">ROI</a>
     <a href="#editions">Editions</a>
     <a href="#partners">Partners</a>
+    <a href="#download">Download</a>
   </div>
   <a class="nav-cta" href="#contact">Request access</a>
 </nav>
@@ -40,7 +42,7 @@
         tamper-evident audit trail your security team already demands.
         The data never leaves your estate.</p>
       <div class="hero-actions">
-        <a class="btn btn-brass" href="#contact">Request access</a>
+        <a class="btn btn-brass" href="#download">Download free</a>
         <a class="btn btn-ghost" href="#problem">What it solves ↓</a>
       </div>
       <ul class="hero-facts mono">
@@ -241,7 +243,12 @@
         <li>Local inference + named cloud providers</li>
         <li>Single instance, closed binary</li>
       </ul>
-      <a class="btn btn-ghost wide" href="#contact">Request access</a>
+      <div class="edition-actions">
+        <a class="btn btn-ghost wide" href="#download">Download the free trial</a>
+        <a class="btn btn-brass wide" id="buy-key-btn" href="#download"
+           hidden>Buy the perpetual key — $99</a>
+        <p class="mono muted" id="buy-note">one-time · removes the 30-day limit</p>
+      </div>
     </article>
 
     <article class="edition edition-primary reveal">
@@ -298,6 +305,52 @@
   </div>
 </section>
 
+<!-- ── Download ─────────────────────────────────────────────────────────── -->
+<section class="section" id="download">
+  <p class="section-label mono">Checkpoint 06 — Get Gatelodge</p>
+  <h2>One binary.<br><em>Thirty days, everything.</em></h2>
+  <p class="section-lede">The Community binary is the full gatehouse — governance, observability,
+    cost-saver, local inference — free for a 30-day evaluation from first boot. No license file,
+    no feature walls during the trial. Enter your email and take the gate home.</p>
+
+  <div class="download-grid">
+    <div class="download-facts">
+      <ul class="hero-facts mono">
+        <li>Single .exe — 156 MB, no installer</li>
+        <li>Full feature trial, 30 days from first boot</li>
+        <li>Local inference works offline, day one</li>
+        <li>After the trial: buy the perpetual key, or keep using local inference</li>
+      </ul>
+      <p class="download-eula mono">By downloading you agree to the
+        <a href="/eula.html">End-User License Agreement</a>.</p>
+    </div>
+
+    <div class="download-card" id="trial-card">
+      <form id="trial-form" autocomplete="off">
+        <label class="mono" for="trial-email">Work email</label>
+        <input type="email" id="trial-email" required
+               placeholder="you@company.com" spellcheck="false">
+        <label class="mono" for="trial-biz">Company <span class="muted">(optional)</span></label>
+        <input type="text" id="trial-biz" placeholder="Acme Corp" spellcheck="false">
+        <div class="cf-turnstile" data-theme="dark"></div>
+        <button type="submit" class="btn btn-brass wide" id="trial-submit">Get the download</button>
+        <p class="mono muted" id="trial-msg" hidden></p>
+      </form>
+      <div id="trial-success" hidden>
+        <p class="ticket-stamp2">CLEARED</p>
+        <p class="download-ready">Your download is ready.</p>
+        <p class="mono muted">The binary runs a full-feature 30-day trial from first boot —
+          no license file needed.</p>
+        <a class="btn btn-brass wide" id="trial-download-link"
+           href="#" download>Download gatelodge-community.exe</a>
+        <p class="mono muted" style="margin-top:12px">156 MB · Windows · SHA-256 verified build</p>
+        <p class="mono muted" id="trial-email-note" hidden
+           style="margin-top:0">We also emailed your download link — keep that message for later.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ── Contact ─────────────────────────────────────────────────────────── -->
 <section class="section section-alt" id="contact">
   <p class="section-label mono">The lodge — Contact</p>
@@ -334,6 +387,7 @@
       </div>
     </div>
     <div class="footer-domains mono">
+      <a href="/eula.html" style="color:inherit;text-decoration:none">EULA</a>
       <span>datagatelodge.com</span>
       <span>data-gate-lodge.com</span>
       <span>datagatelodge.solutions</span>

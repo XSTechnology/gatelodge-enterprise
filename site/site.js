@@ -67,6 +67,8 @@
         link.href = API + (data.download || "/download/community");
         form.hidden = true;
         document.getElementById("trial-success").hidden = false;
+        var mailed = document.getElementById("trial-email-note");
+        if (mailed) mailed.hidden = !data.email_sent;
       }).catch(function (e) {
         msg.textContent = e.message || "something went wrong — try again";
         msg.hidden = false;
