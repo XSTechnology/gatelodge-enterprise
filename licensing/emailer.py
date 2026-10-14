@@ -11,7 +11,11 @@ Env:
                      (auto-selects "resend" when RESEND_API_KEY is set)
   RESEND_API_KEY   — API key from the Resend dashboard
   EMAIL_FROM       — default "Gatelodge Licensing <license@datagatelodge.com>"
-  EMAIL_REPLY_TO   — default "support@datagatelodge.com"
+  SUPPORT_EMAIL    — published support address used for Reply-To and body
+                     text; default "sales@xs.technology" (support@
+                     datagatelodge.com has no forwarding rule — flip back
+                     here if one is ever added)
+  EMAIL_REPLY_TO   — default derives from SUPPORT_EMAIL
   PUBLIC_BASE_URL  — public origin of this service (download links),
                      default "https://get.datagatelodge.com"
   SITE_URL         — marketing site origin (EULA links),
@@ -32,8 +36,8 @@ EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER",
                                 "resend" if RESEND_API_KEY else "")
 EMAIL_FROM = os.environ.get(
     "EMAIL_FROM", "Gatelodge Licensing <license@datagatelodge.com>")
-EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO",
-                                "support@datagatelodge.com")
+SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "sales@xs.technology")
+EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", SUPPORT_EMAIL)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL",
                                  "https://get.datagatelodge.com").rstrip("/")
 SITE_URL = os.environ.get("SITE_URL",
@@ -100,7 +104,7 @@ def _shell(preheader: str, body: str) -> str:
   <div style="border-top:1px solid {_RULE};padding-top:16px;font-family:Arial,Helvetica,sans-serif;font-size:11px;line-height:18px;color:{_MUTE};">
     <span style="font-family:'Courier New',Courier,monospace;color:{_INK};letter-spacing:1px;">datagatelodge.solutions</span><br>
     a division of XS Technologies Inc., a Delaware corporation<br>
-    &copy; 2026 XS Technologies Inc. &nbsp;&middot;&nbsp; <a href="{SITE_URL}/eula" style="color:{_MUTE};">EULA</a> &nbsp;&middot;&nbsp; support@datagatelodge.com
+    &copy; 2026 XS Technologies Inc. &nbsp;&middot;&nbsp; <a href="{SITE_URL}/eula" style="color:{_MUTE};">EULA</a> &nbsp;&middot;&nbsp; {SUPPORT_EMAIL}
   </div>
 </td></tr>
 </table>
@@ -192,7 +196,7 @@ Serial: {serial}  [CLEARED]
 {license_json}
 ------------------------------------------------------------------
 
-Questions? support@datagatelodge.com
+Questions? {SUPPORT_EMAIL}
 
 datagatelodge.solutions
 a division of XS Technologies Inc., a Delaware corporation
@@ -242,7 +246,7 @@ Keep this email — the link re-downloads the same binary whenever
 you need it. When the trial earns its keep, a perpetual key is
 US$99 from the site.
 
-Questions? support@datagatelodge.com
+Questions? {SUPPORT_EMAIL}
 
 datagatelodge.solutions
 a division of XS Technologies Inc., a Delaware corporation
