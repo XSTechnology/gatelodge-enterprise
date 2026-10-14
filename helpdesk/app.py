@@ -128,7 +128,38 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session
   ON chat_messages (session_id, id);
+CREATE TABLE IF NOT EXISTS kb_overrides (
+  name TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
+
+
+def _load_kb_overrides() -> dict:
+    """DB overrides merged over the built-in docs (admin live edits)."""
+    docs = dict(KB)
+    if not DATABASE_URL:
+        return docs
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT name, content FROM kb_overrides").fetchall()
+    except Exception:
+        return docs
+    for name, content in rows:
+        if name in docs:
+            title = re.search(r"^title:\s*(.+)$", content, re.M)
+            desc = re.search(r"^description:\s*(.+)$", content, re.M)
+            docs[name] = {
+                "name": name,
+                "title": (title.group(1).strip() if title
+                          else docs[name]["title"]),
+                "summary": (desc.group(1).strip() if desc
+                            else docs[name]["summary"]),
+                "content": content,
+            }
+    return docs
 
 
 def _run(fn):
@@ -310,8 +341,9 @@ async def triage(question: str) -> dict:
     if not GATEWAY_URL or not GATEWAY_KEY:
         return {"doc": None, "answerable": False, "confident": False,
                 "legal": False, "topic": "gateway-unconfigured"}
+    kb = await _run(_load_kb_overrides)
     listing = "\n".join(f'- {d["name"]}: {d["summary"]}'
-                        for d in KB.values())
+                        for d in kb.values())
     try:
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(
@@ -464,7 +496,8 @@ async def chat_message(body: MessageRequest, request: Request):
                             "take your email? The team will follow up.")})
             return
 
-        doc = KB[t["doc"]]
+        kb = await _run(_load_kb_overrides)
+        doc = kb[t["doc"]]
         history = await load_history(body.session_id)
         messages = ([{"role": "system", "content": ANSWER_SYSTEM.format(
                         doc_title=doc["title"], doc_content=doc["content"])}]
@@ -534,7 +567,26 @@ async def escalate(body: EscalateRequest, request: Request):
                                              transcript)
     print(f"[gatekeeper] escalation {body.session_id[:8]} "
           f"({email or 'no email'}): {'OK ' + detail if ok else 'FAIL ' + detail}")
+    await _run_email_log(email, ok, detail)
     return {"ok": True}      # identical whether or not the email delivered
+
+
+def _log_email(to_addr: str, ok: bool, detail: str) -> None:
+    if not DATABASE_URL:
+        return
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO email_log (kind, to_addr, serial, ok, detail) "
+                "VALUES ('gatekeeper-escalation', %s, '', %s, %s)",
+                (to_addr or "unknown", int(bool(ok)),
+                 str(detail)[:300]))
+    except Exception as e:
+        print(f"[gatekeeper] email_log write failed: {e!r}")
+
+
+async def _run_email_log(to_addr: str, ok: bool, detail: str) -> None:
+    await _run(lambda: _log_email(to_addr, ok, detail))
 
 
 def _require_review_key(request: Request) -> None:
