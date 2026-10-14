@@ -141,7 +141,53 @@ check("email_log has failed trial row",
 check("failure detail captured",
       all("network down" in (x[4] or "") for x in rows), str(rows))
 
-# ── 5. render previews ────────────────────────────────────────────────────
+# ── 5. lost-key recovery ──────────────────────────────────────────────────
+# known buyer + mocked send -> resends the stored license_json
+sent = []
+
+
+async def _fake_send(to, subject, html, text):
+    sent.append((to, subject))
+    return True, "mock-id"
+
+
+emailer.configured = lambda: True
+_orig_real_send = emailer.send
+emailer.send = _fake_send
+
+r = client.post("/api/license/recovery",
+                json={"email": "buyer@example.com"})
+check("recovery 200", r.status_code == 200, r.text)
+check("recovery response shape", r.json() == {"ok": True}, r.text)
+check("recovery resent to buyer",
+      len(sent) == 1 and sent[0][0] == "buyer@example.com", str(sent))
+check("recovery subject carries serial",
+      bool(sent) and rec["serial"] in sent[0][1], str(sent))
+with app.db() as c:
+    rows = c.execute("SELECT kind, to_addr, serial, ok FROM email_log "
+                     "WHERE kind = 'recovery'").fetchall()
+check("recovery logged", len(rows) == 1 and rows[0][1] == "buyer@example.com"
+      and rows[0][3] == 1, str(rows))
+
+# unknown address -> identical response, no email, no log row
+sent.clear()
+r = client.post("/api/license/recovery",
+                json={"email": "nobody@nowhere.example"})
+check("recovery unknown 200", r.status_code == 200, r.text)
+check("recovery anti-enumeration", r.json() == {"ok": True}, r.text)
+check("recovery unknown sends nothing", not sent, str(sent))
+with app.db() as c:
+    n = c.execute("SELECT COUNT(*) FROM email_log WHERE kind='recovery' "
+                  "AND to_addr='nobody@nowhere.example'").fetchone()[0]
+check("recovery unknown not logged as send", n == 0, str(n))
+
+# bad email rejected
+r = client.post("/api/license/recovery", json={"email": "not-an-email"})
+check("recovery bad email 400", r.status_code == 400, r.text)
+
+emailer.send = _orig_real_send
+
+# ── 6. render previews ────────────────────────────────────────────────────
 out = TD / "previews"
 out.mkdir()
 s1, h1, txt1 = emailer.render_purchase(rec["serial"], rec["license_json"])

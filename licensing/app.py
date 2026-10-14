@@ -7,6 +7,9 @@ Endpoints:
                                 record -> download grant (+ emailed
                                 download link when Resend configured)
   GET  /download/community    — streams the community binary (rate limited)
+  POST /api/license/recovery — lost-key re-send (Turnstile-verified,
+                                anti-enumeration: same response whether
+                                or not the address holds a key)
   POST /api/stripe/webhook    — phase 2: payment -> perpetual license key
                                 + delivery email (activates when
                                 STRIPE_WEBHOOK_SECRET set)
@@ -126,14 +129,16 @@ init_db()
 _HITS: dict[str, list[float]] = {}
 
 
-def rate_ok(ip: str, limit: int, window_s: int = 3600) -> bool:
+def rate_ok(ip: str, limit: int, window_s: int = 3600,
+            bucket: str = "") -> bool:
     now = time.time()
-    hits = [t for t in _HITS.get(ip, []) if now - t < window_s]
+    key = f"{ip}|{bucket}"
+    hits = [t for t in _HITS.get(key, []) if now - t < window_s]
     if len(hits) >= limit:
-        _HITS[ip] = hits
+        _HITS[key] = hits
         return False
     hits.append(now)
-    _HITS[ip] = hits
+    _HITS[key] = hits
     return True
 
 
@@ -190,7 +195,7 @@ async def config():
 @app.post("/api/trial-request")
 async def trial_request(body: TrialRequest, request: Request):
     ip = client_ip(request)
-    if not rate_ok(ip, limit=5):
+    if not rate_ok(ip, limit=5, bucket="trial"):
         raise HTTPException(429, "too many requests — try again later")
     email = body.email.strip().lower()
     if not EMAIL_RE.match(email):
@@ -226,7 +231,7 @@ async def trial_request(body: TrialRequest, request: Request):
 @app.get("/download/community")
 async def download_community(request: Request):
     ip = client_ip(request)
-    if not rate_ok(ip, limit=10):
+    if not rate_ok(ip, limit=10, bucket="dl"):
         raise HTTPException(429, "too many downloads — try again later")
     if not BINARY_PATH or not os.path.exists(BINARY_PATH):
         raise HTTPException(404, "binary not configured")
@@ -235,6 +240,49 @@ async def download_community(request: Request):
         media_type="application/octet-stream",
         filename="gatelodge-community.exe",
     )
+
+
+# ── lost-key recovery ─────────────────────────────────────────────────────
+
+
+class RecoveryRequest(BaseModel):
+    email: str = ""
+    turnstile_token: str = ""
+
+
+@app.post("/api/license/recovery")
+async def license_recovery(body: RecoveryRequest, request: Request):
+    """Re-send a buyer's license key by email.
+
+    Anti-enumeration by design: the response is identical whether or not
+    the address holds a key — only a real match sends mail."""
+    ip = client_ip(request)
+    if not rate_ok(ip, limit=3, bucket="recovery"):
+        raise HTTPException(429, "too many requests — try again later")
+    email = body.email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "a valid email address is required")
+    if not await turnstile_ok(body.turnstile_token, ip):
+        raise HTTPException(403, "verification failed — please retry")
+    if emailer.configured():
+        with db() as c:
+            row = c.execute(
+                "SELECT serial, license_json FROM licenses "
+                "WHERE email = ? AND license_json != '' "
+                "ORDER BY id DESC LIMIT 1", (email,)).fetchone()
+        if row:
+            subject, html_body, text_body = emailer.render_purchase(
+                row[0], row[1])
+            ok, detail = await emailer.send(email, subject, html_body,
+                                            text_body)
+            print(f"[email] recovery {row[0]} -> {email}: "
+                  f"{'OK ' + detail if ok else 'FAIL ' + detail}")
+            with db() as c:
+                c.execute("INSERT INTO email_log "
+                          "(kind, to_addr, serial, ok, detail) "
+                          "VALUES ('recovery', ?, ?, ?, ?)",
+                          (email, row[0], int(ok), detail[:300]))
+    return {"ok": True}
 
 
 # ── phase 2: stripe webhook -> perpetual community license key ────────────
