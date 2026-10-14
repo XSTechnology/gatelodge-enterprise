@@ -630,7 +630,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, .btn:focus-visible {
 }
 
 .gk-label {
-  display: flex; flex-direction: column; align-items: flex-end; gap: .1rem;
+  display: flex; flex-direction: column; align-items: flex-end; gap: .08rem;
   font-family: var(--font-mono); font-size: .58rem; font-weight: 500;
   letter-spacing: .14em; text-transform: uppercase; line-height: 1.4;
   color: var(--muted); text-align: right;
@@ -643,6 +643,11 @@ a:focus-visible, button:focus-visible, input:focus-visible, .btn:focus-visible {
 }
 .gk-label:hover { color: var(--brass-bright); border-color: var(--brass); }
 .gk-label .gk-l2 { color: var(--faint); }
+.gk-label .gk-l3 {
+  color: var(--brass); font-size: .54rem; letter-spacing: .1em;
+  margin-top: .18rem; padding-top: .18rem;
+  border-top: 1px dashed var(--line-soft);
+}
 .gk-label:hover .gk-l2 { color: var(--brass); }
 .gk-launch.gk-open .gk-label { opacity: 0; pointer-events: none; }
 

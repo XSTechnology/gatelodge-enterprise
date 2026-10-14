@@ -34,8 +34,9 @@
   function mount() {
     var launch = el("div", "gk-launch");
     var label = el("div", "gk-label");
-    label.innerHTML = '<span class="gk-l1">Support</span>'
-      + '<span class="gk-l2">Questions / Chat</span>';
+    label.innerHTML = '<span class="gk-l1">Product Support</span>'
+      + '<span class="gk-l2">Questions / Chat</span>'
+      + '<span class="gk-l3">1-(302) 830-3151</span>';
     label.setAttribute("role", "button");
     label.setAttribute("aria-label", "Open the Gatekeeper chat");
 
