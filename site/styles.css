@@ -624,11 +624,32 @@ a:focus-visible, button:focus-visible, input:focus-visible, .btn:focus-visible {
 
 /* ── Gatekeeper chat widget ─────────────────────────────────────────────── */
 
-.gk-btn {
+.gk-launch {
   position: fixed; right: 22px; bottom: 22px; z-index: 90;
+  display: flex; align-items: center; gap: 10px;
+}
+
+.gk-label {
+  display: flex; flex-direction: column; align-items: flex-end; gap: .1rem;
+  font-family: var(--font-mono); font-size: .58rem; font-weight: 500;
+  letter-spacing: .14em; text-transform: uppercase; line-height: 1.4;
+  color: var(--muted); text-align: right;
+  padding: .4rem .6rem .42rem;
+  background: rgba(14, 20, 17, .78);
+  border: 1px solid var(--line-soft); border-radius: 8px;
+  backdrop-filter: blur(6px);
+  cursor: pointer; user-select: none;
+  transition: opacity .22s ease, color .18s ease, border-color .18s ease;
+}
+.gk-label:hover { color: var(--brass-bright); border-color: var(--brass); }
+.gk-label .gk-l2 { color: var(--faint); }
+.gk-label:hover .gk-l2 { color: var(--brass); }
+.gk-launch.gk-open .gk-label { opacity: 0; pointer-events: none; }
+
+.gk-btn {
   width: 56px; height: 56px; border-radius: 50%;
   border: 1px solid var(--brass); background: var(--ink-2);
-  color: var(--brass); cursor: pointer;
+  color: var(--brass); cursor: pointer; flex: none;
   box-shadow: 0 14px 34px rgba(0,0,0,.5), inset 0 1px 0 rgba(212,175,55,.12);
   transition: transform .18s ease, background .18s ease;
   display: flex; align-items: center; justify-content: center;
@@ -648,8 +669,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, .btn:focus-visible {
   overflow: hidden;
 }
 @media (max-width: 640px) {
+  .gk-launch { right: 14px; bottom: 14px; }
+  .gk-label { display: none; }
   .gk-panel { right: 12px; left: 12px; bottom: 84px; width: auto; }
-  .gk-btn { right: 14px; bottom: 14px; }
 }
 
 .gk-head {

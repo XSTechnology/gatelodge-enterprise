@@ -32,6 +32,13 @@
   var dom = {};
 
   function mount() {
+    var launch = el("div", "gk-launch");
+    var label = el("div", "gk-label");
+    label.innerHTML = '<span class="gk-l1">Support</span>'
+      + '<span class="gk-l2">Questions / Chat</span>';
+    label.setAttribute("role", "button");
+    label.setAttribute("aria-label", "Open the Gatekeeper chat");
+
     var btn = el("button", "gk-btn");
     btn.type = "button";
     btn.setAttribute("aria-label", "Open the Gatekeeper chat");
@@ -41,6 +48,7 @@
       + '<rect x="26" y="30" width="12" height="20" rx="1" '
       + 'fill="currentColor"/></svg>';
     btn.addEventListener("click", toggle);
+    label.addEventListener("click", toggle);
 
     var panel = el("div", "gk-panel");
     panel.setAttribute("role", "dialog");
@@ -63,9 +71,11 @@
       + '<span class="gk-brand">datagatelodge.solutions</span>'
       + "</div>";
 
-    document.body.appendChild(btn);
+    launch.appendChild(label);
+    launch.appendChild(btn);
+    document.body.appendChild(launch);
     document.body.appendChild(panel);
-    dom = { btn: btn, panel: panel,
+    dom = { launch: launch, btn: btn, panel: panel,
             msgs: panel.querySelector(".gk-msgs"),
             input: panel.querySelector(".gk-input"),
             send: panel.querySelector(".gk-send"),
@@ -86,7 +96,7 @@
   function toggle() {
     state.open = !state.open;
     dom.panel.hidden = !state.open;
-    dom.btn.classList.toggle("gk-open", state.open);
+    dom.launch.classList.toggle("gk-open", state.open);
     if (state.open) {
       if (!state.session) start();
       dom.input.focus();
