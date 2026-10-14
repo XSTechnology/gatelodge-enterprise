@@ -1,0 +1,192 @@
+"""Verification: individual-page architecture, nav page lists, fit-on-screen."""
+import json
+import os
+import sys
+
+from playwright.sync_api import sync_playwright
+
+BASE = "http://localhost:8435"
+SHOTS = os.path.join(os.environ.get("TEMP", "."), "site_page_shots")
+os.makedirs(SHOTS, exist_ok=True)
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append((name, bool(ok), detail))
+
+
+def run():
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+        page = ctx.new_page()
+        errors = []
+        page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: errors.append(str(e)))
+
+        def fit_report(label):
+            return page.evaluate(
+                "({h: document.documentElement.scrollHeight, vh: window.innerHeight})"), label
+
+        # ── index ─────────────────────────────────────────────────────
+        page.goto(BASE + "/", wait_until="networkidle")
+        check("index: 3 section links", page.eval_on_selector_all(
+            ".nav-sections a", "els => els.length") == 3)
+        check("index: overview current", page.eval_on_selector(
+            '.nav-sections a[aria-current="page"]', "el => el.textContent") == "Overview")
+        pages = page.eval_on_selector_all(
+            ".nav-pages a", "els => els.map(a => a.textContent.trim())")
+        check("index: 4 pages", pages == ["Two Doors", "Why One Company", "The Proof", "Knock"],
+              str(pages))
+        check("index: two-doors default", page.eval_on_selector(
+            "#two-doors", "el => !el.hidden"))
+        check("index: division kicker removed", page.eval_on_selector_all(
+            ".kicker", "els => els.length") == 0)
+        check("index: console on two-doors", page.eval_on_selector(
+            "#two-doors .console-band.compact", "el => !!el"))
+        h, _ = fit_report("two-doors")
+        check("index: Two Doors fits screen", h["h"] <= h["vh"],
+              f'{h["h"]}px vs {h["vh"]}px')
+        page.screenshot(path=os.path.join(SHOTS, "01-index-two-doors.png"))
+
+        # switch to Knock via the nav page list
+        page.click('.nav-pages a[href="#contact"]')
+        page.wait_for_timeout(400)
+        check("index: knock page shows", page.eval_on_selector(
+            "#contact", "el => !el.hidden") and page.evaluate("location.hash") == "#contact")
+        check("index: phone card dropped", page.eval_on_selector_all(
+            "#contact .contact-card", "els => els.length") == 2)
+        check("index: aria-selected sync", page.eval_on_selector(
+            '.nav-pages a[href="#contact"]',
+            'el => el.getAttribute("aria-selected")') == "true")
+        h, _ = fit_report("knock")
+        check("index: Knock fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+
+        # back button returns to the landing
+        page.go_back()
+        page.wait_for_timeout(400)
+        check("index: back → landing", page.eval_on_selector(
+            "#two-doors", "el => !el.hidden"))
+
+        # why + proof pages fit
+        for pid in ["why", "proof"]:
+            page.click(f'.nav-pages a[href="#{pid}"]')
+            page.wait_for_timeout(350)
+            h, _ = fit_report(pid)
+            check(f"index: {pid} fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+
+        # ── gatelodge ─────────────────────────────────────────────────
+        page.goto(BASE + "/gatelodge.html", wait_until="networkidle")
+        gpages = page.eval_on_selector_all(
+            ".nav-pages a", "els => els.map(a => a.textContent.trim())")
+        check("gate: 8 pages", gpages == ["One Gateway", "Problem", "Capabilities", "ROI",
+                                          "Editions", "Channel", "Download", "Contact"], str(gpages))
+        check("gate: gateway section current", page.eval_on_selector(
+            '.nav-sections a[aria-current="page"]', "el => el.textContent") == "The Gateway")
+        check("gate: no CTA", page.eval_on_selector_all(
+            ".nav-cta", "els => els.length") == 0)
+        check("gate: intro landing default", page.eval_on_selector(
+            "#intro", "el => !el.hidden"))
+        check("gate: console NOT in capabilities", page.eval_on_selector_all(
+            "#capabilities .console-band", "els => els.length") == 0)
+        h, _ = fit_report("intro")
+        check("gate: One Gateway fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+        page.screenshot(path=os.path.join(SHOTS, "02-gate-intro.png"))
+
+        for pid in ["problem", "capabilities", "roi", "editions",
+                    "partners", "download", "contact"]:
+            page.click(f'.nav-pages a[href="#{pid}"]')
+            page.wait_for_timeout(350)
+            h, _ = fit_report(pid)
+            check(f"gate: {pid} fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+            if pid == "problem":
+                page.screenshot(path=os.path.join(SHOTS, "03-gate-problem.png"))
+            if pid == "capabilities":
+                # title block alignment on a full-bleed band page
+                align = page.eval_on_selector("#capabilities", """el => {
+                    const l = el.querySelector('.section-label').getBoundingClientRect();
+                    const h2 = el.querySelector('h2').getBoundingClientRect();
+                    return Math.abs(l.left - h2.left) < 2;
+                }""")
+                check("gate: label aligns with content (alt band)", align)
+
+        # deep link still works
+        page.goto(BASE + "/gatelodge.html#download", wait_until="networkidle")
+        check("gate: deep link opens download", page.eval_on_selector(
+            "#download", "el => !el.hidden"))
+
+        # in-page anchor (hero button)
+        page.goto(BASE + "/gatelodge.html", wait_until="networkidle")
+        page.click('.hero-actions .btn-brass')
+        page.wait_for_timeout(400)
+        check("gate: hero button → download page", page.eval_on_selector(
+            "#download", "el => !el.hidden") and page.evaluate("location.hash") == "#download")
+
+        # EULA modal still wired
+        page.click(".dock-eula")
+        page.wait_for_timeout(1000)
+        check("gate: eula modal loads", page.eval_on_selector(
+            "#eula-body", "el => el.textContent.includes('Definitions')"))
+        page.keyboard.press("Escape")
+
+        # ── services ──────────────────────────────────────────────────
+        page.goto(BASE + "/services.html", wait_until="networkidle")
+        spages = page.eval_on_selector_all(
+            ".nav-pages a", "els => els.map(a => a.textContent.trim())")
+        check("services: 9 pages", spages == ["What We Build", "Expertise", "Survey", "Map",
+                                              "Design", "Post", "Walk", "Proof", "Start"], str(spages))
+        h, _ = fit_report("intro")
+        check("services: What We Build fits", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+        page.screenshot(path=os.path.join(SHOTS, "04-services-intro.png"))
+
+        for pid in ["expertise", "survey", "map", "design", "post", "walk", "proof", "what-we-need"]:
+            page.click(f'.nav-pages a[href="#{pid}"]')
+            page.wait_for_timeout(350)
+            h, _ = fit_report(pid)
+            check(f"services: {pid} fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+            if pid == "design":
+                page.screenshot(path=os.path.join(SHOTS, "05-services-design.png"))
+
+        # step-nav flow across method pages
+        page.click('.nav-pages a[href="#survey"]')
+        page.wait_for_timeout(300)
+        page.click('#survey .step-nav a[href="#map"]')
+        page.wait_for_timeout(300)
+        check("services: step-nav → map", page.eval_on_selector(
+            "#map", "el => !el.hidden"))
+
+        ctx.close()
+
+        # ── mobile ────────────────────────────────────────────────────
+        mctx = browser.new_context(viewport={"width": 390, "height": 844})
+        mpage = mctx.new_page()
+        mpage.goto(BASE + "/gatelodge.html", wait_until="networkidle")
+        mpage.wait_for_timeout(400)
+        check("mobile: no horizontal overflow", mpage.evaluate(
+            "document.documentElement.scrollWidth <= 390"))
+        nav_wrapped = mpage.eval_on_selector(".nav", """el => {
+                return el.getBoundingClientRect().height > 80; }""")
+        check("mobile: page list wraps to second row", nav_wrapped,
+              str(mpage.eval_on_selector(".nav", "el => el.getBoundingClientRect().height")))
+        mpage.screenshot(path=os.path.join(SHOTS, "06-mobile-gate.png"))
+        mctx.close()
+        browser.close()
+
+    fails = [r for r in results if not r[1]]
+    for name, ok, detail in results:
+        print(("PASS " if ok else "FAIL ") + name + (("  — " + detail) if detail and not ok else ""))
+    print()
+    js_errors = [e for e in errors
+                 if "turnstile" not in e.lower()
+                 and "challenges.cloudflare" not in e.lower()
+                 and "datagatelodge.com" not in e
+                 and "ERR_FAILED" not in e]
+    print(f"console errors (filtered): {len(js_errors)}")
+    for e in js_errors[:10]:
+        print("  !", e[:200])
+    print(f"\n{len(results) - len(fails)}/{len(results)} checks passed")
+    sys.exit(1 if fails or js_errors else 0)
+
+
+run()

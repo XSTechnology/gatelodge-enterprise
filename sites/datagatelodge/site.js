@@ -86,97 +86,78 @@
   initTabs();
   initEula();
 
-  /* ── page tabs ────────────────────────────────────────────────────── */
-  // Sticky checkpoint bar. Panels keep their historic ids (#problem,
-  // #download, …) so every existing deep link keeps working — on load
-  // and on in-page hash changes the matching tab activates.
+  /* ── pages ────────────────────────────────────────────────────────── */
+  // The nav carries a contextual page list (.nav-pages). Links swap the
+  // page panels in place — no reload. Panels keep their historic ids
+  // (#problem, #download, #survey…), so old deep links keep working.
+  // Clicks pushState (back/forward steps through pages); native hash
+  // changes (in-page anchors) and popstate both resolve through the
+  // same activation path.
   function initTabs() {
-    var sticky = document.querySelector(".tabs-sticky");
-    var bar = document.querySelector(".tabs-bar");
-    if (!bar) return;
+    var list = document.querySelector(".nav-pages");
+    if (!list) return;
     var tabs = Array.prototype.slice.call(
-      bar.querySelectorAll('[role="tab"]'));
+      list.querySelectorAll('[role="tab"]'));
 
     function panelFor(tab) {
-      return document.getElementById(tab.getAttribute("aria-controls"));
+      var href = tab.getAttribute("href") || "";
+      return document.getElementById(href.replace(/^#/, ""));
     }
 
     function activate(tab, focus) {
       tabs.forEach(function (t) {
         var on = t === tab;
         t.setAttribute("aria-selected", on ? "true" : "false");
-        t.tabIndex = on ? 0 : -1;
         var p = panelFor(t);
         if (p) p.hidden = !on;
       });
       if (focus) tab.focus();
-      // keep the chosen tab visible inside a scrolling strip
-      if (bar.scrollWidth > bar.clientWidth) {
+      // keep the chosen link visible inside a scrolling page strip
+      if (list.scrollWidth > list.clientWidth) {
         var b = tab.offsetLeft, w = tab.offsetWidth;
-        bar.scrollTo({ left: b + w / 2 - bar.clientWidth / 2,
-                       behavior: focus ? "smooth" : "auto" });
+        list.scrollTo({ left: b + w / 2 - list.clientWidth / 2,
+                        behavior: focus ? "smooth" : "auto" });
       }
     }
 
-    function scrollToBar() {
-      if (!sticky) return;
-      var y = sticky.getBoundingClientRect().top +
-              window.pageYOffset - 64;   /* fixed nav height */
-      window.scrollTo({ top: y, behavior: "smooth" });
-    }
-
-    function setHash(panel) {
-      if (history.replaceState) {
-        history.replaceState(null, "", "#" + panel.id);
-      } else {
-        location.hash = "#" + panel.id;
-      }
+    function goTo(tab) {
+      activate(tab);
+      var p = panelFor(tab);
+      if (p && history.pushState) history.pushState(null, "", "#" + p.id);
+      window.scrollTo(0, 0);   // a page switch shows the page from its top
     }
 
     tabs.forEach(function (tab, i) {
-      tab.addEventListener("click", function () {
-        activate(tab);
-        var p = panelFor(tab);
-        if (p) setHash(p);
-        scrollToBar();
+      tab.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        goTo(tab);
       });
       tab.addEventListener("keydown", function (ev) {
         var d = ev.key === "ArrowRight" ? 1 :
                 ev.key === "ArrowLeft" ? -1 : 0;
         if (!d) return;
         ev.preventDefault();
-        var next = tabs[(i + d + tabs.length) % tabs.length];
-        activate(next, true);
-        var p = panelFor(next);
-        if (p) setHash(p);
+        goTo(tabs[(i + d + tabs.length) % tabs.length]);
       });
     });
 
-    function activateByHash() {
+    function resolve() {
       var h = (location.hash || "").replace(/^#/, "");
-      if (!h) return false;
-      var panel = document.getElementById(h);
-      if (!panel || !panel.classList.contains("tab-panel")) return false;
-      var tab = bar.querySelector('[aria-controls="' + h + '"]');
+      var tab = h && list.querySelector('[href="#' + h + '"]');
       if (tab) { activate(tab); return true; }
       return false;
     }
 
     window.addEventListener("hashchange", function () {
-      if (activateByHash()) scrollToBar();
+      if (resolve()) window.scrollTo(0, 0);
+    });
+    window.addEventListener("popstate", function () {
+      if (!resolve()) activate(tabs[0]);   // back to the section landing
+      window.scrollTo(0, 0);
     });
 
     activate(tabs[0]);
-    activateByHash();
-
-    // edge-fade hint when the strip actually scrolls
-    function checkScrollable() {
-      sticky.classList.toggle(
-        "scrollable", bar.scrollWidth > bar.clientWidth + 8);
-    }
-    bar.addEventListener("scroll", checkScrollable);
-    window.addEventListener("resize", checkScrollable);
-    checkScrollable();
+    resolve();
   }
 
   /* ── EULA pop-up window ───────────────────────────────────────────── */

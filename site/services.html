@@ -20,7 +20,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20261014">
+<link rel="stylesheet" href="styles.css?v=20261014b">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
@@ -30,13 +30,30 @@
     <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
     <span>datagatelodge.solutions</span>
   </a>
-  <div class="nav-links">
+  <div class="nav-sections">
     <a href="/">Overview</a>
     <a href="/gatelodge.html">The Gateway</a>
     <a href="/services.html" aria-current="page">Agent Services</a>
   </div>
-  <a class="nav-cta" href="#what-we-need">Talk to us</a>
+  <div class="nav-pages" role="tablist" aria-label="Agent Services — pages">
+    <a href="#intro" role="tab" id="tab-intro" aria-controls="intro" aria-selected="true">What We Build</a>
+    <a href="#expertise" role="tab" id="tab-expertise" aria-controls="expertise" aria-selected="false">Expertise</a>
+    <a href="#survey" role="tab" id="tab-survey" aria-controls="survey" aria-selected="false">Survey</a>
+    <a href="#map" role="tab" id="tab-map" aria-controls="map" aria-selected="false">Map</a>
+    <a href="#design" role="tab" id="tab-design" aria-controls="design" aria-selected="false">Design</a>
+    <a href="#post" role="tab" id="tab-post" aria-controls="post" aria-selected="false">Post</a>
+    <a href="#walk" role="tab" id="tab-walk" aria-controls="walk" aria-selected="false">Walk</a>
+    <a href="#proof" role="tab" id="tab-proof" aria-controls="proof" aria-selected="false">Proof</a>
+    <a href="#what-we-need" role="tab" id="tab-what-we-need" aria-controls="what-we-need" aria-selected="false">Start</a>
+  </div>
 </nav>
+
+<main>
+
+<noscript><style>.tab-panel[hidden]{display:block}</style></noscript>
+
+<!-- ── Page 1 — What We Build (section landing) ───────────────────────── -->
+<section class="tab-panel" id="intro" role="tabpanel" aria-labelledby="tab-intro">
 
 <header class="hero">
   <div class="arch" aria-hidden="true"></div>
@@ -77,27 +94,10 @@
   </div>
 </header>
 
-<noscript><style>.tab-panel[hidden]{display:block}.tabs-sticky{display:none}</style></noscript>
+</section>
 
-<main>
-
-<div class="tabs-sticky">
-  <div class="tabs-bar" role="tablist" aria-label="Agent Services — chapters">
-    <button class="tab" type="button" role="tab" id="tab-expertise" aria-controls="expertise" aria-selected="true">Expertise</button>
-    <span class="tab-rule" aria-hidden="true"></span>
-    <button class="tab" type="button" role="tab" id="tab-survey" aria-controls="survey" aria-selected="false" tabindex="-1"><span class="tab-no">01</span>Survey</button>
-    <button class="tab" type="button" role="tab" id="tab-map" aria-controls="map" aria-selected="false" tabindex="-1"><span class="tab-no">02</span>Map</button>
-    <button class="tab" type="button" role="tab" id="tab-design" aria-controls="design" aria-selected="false" tabindex="-1"><span class="tab-no">03</span>Design</button>
-    <button class="tab" type="button" role="tab" id="tab-post" aria-controls="post" aria-selected="false" tabindex="-1"><span class="tab-no">04</span>Post</button>
-    <button class="tab" type="button" role="tab" id="tab-walk" aria-controls="walk" aria-selected="false" tabindex="-1"><span class="tab-no">05</span>Walk</button>
-    <span class="tab-rule" aria-hidden="true"></span>
-    <button class="tab" type="button" role="tab" id="tab-proof" aria-controls="proof" aria-selected="false" tabindex="-1">Proof</button>
-    <button class="tab" type="button" role="tab" id="tab-what-we-need" aria-controls="what-we-need" aria-selected="false" tabindex="-1">Start</button>
-  </div>
-</div>
-
-<!-- ── Expertise ────────────────────────────────────────────────────────── -->
-<section class="section tab-panel" id="expertise" role="tabpanel" aria-labelledby="tab-expertise">
+<!-- ── Page 2 — Expertise ────────────────────────────────────────────── -->
+<section class="section tab-panel" id="expertise" role="tabpanel" aria-labelledby="tab-expertise" hidden>
   <p class="section-label mono">◆ What we bring</p>
   <h2>Not prompt engineers.<br><em>Infrastructure engineers.</em></h2>
   <p class="section-lede">We spent years building the gateway layer — the routing,
@@ -429,7 +429,7 @@
   </div>
 </dialog>
 
-<script src="site.js?v=20261014"></script>
-<script src="chat.js?v=20261014"></script>
+<script src="site.js?v=20261014b"></script>
+<script src="chat.js?v=20261014b"></script>
 </body>
 </html>
