@@ -12,9 +12,8 @@ Env:
   RESEND_API_KEY   — API key from the Resend dashboard
   EMAIL_FROM       — default "Gatelodge Licensing <license@datagatelodge.com>"
   SUPPORT_EMAIL    — published support address used for Reply-To and body
-                     text; default "sales@xs.technology" (support@
-                     datagatelodge.com has no forwarding rule — flip back
-                     here if one is ever added)
+                     text; default "support@datagatelodge.com" (receives
+                     via Cloudflare Email Routing -> sales@xs.technology)
   EMAIL_REPLY_TO   — default derives from SUPPORT_EMAIL
   PUBLIC_BASE_URL  — public origin of this service (download links),
                      default "https://get.datagatelodge.com"
@@ -36,7 +35,8 @@ EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER",
                                 "resend" if RESEND_API_KEY else "")
 EMAIL_FROM = os.environ.get(
     "EMAIL_FROM", "Gatelodge Licensing <license@datagatelodge.com>")
-SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "sales@xs.technology")
+SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL",
+                               "support@datagatelodge.com")
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO", SUPPORT_EMAIL)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL",
                                  "https://get.datagatelodge.com").rstrip("/")
