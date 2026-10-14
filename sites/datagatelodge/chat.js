@@ -121,8 +121,8 @@
         body: JSON.stringify({ turnstile_token: token || "" })
       }).then(function (r) {
         if (r.status === 429) {
-          addMsg("agent", "You've opened several chats recently — give it "
-            + "a few minutes and try again. Questions? "
+          addMsg("agent", "You've reached this hour's chat limit — the "
+            + "gate reopens shortly. Need an answer sooner? "
             + "support@datagatelodge.com");
           return null;
         }
