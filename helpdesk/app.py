@@ -214,12 +214,25 @@ def _mark_reviewed(sid: str) -> None:
                      "WHERE id = %s", (sid,))
 
 
+_schema_ok = False
+
+
+async def _ensure_schema() -> None:
+    global _schema_ok
+    if not _schema_ok:
+        await _run(_init_schema)
+        _schema_ok = True
+
+
 @app.on_event("startup")
 async def init_db() -> None:
     if not DATABASE_URL:
         print("WARNING: DATABASE_URL unset — service cannot store chats")
         return
-    await _run(_init_schema)
+    try:
+        await _ensure_schema()
+    except Exception as e:            # DB may attach slightly after boot —
+        print(f"WARNING: schema init deferred ({e!r}) — retried on first use")
 
 
 # ── rate limiting (per-IP, in-memory; fronted by Cloudflare anyway) ──────
@@ -404,6 +417,7 @@ async def create_session(body: SessionRequest, request: Request):
     if not DATABASE_URL:
         raise HTTPException(503, "storage unavailable")
     sid = uuid.uuid4().hex
+    await _ensure_schema()
     await _run(lambda: _create_session(sid, ip))
     return {"session_id": sid}
 
