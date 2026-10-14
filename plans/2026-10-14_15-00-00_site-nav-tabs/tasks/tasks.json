@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[nav-1] styles.css: fixed dock footer + sticky tab bar + EULA modal + nav responsive + chat-widget offset",
+    "id": "nav-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[nav-2] site.js: tab engine (hash sync, keyboard) + EULA modal loader",
+    "id": "nav-2",
+    "status": "pending"
+  },
+  {
+    "content": "[nav-3] gatelodge.html: 7 tab panels (console into Capabilities)",
+    "id": "nav-3",
+    "status": "pending"
+  },
+  {
+    "content": "[nav-4] services.html: tabs incl. 5 Gatehouse Method step tabs + step nav",
+    "id": "nav-4",
+    "status": "pending"
+  },
+  {
+    "content": "[nav-5] index.html + eula.html: unified nav, dock, legal-doc styles to styles.css",
+    "id": "nav-5",
+    "status": "pending"
+  },
+  {
+    "content": "[nav-6] Local verify: screenshots desktop + mobile, tab/modal behavior",
+    "id": "nav-6",
+    "status": "pending"
+  },
+  {
+    "content": "[nav-7] Deploy: sync sites/, CF purge, live verify, commit",
+    "id": "nav-7",
+    "status": "pending"
+  }
+]

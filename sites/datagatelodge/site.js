@@ -83,6 +83,147 @@
 
   wireConfig();
   wireTrialForm();
+  initTabs();
+  initEula();
+
+  /* ── page tabs ────────────────────────────────────────────────────── */
+  // Sticky checkpoint bar. Panels keep their historic ids (#problem,
+  // #download, …) so every existing deep link keeps working — on load
+  // and on in-page hash changes the matching tab activates.
+  function initTabs() {
+    var sticky = document.querySelector(".tabs-sticky");
+    var bar = document.querySelector(".tabs-bar");
+    if (!bar) return;
+    var tabs = Array.prototype.slice.call(
+      bar.querySelectorAll('[role="tab"]'));
+
+    function panelFor(tab) {
+      return document.getElementById(tab.getAttribute("aria-controls"));
+    }
+
+    function activate(tab, focus) {
+      tabs.forEach(function (t) {
+        var on = t === tab;
+        t.setAttribute("aria-selected", on ? "true" : "false");
+        t.tabIndex = on ? 0 : -1;
+        var p = panelFor(t);
+        if (p) p.hidden = !on;
+      });
+      if (focus) tab.focus();
+      // keep the chosen tab visible inside a scrolling strip
+      if (bar.scrollWidth > bar.clientWidth) {
+        var b = tab.offsetLeft, w = tab.offsetWidth;
+        bar.scrollTo({ left: b + w / 2 - bar.clientWidth / 2,
+                       behavior: focus ? "smooth" : "auto" });
+      }
+    }
+
+    function scrollToBar() {
+      if (!sticky) return;
+      var y = sticky.getBoundingClientRect().top +
+              window.pageYOffset - 64;   /* fixed nav height */
+      window.scrollTo({ top: y, behavior: "smooth" });
+    }
+
+    function setHash(panel) {
+      if (history.replaceState) {
+        history.replaceState(null, "", "#" + panel.id);
+      } else {
+        location.hash = "#" + panel.id;
+      }
+    }
+
+    tabs.forEach(function (tab, i) {
+      tab.addEventListener("click", function () {
+        activate(tab);
+        var p = panelFor(tab);
+        if (p) setHash(p);
+        scrollToBar();
+      });
+      tab.addEventListener("keydown", function (ev) {
+        var d = ev.key === "ArrowRight" ? 1 :
+                ev.key === "ArrowLeft" ? -1 : 0;
+        if (!d) return;
+        ev.preventDefault();
+        var next = tabs[(i + d + tabs.length) % tabs.length];
+        activate(next, true);
+        var p = panelFor(next);
+        if (p) setHash(p);
+      });
+    });
+
+    function activateByHash() {
+      var h = (location.hash || "").replace(/^#/, "");
+      if (!h) return false;
+      var panel = document.getElementById(h);
+      if (!panel || !panel.classList.contains("tab-panel")) return false;
+      var tab = bar.querySelector('[aria-controls="' + h + '"]');
+      if (tab) { activate(tab); return true; }
+      return false;
+    }
+
+    window.addEventListener("hashchange", function () {
+      if (activateByHash()) scrollToBar();
+    });
+
+    activate(tabs[0]);
+    activateByHash();
+
+    // edge-fade hint when the strip actually scrolls
+    function checkScrollable() {
+      sticky.classList.toggle(
+        "scrollable", bar.scrollWidth > bar.clientWidth + 8);
+    }
+    bar.addEventListener("scroll", checkScrollable);
+    window.addEventListener("resize", checkScrollable);
+    checkScrollable();
+  }
+
+  /* ── EULA pop-up window ───────────────────────────────────────────── */
+  // The dock button (and any [data-eula-open] link) opens the agreement
+  // in a scrollable <dialog>. Content is lifted from /eula.html at
+  // runtime, so there is exactly one source of truth for the text.
+  function initEula() {
+    var modal = document.getElementById("eula-modal");
+    if (!modal || !modal.showModal) return;
+    var body = document.getElementById("eula-body");
+    var loaded = false;
+
+    function open() {
+      modal.showModal();
+      if (loaded) return;
+      loaded = true;
+      fetch("eula.html").then(function (r) { return r.text(); })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var src = doc.querySelector(".legal-doc");
+          if (src && body) body.innerHTML = src.innerHTML;
+        })
+        .catch(function () {
+          if (body) body.innerHTML =
+            '<p>Could not load the agreement here — ' +
+            '<a href="eula.html">open it as a page</a> instead.</p>';
+        });
+    }
+
+    Array.prototype.forEach.call(
+      document.querySelectorAll("[data-eula-open]"),
+      function (el) {
+        el.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          open();
+        });
+      });
+
+    var close = document.getElementById("eula-close");
+    if (close) close.addEventListener("click", function () { modal.close(); });
+
+    // click on the dimmed area around the document closes it
+    modal.addEventListener("click", function (ev) {
+      if (ev.target === modal) modal.close();
+    });
+  }
+
 
   var $ = function (id) { return document.getElementById(id); };
 

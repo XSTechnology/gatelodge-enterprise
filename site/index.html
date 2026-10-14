@@ -20,20 +20,20 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=20261014">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
 
 <nav class="nav" id="top">
-  <a class="brand" href="#top" aria-label="DataGateLodge home">
+  <a class="brand" href="/" aria-label="datagatelodge.solutions — home">
     <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
     <span>datagatelodge.solutions</span>
   </a>
   <div class="nav-links">
+    <a href="/" aria-current="page">Overview</a>
     <a href="/gatelodge.html">The Gateway</a>
     <a href="/services.html">Agent Services</a>
-    <a href="/#contact">Contact</a>
   </div>
   <a class="nav-cta" href="/gatelodge.html#download">Download free</a>
 </nav>
@@ -155,27 +155,33 @@
 
 </main>
 
-<footer class="footer">
-  <div class="footer-inner">
-    <div class="footer-brand">
-      <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
-      <div>
-        <p class="footer-name">datagatelodge.solutions</p>
-        <p class="footer-co mono">a division of XS Technologies Inc., a Delaware corporation</p>
-        <p class="footer-co mono">© 2026 XS Technologies Inc.</p>
-      </div>
-    </div>
-    <div class="footer-domains mono">
-      <a href="/eula.html">EULA</a>
-      <span>datagatelodge.com</span>
-      <span>data-gate-lodge.com</span>
-      <span>datagatelodge.solutions</span>
-    </div>
-    <p class="footer-line mono">Every model. One gateway. Fully governed.</p>
+<footer class="dock" role="contentinfo">
+  <div class="dock-inner">
+    <svg class="dock-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
+    <p class="dock-legal"><strong>datagatelodge.solutions</strong><span class="sep">·</span>a division of XS Technologies Inc., a Delaware corporation<span class="sep">·</span>© 2026 XS Technologies Inc.</p>
+    <p class="dock-line">Every model. One gateway. Fully governed.</p>
+    <button class="dock-eula" type="button" data-eula-open>EULA</button>
   </div>
 </footer>
 
-<script src="site.js"></script>
-<script src="chat.js"></script>
+<dialog class="eula-modal" id="eula-modal" aria-labelledby="eula-title">
+  <div class="eula-frame">
+    <div class="eula-head">
+      <div>
+        <p class="eula-kicker">XS Technologies Inc. · DataGateLodge division</p>
+        <p class="eula-title" id="eula-title">Software End-User License Agreement</p>
+      </div>
+      <button class="eula-close" type="button" id="eula-close" aria-label="Close agreement">✕</button>
+    </div>
+    <div class="eula-body" id="eula-body">
+      <p class="mono">Loading the agreement…</p>
+    </div>
+    <div class="eula-foot mono">Gatelodge · machine-code distribution ·
+      <a href="/eula.html">open as a page</a></div>
+  </div>
+</dialog>
+
+<script src="site.js?v=20261014"></script>
+<script src="chat.js?v=20261014"></script>
 </body>
 </html>
