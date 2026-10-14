@@ -461,7 +461,7 @@ async def chat_message(body: MessageRequest, request: Request):
                         "POST", f"{GATEWAY_URL}/v1/chat/completions",
                         headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
                         json={"model": ANSWER_MODEL, "messages": messages,
-                              "max_tokens": 600, "temperature": 0.3,
+                              "max_tokens": 1200, "temperature": 0.3,
                               "stream": True}) as r:
                     r.raise_for_status()
                     async for line in r.aiter_lines():
