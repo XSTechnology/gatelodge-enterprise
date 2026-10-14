@@ -470,7 +470,7 @@ input[type="range"]::-moz-range-thumb {
 .footer-name { font-family: var(--font-display); font-size: 1.15rem; font-weight: 600; }
 .footer-co { font-size: .66rem; color: var(--faint); letter-spacing: .1em; text-transform: uppercase; margin-top: .15rem; }
 
-.footer-domains { display: flex; gap: 1.6rem; font-size: .7rem; color: var(--faint); letter-spacing: .06em; }
+.footer-domains { display: flex; flex-wrap: wrap; gap: 1.6rem; font-size: .7rem; color: var(--faint); letter-spacing: .06em; }
 .footer-line { font-size: .68rem; color: var(--brass); letter-spacing: .12em; text-transform: uppercase; }
 
 /* ── motion ───────────────────────────────────────────────────────────── */
@@ -496,3 +496,128 @@ input[type="range"]::-moz-range-thumb {
   .reveal { opacity: 1; transform: none; }
   html { scroll-behavior: auto; }
 }
+
+/* ── console band (product visual) ─────────────────────────────────────── */
+
+.console-band {
+  max-width: var(--w); margin: 0 auto;
+  padding: clamp(1.5rem, 4vw, 3.5rem) clamp(1.2rem, 4vw, 2.5rem) 0;
+}
+
+.console {
+  background: linear-gradient(180deg, var(--ink-2), var(--ink) 85%);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 34px 90px rgba(0,0,0,.5), inset 0 1px 0 rgba(212,175,55,.07);
+  overflow: hidden;
+}
+
+.console-bar {
+  display: flex; align-items: center; gap: .7rem;
+  padding: .8rem 1.25rem; border-bottom: 1px solid var(--line-soft);
+  font-size: .66rem; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--muted);
+}
+.console-mark { width: 15px; height: 15px; color: var(--brass); flex: none; }
+.console-meta { margin-left: auto; color: var(--faint); letter-spacing: .08em; text-transform: none; }
+
+.console-body { display: grid; grid-template-columns: 1.55fr 1fr; }
+@media (max-width: 820px) { .console-body { grid-template-columns: 1fr; } }
+
+.console-main { padding: 1.3rem 1.4rem 1.15rem; min-width: 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.console-side {
+  border-left: 1px solid var(--line-soft);
+  display: flex; flex-direction: column; gap: 1rem;
+  padding: 1.3rem 1.4rem;
+}
+@media (max-width: 820px) {
+  .console-side { border-left: none; border-top: 1px solid var(--line-soft); }
+}
+
+.console-label {
+  font-size: .62rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--brass); margin-bottom: .7rem;
+}
+
+.console-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.console-table th {
+  text-align: left; font-weight: 400; color: var(--faint);
+  padding: .25rem .6rem .55rem 0; border-bottom: 1px solid var(--line-soft);
+  letter-spacing: .05em;
+}
+.console-table td {
+  color: var(--paper); padding: .6rem .6rem .6rem 0;
+  border-bottom: 1px dashed var(--line-soft);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.console-table td:first-child { color: var(--brass-bright); }
+.console-table .muted-alias { color: var(--faint); }
+.console-table .dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+}
+.console-table .dot.ok {
+  background: var(--cleared); box-shadow: 0 0 7px rgba(87,180,129,.55);
+}
+.console-table .dot.no { background: transparent; border: 1px solid var(--faint); }
+
+.console-spark {
+  display: flex; align-items: flex-end; gap: 4px; height: 46px;
+  margin: 1.2rem 0 .75rem;
+}
+.console-spark i {
+  flex: 1; height: var(--h, 30%);
+  background: linear-gradient(180deg, rgba(212,175,55,.68), rgba(212,175,55,.14));
+  border-radius: 2px 2px 0 0;
+}
+
+.console-foot { font-size: .64rem; color: var(--faint); line-height: 1.7; letter-spacing: .03em; }
+
+.console-card {
+  background: rgba(26, 36, 29, .55);
+  border: 1px solid var(--line-soft); border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+.console-num {
+  font-family: var(--font-display); font-size: 1.55rem;
+  color: var(--brass-bright); font-variant-numeric: tabular-nums;
+}
+.console-num span { font-size: .8rem; color: var(--faint); font-family: var(--font-mono); }
+.console-meter {
+  height: 5px; background: var(--line); border-radius: 3px;
+  margin: .7rem 0 .6rem; overflow: hidden;
+}
+.console-meter i {
+  display: block; height: 100%; width: var(--w, 40%);
+  background: linear-gradient(90deg, var(--brass), var(--brass-bright));
+  border-radius: 3px;
+}
+.console-hash { font-size: .84rem; color: var(--paper); letter-spacing: .02em; }
+.console-hash .ok { color: var(--cleared); }
+.console-tiny { font-size: .6rem; color: var(--faint); margin-top: .55rem; line-height: 1.7; }
+
+.console-caption {
+  text-align: center; margin-top: 1.15rem;
+  font-size: .66rem; color: var(--faint);
+  letter-spacing: .14em; text-transform: uppercase;
+}
+
+/* ── finish: grain, focus rings, ambient depth ─────────────────────────── */
+
+/* film grain — the gatehouse in lamplight, not a flat screen */
+body::after {
+  content: ""; position: fixed; inset: 0; z-index: 3000; pointer-events: none;
+  opacity: .026;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 160px;
+}
+
+/* keyboard focus — brass rings, always visible when tabbing */
+a:focus-visible, button:focus-visible, input:focus-visible, .btn:focus-visible {
+  outline: 2px solid var(--brass); outline-offset: 2px; border-radius: 4px;
+}
+
+/* ambient depth so cards never sit flat at rest */
+.pillar, .calc, .calc-result, .edition, .download-card, .contact-card {
+  box-shadow: 0 10px 30px rgba(0,0,0,.22);
+}
+.pillar:hover, .contact-card:hover { box-shadow: 0 18px 44px rgba(0,0,0,.4); }

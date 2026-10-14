@@ -5,6 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Gatelodge — the self-hosted AI gateway. Every model, one endpoint, fully governed. Keys, budgets, and an audit trail your security team signs off on.">
 <meta name="theme-color" content="#0e1411">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="DataGateLodge">
+<meta property="og:title" content="Gatelodge — Every model. One gateway. Fully governed.">
+<meta property="og:description" content="The self-hosted AI gateway. One OpenAI-compatible endpoint in front of every LLM your teams use — with keys, budgets, and a tamper-evident audit trail.">
+<meta property="og:url" content="https://datagatelodge.com/">
+<meta property="og:image" content="https://datagatelodge.com/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Gatelodge — Every model. One gateway. Fully governed.">
+<meta name="twitter:description" content="Self-hosted AI gateway with budgets, keys, and a tamper-evident audit chain.">
+<meta name="twitter:image" content="https://datagatelodge.com/og-image.png">
 <title>datagatelodge.solutions — The front door for your AI</title>
 <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%230e1411"/><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="%23d4af37" stroke-width="4"/><rect x="26" y="30" width="12" height="20" rx="1" fill="%23d4af37"/></svg>'>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -28,7 +38,7 @@
     <a href="#partners">Partners</a>
     <a href="#download">Download</a>
   </div>
-  <a class="nav-cta" href="#contact">Request access</a>
+  <a class="nav-cta" href="#download">Download free</a>
 </nav>
 
 <header class="hero">
@@ -71,6 +81,53 @@
     </aside>
   </div>
 </header>
+
+<!-- ── The console (product visual) ────────────────────────────────────── -->
+<section class="console-band" aria-label="The Gatelodge console">
+  <div class="console reveal">
+    <div class="console-bar">
+      <svg class="console-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="6"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
+      <span class="mono">gatelodge console · localhost:8010</span>
+      <span class="mono console-meta">v2.2.1 · community</span>
+    </div>
+    <div class="console-body">
+      <div class="console-main">
+        <p class="console-label mono">models · alias chains</p>
+        <table class="console-table mono">
+          <thead><tr><th>alias</th><th>routed to</th><th>p50</th><th>$ / 1k</th><th></th></tr></thead>
+          <tbody>
+            <tr><td>smart</td><td>anthropic · sonnet 4.5</td><td>82ms</td><td>3.00</td><td><span class="dot ok"></span></td></tr>
+            <tr><td>fast</td><td>groq · gpt-oss-20b</td><td>41ms</td><td>0.15</td><td><span class="dot ok"></span></td></tr>
+            <tr><td>vision</td><td>openai · gpt-4.1</td><td>119ms</td><td>2.50</td><td><span class="dot ok"></span></td></tr>
+            <tr><td>local</td><td>embedded · qwen3-8b</td><td>128ms</td><td>0.00</td><td><span class="dot ok"></span></td></tr>
+            <tr><td class="muted-alias">draft</td><td class="muted-alias">unlisted provider</td><td class="muted-alias">—</td><td class="muted-alias">—</td><td><span class="dot no"></span></td></tr>
+          </tbody>
+        </table>
+        <div class="console-spark" aria-hidden="true">
+          <i style="--h:22%"></i><i style="--h:34%"></i><i style="--h:28%"></i><i style="--h:47%"></i>
+          <i style="--h:38%"></i><i style="--h:56%"></i><i style="--h:44%"></i><i style="--h:63%"></i>
+          <i style="--h:52%"></i><i style="--h:71%"></i><i style="--h:60%"></i><i style="--h:78%"></i>
+        </div>
+        <p class="console-foot mono">don't-display: the unlisted model never renders — its requests return the
+          same unknown-model error as any typo</p>
+      </div>
+      <aside class="console-side">
+        <div class="console-card">
+          <p class="console-label mono">budget · this month</p>
+          <p class="console-num">$18.40 <span>/ $50.00</span></p>
+          <div class="console-meter"><i style="--w:37%"></i></div>
+          <p class="console-tiny mono">team:payments · svc-quotes · hard stop armed</p>
+        </div>
+        <div class="console-card">
+          <p class="console-label mono">audit chain</p>
+          <p class="console-hash mono">8d1f…c4a2 <span class="ok">✓ linked</span></p>
+          <p class="console-tiny mono">append-only · hash-chained · tamper-evident by construction</p>
+        </div>
+      </aside>
+    </div>
+  </div>
+  <p class="console-caption mono">The gatehouse in operation — one console page, the whole AI estate</p>
+</section>
 
 <main>
 
