@@ -23,6 +23,8 @@ Env:
   PAYMENT_LINK         — Stripe payment-link URL shown by the site ("" = none)
   STRIPE_WEBHOOK_SECRET— Stripe signing secret (phase 2; unset = 503)
   LICENSE_PRIVATE_KEY  — path to the RS256 private key PEM (phase 2)
+  DATABASE_URL         — Postgres (phase 3; unset = sqlite in DATA_DIR)
+  ADMIN_KEY            — bearer for POST /api/admin/issue (manual keys)
   EMAIL_PROVIDER       — "resend" to enable transactional email (see
                          emailer.py for RESEND_API_KEY, EMAIL_FROM,
                          EMAIL_REPLY_TO, PUBLIC_BASE_URL, SITE_URL;
@@ -59,14 +61,47 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 PAYMENT_LINK = os.environ.get("PAYMENT_LINK", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 LICENSE_PRIVATE_KEY = os.environ.get("LICENSE_PRIVATE_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")     # unset = sqlite
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")           # /api/admin/issue
 PORT = int(os.environ.get("PORT", "8100"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "leads.db"
 
+if DATABASE_URL:
+    import psycopg
+
+    class _Pg:
+        """sqlite3-compatible facade over psycopg: translates '?'
+        placeholders, commits + closes on context exit."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "INSERT OR IGNORE" in sql:
+                sql = (sql.replace("INSERT OR IGNORE INTO",
+                                   "INSERT INTO")
+                       + " ON CONFLICT DO NOTHING")
+            return self._conn.execute(sql.replace("?", "%s"),
+                                      params or ())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, et, ev, tb):
+            try:
+                if et is None:
+                    self._conn.commit()
+            finally:
+                self._conn.close()
+
 ALL_CLOUD_PROVIDERS = ["openai", "anthropic", "gemini", "responses",
                        "azure", "vertex", "bedrock", "runpod",
                        "runpod-public"]
+
+DURATIONS = {"30d": 30, "60d": 60, "90d": 90, "1y": 365, "2y": 730,
+             "3y": 1095, "perpetual": 100 * 365}
 
 app = FastAPI(title="Gatelodge Licensing", version="1.0.0")
 app.add_middleware(
@@ -76,16 +111,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── lead store (sqlite; phase 3 migrates to Postgres) ─────────────────────
+# ── store: Postgres when DATABASE_URL is set, sqlite otherwise ────────────
 
 
-def db() -> sqlite3.Connection:
+def db():
+    if DATABASE_URL:
+        return _Pg(psycopg.connect(DATABASE_URL))
     c = sqlite3.connect(DB)
     c.execute("PRAGMA journal_mode=WAL")
     return c
 
 
 def init_db() -> None:
+    if DATABASE_URL:
+        with db() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS leads (
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT NOT NULL,
+                business_name TEXT DEFAULT '',
+                serial TEXT DEFAULT '',
+                edition TEXT DEFAULT 'community-trial',
+                source TEXT DEFAULT 'website',
+                ip TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS licenses (
+                id BIGSERIAL PRIMARY KEY,
+                serial TEXT UNIQUE NOT NULL,
+                email TEXT NOT NULL,
+                edition TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                stripe_event TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT now(),
+                license_json TEXT DEFAULT '',
+                business_name TEXT DEFAULT '',
+                revoked BOOLEAN DEFAULT FALSE
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS email_log (
+                id BIGSERIAL PRIMARY KEY,
+                kind TEXT NOT NULL,
+                to_addr TEXT NOT NULL,
+                serial TEXT DEFAULT '',
+                ok INTEGER DEFAULT 0,
+                detail TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
+        return
     with db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,11 +186,16 @@ def init_db() -> None:
             detail TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
         )""")
-        try:      # migration for stores created before key-email delivery
-            c.execute("ALTER TABLE licenses "
-                      "ADD COLUMN license_json TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
+        for stmt in ("ALTER TABLE licenses "
+                     "ADD COLUMN license_json TEXT DEFAULT ''",
+                     "ALTER TABLE licenses "
+                     "ADD COLUMN business_name TEXT DEFAULT ''",
+                     "ALTER TABLE licenses "
+                     "ADD COLUMN revoked BOOLEAN DEFAULT 0"):
+            try:
+                c.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
 
 init_db()
@@ -288,22 +364,13 @@ async def license_recovery(body: RecoveryRequest, request: Request):
 # ── phase 2: stripe webhook -> perpetual community license key ────────────
 
 
-def issue_paid_key(email: str, stripe_event: str = "") -> dict:
-    """Mint a perpetual community License Key (all cloud providers named).
-
-    Idempotent per Stripe event — a retried webhook delivery returns the
-    key minted for that event instead of issuing a second one. Claims
-    mirror scripts/license_tool.py: RS256, kid = sha16 of the public key
-    DER. Requires LICENSE_PRIVATE_KEY."""
-    if stripe_event:
-        with db() as c:
-            row = c.execute(
-                "SELECT serial, license_json FROM licenses "
-                "WHERE stripe_event = ? AND kind = 'paid-key'",
-                (stripe_event,)).fetchone()
-        if row and row[1]:
-            return {"serial": row[0], "license_json": row[1],
-                    "email": email}
+def _mint(email: str, edition: str = "community",
+          business_name: str = "", providers: list | None = None,
+          duration_days: int = 100 * 365, kind: str = "paid-key",
+          stripe_event: str = "") -> dict:
+    """Mint a signed license and store it. Shared by the Stripe webhook
+    and the admin-issue endpoint. Claims mirror scripts/license_tool.py:
+    RS256, kid = sha16 of the public key DER."""
     if not LICENSE_PRIVATE_KEY or not os.path.exists(LICENSE_PRIVATE_KEY):
         raise HTTPException(503, "license issuance not configured")
     import hashlib
@@ -322,17 +389,18 @@ def issue_paid_key(email: str, stripe_event: str = "") -> dict:
     serial = "GL-" + secrets.token_hex(6).upper()
     claims = {
         "product": "gatelodge",
-        "edition": "community",
+        "edition": edition,
         "serial": serial,
-        "business_name": "",
+        "business_name": business_name,
         "contract_email": email,
         "vendor": "-",
         "support": False,
-        "providers": ALL_CLOUD_PROVIDERS,
+        "providers": providers if providers is not None
+        else ALL_CLOUD_PROVIDERS,
         "grace_hours": 0,
         "iat": now,
         "nbf": now,
-        "exp": now + 100 * 365 * 24 * 3600,   # effectively perpetual
+        "exp": now + duration_days * 24 * 3600,
     }
     token = jwt.encode(claims, priv, algorithm="RS256",
                        headers={"kid": kid})
@@ -340,11 +408,29 @@ def issue_paid_key(email: str, stripe_event: str = "") -> dict:
     with db() as c:
         c.execute("INSERT OR IGNORE INTO licenses "
                   "(serial, email, edition, kind, stripe_event, "
-                  "license_json) "
-                  "VALUES (?, ?, 'community', 'paid-key', ?, ?)",
-                  (serial, email, stripe_event, license_json))
+                  "license_json, business_name) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (serial, email, edition, kind, stripe_event,
+                   license_json, business_name))
     return {"serial": serial, "license_json": license_json,
             "email": email}
+
+
+def issue_paid_key(email: str, stripe_event: str = "") -> dict:
+    """Mint a perpetual community License Key (all cloud providers named).
+
+    Idempotent per Stripe event — a retried webhook delivery returns the
+    key minted for that event instead of issuing a second one."""
+    if stripe_event:
+        with db() as c:
+            row = c.execute(
+                "SELECT serial, license_json FROM licenses "
+                "WHERE stripe_event = ? AND kind = 'paid-key'",
+                (stripe_event,)).fetchone()
+        if row and row[1]:
+            return {"serial": row[0], "license_json": row[1],
+                    "email": email}
+    return _mint(email, kind="paid-key", stripe_event=stripe_event)
 
 
 async def deliver_purchase(rec: dict) -> None:
@@ -404,6 +490,61 @@ async def stripe_webhook(request: Request):
             await deliver_purchase(rec)
             return rec
     return {"received": True}
+
+
+# ── admin: manual license issue (LAN-side admin service only) ─────────────
+
+
+class AdminIssueRequest(BaseModel):
+    email: str = ""
+    edition: str = "community"          # community | enterprise
+    business_name: str = ""
+    duration: str = "perpetual"         # 30d/60d/90d/1y/2y/3y/perpetual
+    providers: list[str] = []           # backend names or cloud types
+
+
+def _require_admin(request: Request) -> None:
+    if not ADMIN_KEY:
+        raise HTTPException(503, "admin not configured")
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {ADMIN_KEY}":
+        raise HTTPException(401, "invalid admin key")
+
+
+@app.post("/api/admin/issue")
+async def admin_issue(body: AdminIssueRequest, request: Request):
+    _require_admin(request)
+    if not rate_ok(client_ip(request), limit=30, bucket="admin"):
+        raise HTTPException(429, "too many requests")
+    email = body.email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(400, "a valid email address is required")
+    if body.edition not in ("community", "enterprise"):
+        raise HTTPException(400, "edition must be community or enterprise")
+    if body.duration not in DURATIONS:
+        raise HTTPException(400, f"duration must be one of "
+                                 f"{', '.join(DURATIONS)}")
+    providers = [p.strip() for p in body.providers if p.strip()] or None
+    rec = _mint(email, edition=body.edition,
+                business_name=body.business_name.strip()[:120],
+                providers=providers,
+                duration_days=DURATIONS[body.duration],
+                kind="manual")
+    if emailer.configured():
+        subject, html_body, text_body = emailer.render_purchase(
+            rec["serial"], rec["license_json"])
+        ok, detail = await emailer.send(rec["email"], subject, html_body,
+                                        text_body)
+        print(f"[email] manual {rec['serial']} -> {rec['email']}: "
+              f"{'OK ' + detail if ok else 'FAIL ' + detail}")
+        with db() as c:
+            c.execute("INSERT INTO email_log "
+                      "(kind, to_addr, serial, ok, detail) "
+                      "VALUES ('manual-issue', ?, ?, ?, ?)",
+                      (rec["email"], rec["serial"], int(ok),
+                       detail[:300]))
+    return {"ok": True, "serial": rec["serial"],
+            "license_json": rec["license_json"]}
 
 
 if __name__ == "__main__":
