@@ -410,7 +410,7 @@ async def config():
 @app.post("/api/chat/session")
 async def create_session(body: SessionRequest, request: Request):
     ip = client_ip(request)
-    if not rate_ok(ip, limit=5, bucket="session"):
+    if not rate_ok(ip, limit=20, bucket="session"):
         raise HTTPException(429, "too many sessions — try again later")
     if not await turnstile_ok(body.turnstile_token, ip):
         raise HTTPException(403, "verification failed — please retry")

@@ -119,8 +119,17 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ turnstile_token: token || "" })
-      }).then(function (r) { return r.json(); })
+      }).then(function (r) {
+        if (r.status === 429) {
+          addMsg("agent", "You've opened several chats recently — give it "
+            + "a few minutes and try again. Questions? "
+            + "support@datagatelodge.com");
+          return null;
+        }
+        return r.json();
+      })
         .then(function (d) {
+          if (d === null) return;
           if (d && d.session_id) { state.session = d.session_id; return; }
           addMsg("agent", "The gate needs a moment — please try reopening "
             + "the chat. If it persists, email support@datagatelodge.com.");
