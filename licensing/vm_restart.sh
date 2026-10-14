@@ -14,13 +14,20 @@ set -e
 IMAGE="${1:-gatelodge-licensing:2}"
 [ $# -gt 0 ] && shift || true
 
+# Only well-formed KEY=VALUE lines survive — this drops empty lines and any
+# fragments of multi-line values (the base image's PYTHON_SHA256 carries a
+# trailing newline that would otherwise produce a stray "-e" argument and
+# wreck the docker run reference parsing).
 ENVS=$(docker inspect licensing --format '{{range .Config.Env}}{{println .}}{{end}}' \
-  | grep -vE '^(PATH|LANG|GPG|PYTHON|HOSTNAME|HOME)=' \
+  | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
+  | grep -vE '^(PATH|LANG|GPG|PYTHON|HOSTNAME|HOME)' \
   | sed 's/^/-e /')
 
 echo "carrying env keys:"
 docker inspect licensing --format '{{range .Config.Env}}{{println .}}{{end}}' \
-  | cut -d= -f1 | grep -vE '^(PATH|LANG|GPG|PYTHON|HOSTNAME|HOME)' | tr '\n' ' '
+  | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
+  | grep -vE '^(PATH|LANG|GPG|PYTHON|HOSTNAME|HOME)' \
+  | cut -d= -f1 | tr '\n' ' '
 echo
 
 docker rm -f licensing
