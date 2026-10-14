@@ -1,22 +1,22 @@
 [
   {
-    "content": "[v14-1..4] seam + chained audit + session hook + SCIM — DONE (e1aff98/5dcd44d/57f429e/8e459f6)",
+    "content": "[v14-1..4] seam + chained audit + session hook + SCIM — DONE",
     "id": "v14-1",
     "status": "completed"
   },
   {
-    "content": "[v14-5] FORK: session_budget_link — enterprise link (inert without section), monthly session:<id> spend gate vs default_tokens + per_tenant[owner], 429 mirrors key budget gate, enterprise pipeline wiring restored, canaries incl. shared-storage two-client — self",
+    "content": "[v14-5] session_budget_link fork (2a56de1): enterprise link, default_tokens + per_tenant[owner], 429 mirrors budget gate, shared-storage two-client canary, live verified (seeded 150/100 → 429) — DONE",
     "id": "v14-5",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[v14-6] UPSTREAM: cloud credential chains — auth: adc (google.auth lazy, cached token via httpx.Auth) + auth: sigv4 (env-var chain, per-request signer) in cloud.py, config passthrough, unit tests w/ fake fetchers — self",
+    "content": "[v14-6] credential chains upstream (9e1797c): credchains.py sigv4 signer (env chain, pinned) + ADCAuth (cached token, fake-fetcher tested), config auth/region passthrough, client cache keyed by mode; 7 tests — DONE",
     "id": "v14-6",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v14-7] v1.4.0: version bumps both repos, tags, SOC2 inventory gap-update, context — self",
+    "content": "[v14-7] v1.4.0 TAGGED both repos (upstream 74aab17, fork 039a8e8); suites 551/581; SOC2 inventory gaps marked LANDED — evidence period STARTS — DONE. v1.4 COMPLETE",
     "id": "v14-7",
-    "status": "pending"
+    "status": "completed"
   }
 ]

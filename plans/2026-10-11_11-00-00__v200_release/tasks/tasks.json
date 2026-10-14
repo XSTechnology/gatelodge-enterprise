@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[rel-1] Version bump 2.0.0; suites green (606/669); fork merged",
+    "id": "rel-1",
+    "status": "completed"
+  },
+  {
+    "content": "[rel-2] Tagged v2.0.0 both repos (standard 2a61934, fork merge HEAD)",
+    "id": "rel-2",
+    "status": "completed"
+  },
+  {
+    "content": "[rel-3] Community exe 2.0.0 verified: version + Data Gatelodge metadata + licensed probe + 20/20 smoke",
+    "id": "rel-3",
+    "status": "completed"
+  },
+  {
+    "content": "[rel-4] Enterprise exe 2.0.0 verified: all-5-claims license, 20/20 smoke, SCIM+MCP+teams all mounted live",
+    "id": "rel-4",
+    "status": "completed"
+  },
+  {
+    "content": "[rel-5] Closed Docker 2.0.0 verified: no-license CRITICAL refusal + licensed 20/20 smoke through mapped port, version 2.0.0",
+    "id": "rel-5",
+    "status": "completed"
+  }
+]

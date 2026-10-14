@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[v23-1] v2.3.0 release: version bump both repos + suites + commit/tag standard + merge/tag fork + launch 3 background builds",
+    "id": "v23-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[v23-2] Restart 8010 (kill PID → task loop) + 8011 (restart enterprise_main) to pick up Bedrock Converse; verify both",
+    "id": "v23-2",
+    "status": "pending"
+  },
+  {
+    "content": "[v23-3] Postgres on the rehearsal VM (f-7 groundwork) — Coolify-managed if API supports, else docker with volume",
+    "id": "v23-3",
+    "status": "pending"
+  },
+  {
+    "content": "[v23-4] Lost-key recovery endpoint (anti-enumeration, Turnstile-gated, resends stored license_json) + test + deploy to VM",
+    "id": "v23-4",
+    "status": "pending"
+  },
+  {
+    "content": "[v23-5] When builds finish: stage to gl_binary_test /MIR /XD data, verify on 8015/8016/8017, smoke tests",
+    "id": "v23-5",
+    "status": "pending"
+  }
+]

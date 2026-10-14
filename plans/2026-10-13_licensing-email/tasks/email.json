@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[em-1] Build licensing/emailer.py — Resend client + gatehouse-aesthetic email templates (purchase receipt + trial link)",
+    "id": "em-1",
+    "status": "completed"
+  },
+  {
+    "content": "[em-2] Wire email into app.py: purchase email after key mint, trial email on request, webhook idempotency fix (stripe_event check + license_json column)",
+    "id": "em-2",
+    "status": "completed"
+  },
+  {
+    "content": "[em-3] Local rehearsal: in-process TestClient flow (trial + webhook + retry-idempotency) with venv python — ALL PASS (29 checks)",
+    "id": "em-3",
+    "status": "completed"
+  },
+  {
+    "content": "[em-4] site.js trial-success note for emailed link + sync sites/datagatelodge copy — live on datagatelodge.com, deploy copy fully refreshed",
+    "id": "em-4",
+    "status": "completed"
+  },
+  {
+    "content": "[em-5] Docker build rehearsal + forged-webhook run on :8102 — ALL PASS (8 checks), container cleaned up",
+    "id": "em-5",
+    "status": "completed"
+  },
+  {
+    "content": "[em-6] Commit fork (e1a2f55) — DONE; blocked-on-user: Resend account + API key → add domain records via CF API → deploy VM with env → end-to-end purchase test",
+    "id": "em-6",
+    "status": "in_progress"
+  }
+]

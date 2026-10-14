@@ -1,0 +1,22 @@
+[
+  {
+    "content": "[otlp-1] gateway/tracing.py (core): W3C traceparent parse/continue, minimal span model, OTLP/HTTP-JSON exporter (hand-rolled, zero new deps), background batch flusher with cap+drop, test seams",
+    "id": "otlp-1",
+    "status": "completed"
+  },
+  {
+    "content": "[otlp-2] Wire into core: middleware server-span + traceparent echo, request-log trace_id correlation, llm child span (model/backend/tokens), otel config section, healthz + /admin/tracing surfaces, startup/shutdown flush hooks",
+    "id": "otlp-2",
+    "status": "completed"
+  },
+  {
+    "content": "[otlp-3] Canary tests (15) incl. in-test OTLP receiver; suites green: standard 588, fork 627",
+    "id": "otlp-3",
+    "status": "completed"
+  },
+  {
+    "content": "[otlp-4] Live verified on 8012: real GPU chat, inbound traceparent continued, llm child span parented, log trace correlation, receiver got 3 spans; committed + fork merged (490c1e1)",
+    "id": "otlp-4",
+    "status": "completed"
+  }
+]

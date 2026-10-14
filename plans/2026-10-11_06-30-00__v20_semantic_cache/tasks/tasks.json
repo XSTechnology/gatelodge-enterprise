@@ -1,0 +1,22 @@
+[
+  {
+    "content": "[sc-1] Studied exact-cache architecture + engine.embed API; scoping decided: (model, key, params)",
+    "id": "sc-1",
+    "status": "completed"
+  },
+  {
+    "content": "[sc-2] gateway/semantic_cache.py (core): embedder hook, cosine store (storage-seam namespace, LRU+TTL+cap), threshold admission, stats + semantic_cache config section",
+    "id": "sc-2",
+    "status": "completed"
+  },
+  {
+    "content": "[sc-3] Wired into chat path; 10 canary tests (paraphrase hit skips backend, scoping, TTL/cap, exact-cache precedence, metrics); suites green: standard 598, fork 637",
+    "id": "sc-3",
+    "status": "completed"
+  },
+  {
+    "content": "[sc-4] Live verified on 8012 with real nomic-embed: paraphrase served at cosine 0.9465 (no model call), dissimilar executed, semantic-cache in log+metrics; committed + fork merged",
+    "id": "sc-4",
+    "status": "completed"
+  }
+]

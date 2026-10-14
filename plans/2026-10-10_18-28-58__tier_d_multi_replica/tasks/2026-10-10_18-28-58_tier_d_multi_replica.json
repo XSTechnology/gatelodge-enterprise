@@ -5,28 +5,28 @@
     "status": "completed"
   },
   {
-    "content": "[tier-d-1] UPSTREAM: `shared` flag + _scope_spend guard; committed 2cc681a; merged (511/511) — DONE",
+    "content": "[tier-d-1] UPSTREAM: `shared` flag + _scope_spend guard; committed 2cc681a; merged — DONE",
     "id": "tier-d-1",
     "status": "completed"
   },
   {
-    "content": "[tier-d-2] gateway_enterprise/redis_storage.py: full protocol parity with InMemoryStorage verified via fakeredis (bytes-client robustness fixed); deps redis+fakeredis added — DONE",
+    "content": "[tier-d-2] RedisStorage + fakeredis parity tests; deps redis+fakeredis — DONE",
     "id": "tier-d-2",
     "status": "completed"
   },
   {
-    "content": "[tier-d-3] gateway_enterprise/db_config.py: DatabaseConfigStore (ConfigStore subclass; DB-API: dsn= psycopg3 / conn= sqlite for tests; gw_config table, BIGINT version, CAS save, seed-from-file on empty) + sqlite round-trip/CAS/seed tests — self",
+    "content": "[tier-d-3] DatabaseConfigStore (psycopg/sqlite, CAS, seed-from-file) + sqlite tests; dep psycopg — DONE",
     "id": "tier-d-3",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[tier-d-4] enterprise_main.py conditional wiring (GATELODGE_REDIS_URL / GATELODGE_CONFIG_DSN; storage→config→auth order, no-env = defaults) + canary suite (real wiring swaps, two-client shared-backend cases per plan §Test plan) — self",
+    "content": "[tier-d-4] enterprise_main._wire_tier_d conditional env wiring + 14-test canary suite (525/525) — DONE",
     "id": "tier-d-4",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[tier-d-5] Live two-replica verification on 8011+8012 (Docker redis+pg if present, else fakeredis/sqlite through same code paths): cross-replica config propagation, shared rate window + sso cache, smoke both, no-env regression; fork commit + both project contexts updated — self (synthesis)",
+    "content": "[tier-d-5] Live verification: Docker redis+pg, replica A (8011) smoke 23/23 + mutation + shared rate window, cross-process probe PASS, replica B (8012) inherits all + smoke 23/23, no-env regression 23/23, containers cleaned, commit b4b3ca4, contexts updated — DONE",
     "id": "tier-d-5",
-    "status": "pending"
+    "status": "completed"
   }
 ]

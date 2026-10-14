@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[t-1] Studied core spend machinery; found + fixed pre-existing gap: embedded/llama-server/runpod chat winners returned UNCHARGED (lazy log-seed masked it until a budget gate cached 0 first)",
+    "id": "t-1",
+    "status": "completed"
+  },
+  {
+    "content": "[t-2] Core seams: _REQUEST_TEAM, rec[\"team\"], team:<id> spend scopes + charge + non-openai charge fix; 5 tests; suites 606; committed + merged",
+    "id": "t-2",
+    "status": "completed"
+  },
+  {
+    "content": "[t-3] gateway_enterprise/teams.py: TeamsState, team_link + team_budget_link, /teams surface (scoped auth, rollups, key CRUD, team CRUD), license claim + wiring + license reissued",
+    "id": "t-3",
+    "status": "completed"
+  },
+  {
+    "content": "[t-4] 11 canary tests (auth scoping fail-closed, budgets both shapes, key lifecycle, CRUD, audit, license gate, triple mount); fork suite 669 green",
+    "id": "t-4",
+    "status": "completed"
+  },
+  {
+    "content": "[t-5] Live verified on 8012: attribution in log, over-budget 429 team_budget_exceeded (month log seeds ledger across restarts), rollups, team-admin scoping + fail-closed /admin/*, team-admin key mint with chained audit record; committed",
+    "id": "t-5",
+    "status": "completed"
+  }
+]

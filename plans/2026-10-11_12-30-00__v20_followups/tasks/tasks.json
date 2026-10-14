@@ -1,0 +1,22 @@
+[
+  {
+    "content": "[fs-1] Stream charging DONE: all 6 stream paths charge + log real usage (openai include_usage / SSE usage chunks) or chars//4 estimate; 3 tests (strong-form pre-seed, exact-usage capture, failure-no-charge); suites 609/677; committed + merged",
+    "id": "fs-1",
+    "status": "completed"
+  },
+  {
+    "content": "[ms-1] _StdioMCP DONE: asyncio subprocess, NDJSON JSON-RPC, lazy spawn, respawn-once, stderr drain, shutdown reap via router.add_event_handler, env passthrough; registry picks url vs command",
+    "id": "ms-1",
+    "status": "completed"
+  },
+  {
+    "content": "[ms-2] 5 stdio canary tests (REAL child processes: list/call, env, death-respawn, dual-transport, audit); MCP suite 18/18; fork suite 677 green",
+    "id": "ms-2",
+    "status": "completed"
+  },
+  {
+    "content": "[ms-3] Live verified on 8012: real stdio child (parent=gateway PID), allowlist filtering + denial, round-trips, chained audit, metrics; children REAPED on shutdown; committed",
+    "id": "ms-3",
+    "status": "completed"
+  }
+]

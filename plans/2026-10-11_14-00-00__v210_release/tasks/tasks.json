@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[rm-1] Version bump 2.1.0; suites green (609/677); fork merged",
+    "id": "rm-1",
+    "status": "completed"
+  },
+  {
+    "content": "[rm-2] Tagged v2.1.0 both repos (standard ebdb8b5, fork 6f3dae9)",
+    "id": "rm-2",
+    "status": "completed"
+  },
+  {
+    "content": "[rm-3] Community exe 2.1.0 verified: version + licensed probe + 20/20 smoke",
+    "id": "rm-3",
+    "status": "completed"
+  },
+  {
+    "content": "[rm-4] Enterprise exe 2.1.0 verified: all-5-claims, 20/20 smoke, SCIM+MCP+teams all live",
+    "id": "rm-4",
+    "status": "completed"
+  },
+  {
+    "content": "[rm-5] Closed Docker 2.1.0 verified: no-license CRITICAL refusal + licensed 20/20 smoke, version 2.1.0",
+    "id": "rm-5",
+    "status": "completed"
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "content": "[mcp-1] Core: additive add_extra_router seam (SCIM+MCP coexist) + tracing.add_span + mcp in default enterprise claims + metrics-registry fix (semantic+MCP counters were silently dropped); suites 601; committed + merged",
+    "id": "mcp-1",
+    "status": "completed"
+  },
+  {
+    "content": "[mcp-2] gateway_enterprise/mcp.py: streamable-HTTP MCP server surface, upstream client (session + tools cache + JSON/SSE parse), key auth + per-key tool allowlists, chained audit + metrics + tracing per call",
+    "id": "mcp-2",
+    "status": "completed"
+  },
+  {
+    "content": "[mcp-3] _wire_mcp license gate; internal license reissued with mcp claim; 13 canary tests; fork suite 653 green",
+    "id": "mcp-3",
+    "status": "completed"
+  },
+  {
+    "content": "[mcp-4] Live verified on 8012 vs real stub upstream: full protocol flow, allowlist filtering+denial, 3 chained audit records (ok/ok/denied), OTLP spans parented, Prometheus counter live; committed ebfd1be",
+    "id": "mcp-4",
+    "status": "completed"
+  }
+]

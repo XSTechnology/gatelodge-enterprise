@@ -1,0 +1,17 @@
+[
+  {
+    "content": "[jwks-1] UPSTREAM: sso.py JWKS machinery (validate_local, keyset cache w/ throttle, authenticate = cache→local→introspect), dep pyjwt[crypto] — DONE",
+    "id": "jwks-1",
+    "status": "completed"
+  },
+  {
+    "content": "[jwks-2] UPSTREAM: 8 JWKS tests (29 in file), suite 527/527, committed b7a49e6 — DONE",
+    "id": "jwks-2",
+    "status": "completed"
+  },
+  {
+    "content": "[jwks-3] Fork: merge 253202d (dep conflict resolved), suite 542/542; stub_idp JWKS+minting (0bf4f61); live verified: JWT→200 zero introspections, opaque→introspection 200+403, tampered→401; contexts updated — DONE",
+    "id": "jwks-3",
+    "status": "completed"
+  }
+]

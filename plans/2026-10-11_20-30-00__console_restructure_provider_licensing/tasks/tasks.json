@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[pl] Provider licensing + don't-display — DONE (7169b68)",
+    "id": "pl",
+    "status": "completed"
+  },
+  {
+    "content": "[lo] License ops 1-5 (serial/ledger, kid, expiry warnings, hot-reload, caps) — DONE (b859050/c319fc3)",
+    "id": "lo",
+    "status": "completed"
+  },
+  {
+    "content": "[cr] Console restructure + live verify — DONE (9d3202c/a626d5c; 8011 running GL-52123F9A9A1C)",
+    "id": "cr",
+    "status": "completed"
+  },
+  {
+    "content": "[rl-1] #7 grace window: default 72h, grace_hours claim (0=off), serving continues in window, level-0 warning, status/healthz fields, console grace banner — DONE",
+    "id": "rl-1",
+    "status": "completed"
+  },
+  {
+    "content": "[rl-2] #6 CRL: signed revocations.json (kid), bootstrap + runtime revoked checks, hot-reload (newly-revoked flips live), broken/unsigned files ignored, shared _decode_jwt — DONE",
+    "id": "rl-2",
+    "status": "completed"
+  },
+  {
+    "content": "[rl-3] license_tool revoke subcommand (append+version+re-sign+ledger) + issue --grace-hours; app watch: CRL hook + grace/revocation events — DONE",
+    "id": "rl-3",
+    "status": "completed"
+  },
+  {
+    "content": "[rl-4] Canaries +6 (grace serves/warns/disabled/custom, CRL bootstrap/runtime-flip/non-revoked/broken/tool revoke+grace) — standard 658 / fork 727; committed 9ef97fa + merged — DONE",
+    "id": "rl-4",
+    "status": "completed"
+  }
+]

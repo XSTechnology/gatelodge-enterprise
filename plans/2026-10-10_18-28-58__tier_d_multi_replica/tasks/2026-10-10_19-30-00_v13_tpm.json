@@ -1,0 +1,17 @@
+[
+  {
+    "content": "[tpm-1] UPSTREAM: rate_limit_tpm end-to-end (config parser, admin payload/listing, console, gate + estimate in rate_limit_link, post-charge in _charge_request) — DONE",
+    "id": "tpm-1",
+    "status": "completed"
+  },
+  {
+    "content": "[tpm-2] UPSTREAM: 8 TPM tests, suite 519/519, committed ec2e944 — DONE",
+    "id": "tpm-2",
+    "status": "completed"
+  },
+  {
+    "content": "[tpm-3] Fork: merged, shared-window canary (534/534), live-verified on 8011 with Docker redis (200 → cross-process seed 150 → 429), committed bf33f1d, contexts updated — DONE",
+    "id": "tpm-3",
+    "status": "completed"
+  }
+]

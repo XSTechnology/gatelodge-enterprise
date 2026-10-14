@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[n1-1] Restart 8010 (schtasks Gatelodge) + 8011 (enterprise_main.py) onto v2.2.1 code, verify versions",
+    "id": "n1-1",
+    "status": "completed"
+  },
+  {
+    "content": "[n2-1] Fix POST /admin/backends to build config for wire types (anthropic/gemini/responses/azure/vertex) + canaries",
+    "id": "n2-1",
+    "status": "completed"
+  },
+  {
+    "content": "[n2-2] Fix POST /admin/models remote_id drop bug + canaries",
+    "id": "n2-2",
+    "status": "completed"
+  },
+  {
+    "content": "[n3-1] Bedrock Converse native wire type (sigv4 bedrock-runtime) + canaries",
+    "id": "n3-1",
+    "status": "completed"
+  },
+  {
+    "content": "[n3-2] Triton/KServe research → decision: OpenAI-compat sufficient, no native type (documented in context)",
+    "id": "n3-2",
+    "status": "completed"
+  },
+  {
+    "content": "[n4-1] Channel-trial BD: pricing design + outreach drafts + co-branded demo trial license",
+    "id": "n4-1",
+    "status": "in_progress"
+  }
+]

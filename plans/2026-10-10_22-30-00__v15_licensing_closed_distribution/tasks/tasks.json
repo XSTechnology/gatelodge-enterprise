@@ -1,0 +1,12 @@
+[
+  {
+    "content": "[v15-1] Tag v1.5.0 in both repos (suites 573/612 green) + release rebuilds of both exes reporting 1.5.0, re-verified (probe + 20/20 smoke + SCIM)",
+    "id": "v15-1",
+    "status": "completed"
+  },
+  {
+    "content": "[v15-2] Live-tested deploy/Dockerfile.closed: glibc fix (runtime=builder base), no-license refusal exit + licensed boot 20/20 smoke + zero .py in image",
+    "id": "v15-2",
+    "status": "completed"
+  }
+]

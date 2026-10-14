@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[v221-1] Version bump 2.2.1 in standard pyproject + uv.lock, commit, tag v2.2.1",
+    "id": "v221-1",
+    "status": "completed"
+  },
+  {
+    "content": "[v221-2] Merge bump into fork, tag v2.2.1 in fork",
+    "id": "v221-2",
+    "status": "completed"
+  },
+  {
+    "content": "[v221-3] Build community binary (standard build_binary.py)",
+    "id": "v221-3",
+    "status": "completed"
+  },
+  {
+    "content": "[v221-4] Build enterprise binary (fork build_binary.py)",
+    "id": "v221-4",
+    "status": "completed"
+  },
+  {
+    "content": "[v221-5] Build closed Docker image",
+    "id": "v221-5",
+    "status": "completed"
+  },
+  {
+    "content": "[v221-6] Stage artifacts to gl_binary_test scratch dirs",
+    "id": "v221-6",
+    "status": "completed"
+  },
+  {
+    "content": "[v221-7] Release-verify 8015/8016/8017 with smoke bearers",
+    "id": "v221-7",
+    "status": "completed"
+  }
+]

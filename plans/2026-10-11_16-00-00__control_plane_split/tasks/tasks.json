@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[cp-1] Config: admin_port/admin_bind fields + GATELODGE_PORT/BIND/ADMIN_PORT/ADMIN_BIND env overrides in GatewayConfig (env = boot context, wins over file, survives hot-reload); tests",
+    "id": "cp-1",
+    "status": "completed"
+  },
+  {
+    "content": "[cp-2] Port-scope shims (serving: no /admin/*, no console; admin: /admin + console + /healthz only) + dual-uvicorn boot in __main__ + healthz admin_port field; tests",
+    "id": "cp-2",
+    "status": "completed"
+  },
+  {
+    "content": "[cp-3] Suites green both repos (618/686); commit upstream (d922a62 + 6afe571 fix); merge fork (c6b0df8)",
+    "id": "cp-3",
+    "status": "completed"
+  },
+  {
+    "content": "[cp-4] Live verify: standard 8013/8014 PASS + fork 8012/8013 PASS 19/19 (teams+SCIM on admin port = the fix; MCP+chat on serving)",
+    "id": "cp-4",
+    "status": "completed"
+  },
+  {
+    "content": "[ut-1] URL-token auth: /<token>/v1 path form + config-gated ?key= query form through resolve_key_link; allowlist auth.token_forms; tests (10 canary)",
+    "id": "ut-1",
+    "status": "completed"
+  },
+  {
+    "content": "[ut-2] URL-token live verify 12/12 on fork 8012 (+ spend attribution proof via team rollup); suites 628/696; commit 577db15; merge 3bc546d",
+    "id": "ut-2",
+    "status": "completed"
+  }
+]

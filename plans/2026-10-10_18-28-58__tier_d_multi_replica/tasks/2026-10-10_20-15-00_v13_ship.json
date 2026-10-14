@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[ship-1] pyproject win32-marker wheel source + uv lock; Dockerfile (uv sync --no-install-package llama-cpp-python, non-root, healthcheck — shell-form after JSON-array parse fix) + .dockerignore at context root — DONE",
+    "id": "ship-1",
+    "status": "completed"
+  },
+  {
+    "content": "[ship-2] docker-compose (gateway+redis+pg healthchecks, tier-D env wiring, mounted seed) + obs profile (prometheus + grafana provisioned; scrape carries bearer — /metrics is behind auth, caught live) — DONE",
+    "id": "ship-2",
+    "status": "completed"
+  },
+  {
+    "content": "[ship-3] Grafana dashboard (11 panels, real gateway_* metrics — every query validated against the live exposition) + 5 alert rules — DONE",
+    "id": "ship-3",
+    "status": "completed"
+  },
+  {
+    "content": "[ship-4] QUICKSTART.md + CHANGE_ME seed template — DONE",
+    "id": "ship-4",
+    "status": "completed"
+  },
+  {
+    "content": "[ship-5] Live verified: image built, stack healthy (3 swaps + DB seed in boot log), smoke 20/20 through the container, whoami correct, metrics validated; stack torn down + volume removed, template reset; suite 546/546; committed 1ddec25; contexts updated — DONE — v1.3 TRAIN COMPLETE",
+    "id": "ship-5",
+    "status": "completed"
+  }
+]

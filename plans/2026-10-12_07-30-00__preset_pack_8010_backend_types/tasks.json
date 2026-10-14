@@ -1,0 +1,52 @@
+[
+  {
+    "content": "[pp-1] Tier-0 preset pack — DONE (standard 300d6bd)",
+    "id": "pp-1",
+    "status": "completed"
+  },
+  {
+    "content": "[pp-2] Preset pack verify on 8011 — DONE (fork a40ee09)",
+    "id": "pp-2",
+    "status": "completed"
+  },
+  {
+    "content": "[hd-1] 8010 hardening — DONE (strong key, v2.2.0 code, license GL-4D7CEB1929D1)",
+    "id": "hd-1",
+    "status": "completed"
+  },
+  {
+    "content": "[ag-1] anthropic backend type — DONE (6619670 + 5eb4ef7, live stub-verified)",
+    "id": "ag-1",
+    "status": "completed"
+  },
+  {
+    "content": "[ag-2] gemini backend type — DONE (same commits)",
+    "id": "ag-2",
+    "status": "completed"
+  },
+  {
+    "content": "[ag-3] wire suites + merge + live verify — DONE (standard 666/fork 735 at the time)",
+    "id": "ag-3",
+    "status": "completed"
+  },
+  {
+    "content": "[ms-1] Console-managed provider credentials (POST /admin/secrets, resolution env→store→file→cmd→keyring, Access-panel paste UI, key_manager RBAC, audit by name) — DONE (standard c62a0b2, fork 740; live-verified: pasted key served claude:sonnet immediately)",
+    "id": "ms-1",
+    "status": "completed"
+  },
+  {
+    "content": "[bk-1] Bedrock-mantle spike — DONE: endpoint https://bedrock-mantle.{region}.api.aws/v1 speaks OpenAI/Responses/Anthropic natively; sigv4 service override wired (service: bedrock-mantle via backend config, df6ee88); Bedrock also accepts Bearer API keys — existing openai type works unchanged",
+    "id": "bk-1",
+    "status": "completed"
+  },
+  {
+    "content": "[rp-1] Responses API wire type — DONE (df6ee88): /v1/responses translator (instructions, typed Items, function_call/function_call_output, store=false stateless, reasoning Items skipped); canaries 11/11 incl. tool round-trip + Bedrock sigv4 override test; standard 674 / fork 743",
+    "id": "rp-1",
+    "status": "completed"
+  },
+  {
+    "content": "[av-1] Azure/Vertex thin adapters — PENDING: Azure = thin adapter over openai type (Entra auth + api-version + deployment naming); Vertex = thin adapter over gemini translator (ADC auth — credchain exists; project/region endpoints). Build when an enterprise customer names their cloud",
+    "id": "av-1",
+    "status": "pending"
+  }
+]

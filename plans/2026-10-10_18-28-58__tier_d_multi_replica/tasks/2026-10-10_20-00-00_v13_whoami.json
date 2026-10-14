@@ -1,0 +1,17 @@
+[
+  {
+    "content": "[whoami-1] UPSTREAM: current_principal() + whoami endpoint + rbac_link refactor (1e5e7a7) + role-exemption fix found in live verify (62bf955) — DONE",
+    "id": "whoami-1",
+    "status": "completed"
+  },
+  {
+    "content": "[whoami-2] UPSTREAM: console RBAC awareness — badge, api() gate, 403 re-fetch — DONE",
+    "id": "whoami-2",
+    "status": "completed"
+  },
+  {
+    "content": "[whoami-3] Tests (4) + smoke row; upstream suite 531; fork merged, suite 546; live verified all three dev keys (km 403→200 after fix, mutations still 403); orphaned stale server on 8011 killed; contexts updated — DONE",
+    "id": "whoami-3",
+    "status": "completed"
+  }
+]

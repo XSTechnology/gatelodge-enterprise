@@ -1,0 +1,42 @@
+[
+  {
+    "content": "[f-0] EULA sample draft + site /eula page marked DRAFT",
+    "id": "f-0",
+    "status": "completed"
+  },
+  {
+    "content": "[f-1] Turnstile widget via CF API (site key + secret)",
+    "id": "f-1",
+    "status": "completed"
+  },
+  {
+    "content": "[f-2] Licensing service: trial-request + binary download + leads ledger + CORS + rate limit",
+    "id": "f-2",
+    "status": "completed"
+  },
+  {
+    "content": "[f-3] Local rehearsal of the service (Docker build + endpoint tests)",
+    "id": "f-3",
+    "status": "completed"
+  },
+  {
+    "content": "[f-4] Site: download section with form + Turnstile, Buy button, EULA link",
+    "id": "f-4",
+    "status": "completed"
+  },
+  {
+    "content": "[f-5] Phase-2 ready: Stripe webhook endpoint + paid-key issuance (simulated test)",
+    "id": "f-5",
+    "status": "completed"
+  },
+  {
+    "content": "[f-6] Deploy service to rehearsal VM + verify end-to-end",
+    "id": "f-6",
+    "status": "completed"
+  },
+  {
+    "content": "[f-7] Phase-3 start: Postgres on the VM via Coolify (portal groundwork)",
+    "id": "f-7",
+    "status": "pending"
+  }
+]
