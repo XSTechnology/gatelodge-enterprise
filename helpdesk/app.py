@@ -212,6 +212,17 @@ CREATE TABLE IF NOT EXISTS tool_proposals (
   status TEXT DEFAULT 'open',
   created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS rulesets (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  kind TEXT DEFAULT 'general',
+  description TEXT DEFAULT '',
+  version INT DEFAULT 1,
+  jdm TEXT NOT NULL,
+  enabled BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE inbound_emails ADD COLUMN IF NOT EXISTS rule TEXT DEFAULT '';
 """
 
 
@@ -1023,15 +1034,15 @@ class InboundEmail(BaseModel):
 
 def _insert_inbound(mid: str, frm: str, subject: str, body: str,
                     status: str, confident: bool, doc: str, topic: str,
-                    reply: str) -> None:
+                    reply: str, rule: str = "") -> None:
     with psycopg.connect(DATABASE_URL) as conn:
         conn.execute(
             "INSERT INTO inbound_emails (id, from_addr, subject, body, "
-            "status, confident, doc, topic, reply, handled_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "status, confident, doc, topic, reply, rule, handled_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
             "CASE WHEN %s = 'review' THEN NULL ELSE now() END)",
             (mid, frm, subject, body, status, confident, doc, topic,
-             reply, status))
+             reply, rule, status))
 
 
 def _inbound_seen(mid: str) -> bool:
@@ -1142,12 +1153,27 @@ async def email_inbound(body: InboundEmail, request: Request):
 
     t = await triage(text, [])
     primary = t["chunks"][0]["doc"] if t["chunks"] else None
-    if t["legal"] or not (t["confident"] and t["chunks"]):
+    # deterministic triage policy — thresholds live as a versioned ruleset,
+    # not in code; the rule that fired is recorded for audit
+    tri = await _run(lambda: _evaluate_policy("email-triage", {
+        "confident": bool(t["confident"]),
+        "legal": bool(t["legal"]),
+        "kb_hits": len(t["chunks"])}))
+    if tri is None:
+        tri = {"policy": "builtin fallback", "performance": "",
+               "result": {"action": "auto_reply" if (
+                   t["confident"] and t["chunks"]) else "inbox",
+                   "rule": "builtin"}}
+    tri_rule = str(tri["result"].get("rule", ""))
+    if tri["result"].get("action") != "auto_reply":
         await _run(lambda: _insert_inbound(
             mid, frm, subject, text, "review", False, primary,
-            t["topic"], ""))
-        print(f"[gatekeeper] inbound queued for review ({t['topic'] or 'uncovered'})")
-        return {"status": "review", "reason": t["topic"] or "uncovered"}
+            t["topic"], "", tri_rule))
+        print(f"[gatekeeper] inbound queued for review "
+              f"({t['topic'] or 'uncovered'} · rule {tri_rule} · "
+              f"{tri['policy']})")
+        return {"status": "review", "reason": t["topic"] or "uncovered",
+                "rule": tri_rule, "policy": tri["policy"]}
 
     try:
         answer = await answer_once(text, t["chunks"])
@@ -1155,22 +1181,25 @@ async def email_inbound(body: InboundEmail, request: Request):
         print(f"[gatekeeper] inbound answer error: {e!r}")
         await _run(lambda: _insert_inbound(
             mid, frm, subject, text, "review", False, primary,
-            t["topic"], ""))
-        return {"status": "review", "reason": "answer-error"}
+            t["topic"], "", tri_rule))
+        return {"status": "review", "reason": "answer-error",
+                "rule": tri_rule, "policy": tri["policy"]}
 
     ok, detail = await send_reply_email(frm, subject, answer, mid)
     status = "answered" if ok else "review"
     await _run(lambda: _insert_inbound(
         mid, frm, subject, text, status, True, primary, t["topic"],
-        answer if ok else ""))
+        answer if ok else "", tri_rule))
     await _run_email_log(frm, ok, detail or "inbound auto-reply",
                          kind="gatekeeper-email-reply",
                          subject=f"Re: {subject}" if subject
                          else "Your question — Gatelodge",
                          body=answer)
     print(f"[gatekeeper] inbound {mid[:12]} from {frm}: "
-          f"{'answered (' + primary + ')' if ok else 'QUEUED (send failed)'}")
-    return {"status": status, "doc": primary,
+          f"{'answered (' + primary + ')' if ok else 'QUEUED (send failed)'}"
+          f" · rule {tri_rule}")
+    return {"status": status, "doc": primary, "rule": tri_rule,
+            "policy": tri["policy"],
             "sources": [{"doc": c["doc"], "section": c["section"]}
                         for c in t["chunks"]]}
 
@@ -1413,6 +1442,11 @@ async def execute_task(task_id: int) -> None:
         # thread the assistant turn (native call or text JSON)
         messages.append(d["assistant"])
 
+        # deterministic pre-tool gate — policy decides BEFORE execution
+        gate = await _run(lambda: _evaluate_policy(
+            "task-tool-gate",
+            {"tool": tool_name, "notify": bool(notify)}))
+
         if tool_name not in TOOLS:
             output = (f"ERROR: no capability named '{tool_name}'. "
                       f"Available: {', '.join(sorted(TOOLS))}")
@@ -1420,6 +1454,13 @@ async def execute_task(task_id: int) -> None:
             await _run(lambda: _propose_tool(
                 tool_name, f"wanted during task '{name}': "
                 f"{tool_input[:300]}"))
+        elif gate is not None \
+                and gate["result"].get("allow") is False:
+            rule = gate["result"].get("rule", "")
+            output = (f"BLOCKED by policy {gate['policy']} "
+                      f"(rule: {rule}). The tool was not executed.")
+            status = "blocked"
+            print(f"[tasks] gate blocked {tool_name}: {rule}")
         else:
             try:
                 output = str(await TOOLS[tool_name]["fn"](tool_input))[:6000]
@@ -1478,6 +1519,32 @@ async def execute_task(task_id: int) -> None:
         print(f"[tasks] review error: {e!r}")
         summary = f"Review error: {e!r}"
 
+    # deterministic check — countable evidence the LLM review can miss:
+    # every URL referenced in the goal/inputs should have been fetched
+    urls_expected = len(re.findall(
+        r"https?://[^\s,)\"]+", f"{goal}\n{inputs or ''}"))
+    fetches_done = sum(1 for t in transcript
+                       if t.startswith("TOOL web_fetch ("))
+    if urls_expected and fetches_done < urls_expected:
+        det_note = (f"Deterministic check: {fetches_done} of "
+                    f"{urls_expected} referenced URLs were actually "
+                    f"fetched.")
+        summary = (det_note + " " + summary).strip()
+        if classification in ("achieved", "review"):
+            classification = "partial"
+        print(f"[tasks] {det_note}")
+
+        def save_det_step():
+            with psycopg.connect(DATABASE_URL) as conn:
+                conn.execute(
+                    "INSERT INTO task_steps (run_id, seq, tool, "
+                    "description, input, output, status) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (run_id, 900, "deterministic_check",
+                     "countable evidence check", "",
+                     det_note, "ok"))
+        await _run(save_det_step)
+
     # notify the owner
     if notify:
         body = (f"Task: {name}\nOutcome: {classification}\n\n{summary}\n\n"
@@ -1515,6 +1582,108 @@ def _task_schedule(task_id: int) -> str:
         row = conn.execute("SELECT schedule FROM tasks WHERE id=%s",
                            (task_id,)).fetchone()
     return row[0] if row else "manual"
+
+
+# ── deterministic policy engine (system rulesets, fail-open) ─────────────
+
+def _load_ruleset(kind: str):
+    """(name, version, jdm) for the enabled ruleset of this kind."""
+    if not DATABASE_URL:
+        return None
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            row = conn.execute(
+                "SELECT name, version, jdm FROM rulesets "
+                "WHERE kind=%s AND enabled ORDER BY id LIMIT 1",
+                (kind,)).fetchone()
+        return row
+    except Exception:
+        return None
+
+
+def _evaluate_policy(kind: str, facts: dict) -> dict | None:
+    """Evaluate a system ruleset. None = no policy configured (fail-open)."""
+    rs = _load_ruleset(kind)
+    if not rs:
+        return None
+    try:
+        from zen import ZenEngine
+        decision = ZenEngine().create_decision(json.loads(rs[2]))
+        out = decision.evaluate(facts)
+        return {"policy": f"{rs[0]} v{rs[1]}",
+                "result": out.get("result", {}) if isinstance(out, dict)
+                else {},
+                "performance": out.get("performance", "")
+                if isinstance(out, dict) else ""}
+    except Exception as e:
+        print(f"[tasks] policy {kind} error: {e!r}")
+        return None
+
+
+def _table_jdm(name: str, inputs: list[str], outputs: list[str],
+               rules: list[tuple]) -> str:
+    """Build a single-table JDM graph. rules = [(id, [cells...], [outs])]."""
+    ins = [{"field": f, "id": f"c{i+1}", "name": f, "type": "expression"}
+           for i, f in enumerate(inputs)]
+    outs = [{"field": f, "id": f"o{i+1}", "name": f, "type": "expression"}
+            for i, f in enumerate(outputs)]
+    jrules = []
+    for rid, cells, values in rules:
+        r = {"_id": rid}
+        for j, v in enumerate(cells):
+            r[f"c{j+1}"] = v
+        for j, v in enumerate(values):
+            r[f"o{j+1}"] = v
+        jrules.append(r)
+    return json.dumps({
+        "edges": [{"id": "e1", "sourceId": "n-input", "targetId": "n-table"},
+                  {"id": "e2", "sourceId": "n-table", "targetId": "n-out"}],
+        "nodes": [{"id": "n-input", "type": "inputNode", "name": "Facts"},
+                  {"id": "n-out", "type": "outputNode", "name": "Decision"},
+                  {"id": "n-table", "type": "decisionTableNode",
+                   "name": name,
+                   "content": {"hitPolicy": "first", "inputs": ins,
+                               "outputs": outs, "rules": jrules}}]})
+
+
+DEFAULT_RULESETS = [
+    ("Task tool gate", "task-tool-gate",
+     "Deterministic pre-tool gate for the admin task agent: every tool "
+     "call is allowed or blocked by policy before execution.",
+     ["tool", "notify"], ["allow", "rule"], [
+         ("no-notify-email", ['== "email_send"', "== false"],
+          ["false", '"no-notify-email"']),
+         ("allow-all", ["", ""], ["true", '"allow-all"']),
+     ]),
+    ("Inbound email triage", "email-triage",
+     "Deterministic triage for inbound support mail: confident KB "
+     "questions auto-answer, everything else queues for review.",
+     ["confident", "legal", "kb_hits"], ["action", "rule"], [
+         ("legal-queue", ["", "== true", ""],
+          ['"inbox"', '"legal-queue"']),
+         ("no-kb", ["", "", "== 0"], ['"inbox"', '"no-kb"']),
+         ("confident-faq", ["== true", "", ""],
+          ['"auto_reply"', '"confident-faq"']),
+         ("not-confident", ["", "", ""],
+          ['"inbox"', '"not-confident"']),
+     ]),
+]
+
+
+def _sync_rulesets() -> None:
+    """Seed/refresh the system policies (idempotent, by kind)."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        for name, kind, desc, ins, outs, rules in DEFAULT_RULESETS:
+            conn.execute(
+                "INSERT INTO rulesets (name, kind, description, jdm) "
+                "SELECT %s, %s, %s, %s WHERE NOT EXISTS "
+                "(SELECT 1 FROM rulesets WHERE kind=%s)",
+                (name, kind, desc, _table_jdm(name, ins, outs, rules),
+                 kind))
+        # dedupe guard: keep the lowest id per kind
+        conn.execute(
+            "DELETE FROM rulesets a USING rulesets b "
+            "WHERE a.kind = b.kind AND a.id > b.id")
 
 
 async def run_due_tasks() -> None:
@@ -1570,6 +1739,11 @@ async def start_task_runner() -> None:
         await _run(sync_tools)
     except Exception as e:
         print(f"[tasks] tool sync failed: {e!r}")
+    # seed the deterministic policy rulesets (tool gate + email triage)
+    try:
+        await _run(_sync_rulesets)
+    except Exception as e:
+        print(f"[tasks] ruleset sync failed: {e!r}")
     asyncio.create_task(_task_loop())
 
 

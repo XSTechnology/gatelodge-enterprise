@@ -59,3 +59,26 @@ SELECT 'Refund eligibility decision',
        (SELECT id FROM portal_rulesets WHERE name = 'Refund eligibility policy')
 WHERE NOT EXISTS (SELECT 1 FROM portal_templates
                   WHERE name = 'Refund eligibility decision');
+
+-- ── support ticket triage policy (global, phase 2) ──────────────────────
+INSERT INTO portal_rulesets (name, description, version, jdm)
+SELECT 'Support ticket triage policy',
+       'Deterministic ticket routing: severity, SLA remaining, tier, repeat-escalation guard.',
+       1,
+       '{"edges": [{"id": "e1", "sourceId": "n-input", "targetId": "n-table"}, {"id": "e2", "sourceId": "n-table", "targetId": "n-output"}], "nodes": [{"id": "n-input", "type": "inputNode", "name": "Facts"}, {"id": "n-output", "type": "outputNode", "name": "Routing"}, {"id": "n-table", "type": "decisionTableNode", "name": "Ticket triage", "content": {"hitPolicy": "first", "inputs": [{"field": "severity", "id": "c1", "name": "Severity", "type": "expression"}, {"field": "customer_tier", "id": "c2", "name": "Tier", "type": "expression"}, {"field": "prior_escalations_7d", "id": "c3", "name": "Prior escalations 7d", "type": "expression"}, {"field": "sla_hours_remaining", "id": "c4", "name": "SLA hours remaining", "type": "expression"}], "outputs": [{"field": "route", "id": "o1", "name": "Route", "type": "expression"}, {"field": "sla_target_hours", "id": "o2", "name": "SLA target (h)", "type": "expression"}, {"field": "rule", "id": "o3", "name": "Rule fired", "type": "expression"}], "rules": [{"_id": "crit-ent", "c1": "== \"critical\"", "c2": "== \"enterprise\"", "c3": "", "c4": "", "o1": "\"escalate_now\"", "o2": "1", "o3": "\"crit-ent\""}, {"_id": "crit-any", "c1": "== \"critical\"", "c2": "", "c3": "", "c4": "", "o1": "\"escalate_now\"", "o2": "2", "o3": "\"crit-any\""}, {"_id": "repeat-escalator", "c1": "", "c2": "", "c3": ">= 2", "c4": "", "o1": "\"priority_queue\"", "o2": "8", "o3": "\"repeat-escalator\""}, {"_id": "high-urgent", "c1": "== \"high\"", "c2": "", "c3": "", "c4": "<= 8", "o1": "\"priority_queue\"", "o2": "8", "o3": "\"high-urgent\""}, {"_id": "high", "c1": "== \"high\"", "c2": "", "c3": "", "c4": "", "o1": "\"standard_queue\"", "o2": "24", "o3": "\"high\""}, {"_id": "fallback", "c1": "", "c2": "", "c3": "", "c4": "", "o1": "\"standard_queue\"", "o2": "48", "o3": "\"fallback\""}]}}]}'
+WHERE NOT EXISTS (SELECT 1 FROM portal_rulesets
+                  WHERE name = 'Support ticket triage policy');
+
+INSERT INTO portal_templates (name, description, icon, goal_template,
+                              criteria_template, parameters, schedule,
+                              ruleset_id)
+SELECT 'Support ticket triage',
+       'The agent reads the ticket and extracts triage facts; a deterministic policy routes it — you see the routing rule that fired.',
+       '🚦',
+       'A support ticket has arrived. Read the TICKET TEXT, extract these facts, and submit them with submit_facts as ONE JSON object: severity (one of "critical", "high", "normal", "low"), customer_tier (one of "standard", "premium", "enterprise"), prior_escalations_7d (number of escalations this week, default 0), sla_hours_remaining (number of hours until the SLA deadline, default 24). Do NOT decide the routing yourself. Then report: list each fact you extracted with its value. The routing decision will be appended by the rules engine. TICKET TEXT: {ticket_text}',
+       'All four facts extracted from the ticket text and submitted via submit_facts; the facts accurately reflect the ticket.',
+       '[{"name": "ticket_text", "label": "Support ticket text", "type": "textarea", "placeholder": "Paste the customer''s ticket..."}]',
+       'manual',
+       (SELECT id FROM portal_rulesets WHERE name = 'Support ticket triage policy')
+WHERE NOT EXISTS (SELECT 1 FROM portal_templates
+                  WHERE name = 'Support ticket triage');

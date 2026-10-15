@@ -525,6 +525,71 @@ check("missing tool files a proposal",
 check("missing tool step marked blocked",
       blk and blk[0] == "blocked", str(blk))
 
+# deterministic pre-tool gate — policy blocks email_send when notify=false
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("UPDATE tasks SET notify=false WHERE id=1")
+    c.execute("DELETE FROM rulesets")
+    c.execute(
+        "INSERT INTO rulesets (name, kind, description, jdm) VALUES "
+        "('test gate', 'task-tool-gate', 'test', %s)",
+        (app._table_jdm("test gate", ["tool", "notify"],
+                        ["allow", "rule"], [
+                            ("no-notify-email",
+                             ['== "email_send"', "== false"],
+                             ["false", '"no-notify-email"']),
+                            ("allow-all", ["", ""],
+                             ["true", '"allow-all"'])]),))
+TASKSCRIPT[:] = [{"tool": "email_send",
+                  "input": json.dumps({"to": "x@y.co", "subject": "s",
+                                       "body": "b"}),
+                  "description": "notify"},
+                 {"done": True, "report": "Sent the email."}]
+_a.run(app.execute_task(1))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    gstep = c.execute("SELECT status, output FROM task_steps WHERE "
+                      "tool='email_send' ORDER BY id DESC "
+                      "LIMIT 1").fetchone()
+check("gate blocks email_send/notify=false",
+      gstep and gstep[0] == "blocked" and "BLOCKED by policy" in gstep[1]
+      and "no-notify-email" in gstep[1], str(gstep))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("UPDATE tasks SET notify=true WHERE id=1")
+TASKSCRIPT[:] = [{"tool": "email_send",
+                  "input": json.dumps({"to": "x@y.co", "subject": "s",
+                                       "body": "b"}),
+                  "description": "notify"},
+                 {"done": True, "report": "Sent the email."}]
+_a.run(app.execute_task(1))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    gstep = c.execute("SELECT status FROM task_steps WHERE "
+                      "tool='email_send' ORDER BY id DESC "
+                      "LIMIT 1").fetchone()
+check("gate allows email_send/notify=true",
+      gstep and gstep[0] == "ok", str(gstep))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM rulesets")
+
+# deterministic review check — URLs referenced vs actually fetched
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("UPDATE tasks SET goal='Fetch these two URLs and report: "
+              "http://a.test/1 http://a.test/2' WHERE id=1")
+TASKSCRIPT[:] = [{"tool": "web_fetch", "input": "http://a.test/1",
+                  "description": "fetch first"},
+                 {"done": True, "report": "Both fetched fine."}]
+_a.run(app.execute_task(1))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    drun = c.execute("SELECT classification, summary FROM task_runs "
+                     "ORDER BY id DESC LIMIT 1").fetchone()
+    dstep = c.execute("SELECT output FROM task_steps WHERE "
+                      "tool='deterministic_check' ORDER BY id DESC "
+                      "LIMIT 1").fetchone()
+check("deterministic check forces partial",
+      drun and drun[0] == "partial" and "1 of 2" in drun[1], str(drun))
+check("deterministic check step recorded",
+      dstep and "1 of 2" in dstep[0], str(dstep))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("UPDATE tasks SET goal='Count the inbound emails' WHERE id=1")
+
 with psycopg.connect(os.environ["DATABASE_URL"]) as c:
     c.execute("DELETE FROM kb_overrides WHERE name='task-test-doc'")
 

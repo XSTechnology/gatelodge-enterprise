@@ -28,7 +28,7 @@ import time
 import httpx
 import psycopg
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "").rstrip("/")
@@ -117,6 +117,8 @@ ALTER TABLE portal_templates ADD COLUMN IF NOT EXISTS ruleset_id BIGINT;
 ALTER TABLE portal_tasks ADD COLUMN IF NOT EXISTS ruleset_id BIGINT;
 ALTER TABLE portal_runs ADD COLUMN IF NOT EXISTS facts TEXT DEFAULT '';
 ALTER TABLE portal_runs ADD COLUMN IF NOT EXISTS decision TEXT DEFAULT '';
+ALTER TABLE portal_rulesets ADD COLUMN IF NOT EXISTS client_id BIGINT;
+ALTER TABLE portal_rulesets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
 """
 
 _schema_ok = False
@@ -576,6 +578,16 @@ body { background:radial-gradient(1100px 500px at 85% -5%,
   font-family:'Segoe UI',system-ui,sans-serif; font-size:15.5px;
   line-height:1.6; }
 .mono { font-family:Consolas,monospace; }
+.ptable { font-size:.8rem; }
+.ptable th { vertical-align:top; min-width:120px; }
+.ptable th .f, .ptable th .n { padding:.25rem .4rem; margin-bottom:.2rem; }
+.ptable td { padding:.2rem .25rem; }
+.ptable input.cell, .ptable input.rname {
+  padding:.3rem .4rem; font-family:Consolas,monospace; font-size:.76rem; }
+.mini { background:transparent; color:var(--faint); border:1px solid
+  var(--line); border-radius:5px; padding:.05rem .35rem; font-size:.7rem;
+  cursor:pointer; }
+.mini:hover { color:var(--danger); border-color:var(--danger); }
 a { color:var(--brassb); text-decoration:none; }
 header { display:flex; align-items:center; gap:1.2rem; padding:.9rem 1.6rem;
   border-bottom:2px solid var(--line); background:var(--ink2);
@@ -648,6 +660,7 @@ SHELL = """<!doctype html><html><head><meta charset="utf-8">
 <div class="brand">{brand}</div>
 <div class="brand-sub">powered by Gatelodge</div></div>
 <nav><a href="/">My tasks</a><a href="/templates">Templates</a>
+<a href="/policies">Policies</a>
 <a href="/logout">Sign out</a></nav></header>
 <main>{body}</main></body></html>"""
 
@@ -790,6 +803,403 @@ budgeted, and audited through the Gatelodge gateway.</p>
     return _page(request, client, "Templates", body)
 
 
+# ── decision policies: per-client rulesets + editor ──────────────────────
+
+def _policy_model(jdm_json: str) -> dict | None:
+    """Parse a single-table JDM graph into an editable model."""
+    try:
+        g = json.loads(jdm_json)
+        for n in g.get("nodes", []):
+            if n.get("type") != "decisionTableNode":
+                continue
+            ct = n.get("content", {})
+            ins = [(i.get("field", ""), i.get("name", ""), i.get("id", ""))
+                   for i in ct.get("inputs", [])]
+            outs = [(o.get("field", ""), o.get("name", ""), o.get("id", ""))
+                    for o in ct.get("outputs", [])]
+            rules = []
+            for r in ct.get("rules", []):
+                cells = []
+                for _, _, cid in ins + outs:
+                    cells.append(str(r.get(cid, "")))
+                rules.append({"name": str(r.get("_id", "")), "cells": cells})
+            return {"hitPolicy": ct.get("hitPolicy", "first"),
+                    "inputs": ins, "outputs": outs, "rules": rules}
+    except Exception:
+        pass
+    return None
+
+
+def _jdm_valid(jdm_json: str) -> bool:
+    try:
+        from zen import ZenEngine
+        ZenEngine().create_decision(json.loads(jdm_json))
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/policies", response_class=HTMLResponse)
+async def policies(request: Request, flash: str = ""):
+    client = _authed(request)
+    if not client:
+        return RedirectResponse("/login", status_code=303)
+
+    def q():
+        with _db() as c:
+            return c.execute(
+                "SELECT id, name, description, version, enabled, "
+                "(client_id IS NULL) AS is_global FROM portal_rulesets "
+                "WHERE client_id IS NULL OR client_id=%s "
+                "ORDER BY is_global DESC, id", (client["id"],)).fetchall()
+    rows = await _run(q)
+
+    trs = ""
+    for pid, name, desc, ver, en, is_global in rows:
+        scope = ("<span class='tag'>global</span>" if is_global
+                 else "<span class='tag ok'>mine</span>")
+        state = ('<span class=tag ok>on</span>' if en
+                 else '<span class=tag>off</span>')
+        act = (f"<a href='/policy/{pid}'>edit</a> · "
+               f"<a href='/policy/{pid}#test'>test</a>"
+               if not is_global else f"<a href='/policy/{pid}'>view</a> · "
+               f"<a href='/policy/{pid}#test'>test</a>")
+        trs += (f"<tr><td>{_e(name)}</td><td>{scope}</td><td>{state}</td>"
+                f"<td class='mono note'>v{ver}</td>"
+                f"<td class='note'>{_e(desc[:90])}</td><td>{act}</td></tr>")
+
+    body = f"""
+<h1>Decision policies</h1>
+<p class="note" style="margin-bottom:1.2rem">Deterministic rulesets —
+the agent extracts facts, the policy decides, the trace shows the rule
+that fired. Global policies are maintained by us; yours are yours to
+edit and version.</p>
+<table><tr><th>policy</th><th>scope</th><th>state</th><th>ver</th>
+<th>description</th><th></th></tr>
+{trs or '<tr><td colspan=6 class=note>No policies yet — create one '
+'below</td></tr>'}</table>
+<div class="inline">
+<a class="btn" href="/policy/0">New policy</a>
+<a class="btn ghost" href="/">back</a></div>"""
+    return _page(request, client, "Policies", body)
+
+
+POLICY_JS = """
+function addRule() {
+  const grid = document.getElementById('grid');
+  const nIn = grid.querySelectorAll('thead th[data-kind=in]').length;
+  const nOut = grid.querySelectorAll('thead th[data-kind=out]').length;
+  const tr = document.createElement('tr');
+  let h = '<td><input class="rname" placeholder="rule id"></td>';
+  for (let i = 0; i < nIn + nOut; i++) {
+    const kind = i < nIn ? 'in' : 'out';
+    h += `<td><input class="cell" data-kind="${kind}" data-col="${kind==='in'?i:i-nIn}"></td>`;
+  }
+  h += '<td><button type="button" class="mini" onclick="this.closest(\\'tr\\').remove()">✕</button></td>';
+  tr.innerHTML = h;
+  grid.querySelector('tbody').appendChild(tr);
+}
+function addCol(kind) {
+  const grid = document.getElementById('grid');
+  const idx = grid.querySelectorAll(`thead th[data-kind=${kind}]`).length;
+  const th = document.createElement('th');
+  th.dataset.kind = kind;
+  th.innerHTML = `<input class="f mono" placeholder="field" style="font-size:.72rem"><input class="n" placeholder="label" style="font-size:.72rem"><button type="button" class="mini" onclick="delCol(this)">✕</button>`;
+  const anchor = kind === 'in' ? grid.querySelector('thead th[data-kind=out]')
+                               : grid.querySelector('thead th.mini-col');
+  anchor.parentNode.insertBefore(th, anchor);
+  grid.querySelectorAll('tbody tr').forEach(tr => {
+    const td = document.createElement('td');
+    td.innerHTML = `<input class="cell" data-kind="${kind}" data-col="${idx}">`;
+    const cellIdx = kind === 'in' ? idx + 1 : tr.children.length - 1;
+    tr.insertBefore(td, tr.children[cellIdx]);
+  });
+}
+function delCol(btn) {
+  const th = btn.closest('th');
+  const kind = th.dataset.kind;
+  if (document.querySelectorAll(`#grid thead th[data-kind=${kind}]`).length <= 1) return;
+  const idx = [...th.parentNode.children].indexOf(th);
+  th.remove();
+  document.querySelectorAll('#grid tbody tr').forEach(tr =>
+    tr.children[idx] && tr.children[idx].remove());
+}
+function buildJdm() {
+  const grid = document.getElementById('grid');
+  const ins = [...grid.querySelectorAll('thead th[data-kind=in]')].map((th, i) => ({
+    field: th.querySelector('.f').value || ('f' + (i + 1)),
+    id: 'c' + (i + 1),
+    name: th.querySelector('.n').value || th.querySelector('.f').value || ('in' + (i + 1)),
+    type: 'expression'
+  }));
+  const outs = [...grid.querySelectorAll('thead th[data-kind=out]')].map((th, i) => ({
+    field: th.querySelector('.f').value || ('out' + (i + 1)),
+    id: 'o' + (i + 1),
+    name: th.querySelector('.n').value || th.querySelector('.f').value || ('out' + (i + 1)),
+    type: 'expression'
+  }));
+  const rules = [...grid.querySelectorAll('tbody tr')].map((tr, i) => {
+    const r = { _id: tr.querySelector('.rname').value || ('r' + (i + 1)) };
+    tr.querySelectorAll('input.cell').forEach(inp => {
+      const k = inp.dataset.kind, ci = +inp.dataset.col;
+      r[k === 'in' ? ins[ci].id : outs[ci].id] = inp.value;
+    });
+    return r;
+  });
+  const name = document.getElementById('pname').value || 'Decision';
+  return {
+    edges: [{ id: 'e1', sourceId: 'n-input', targetId: 'n-table' },
+            { id: 'e2', sourceId: 'n-table', targetId: 'n-output' }],
+    nodes: [
+      { id: 'n-input', type: 'inputNode', name: 'Facts' },
+      { id: 'n-output', type: 'outputNode', name: 'Decision' },
+      { id: 'n-table', type: 'decisionTableNode', name: name,
+        content: { hitPolicy: document.getElementById('hitpolicy').value,
+                   inputs: ins, outputs: outs, rules: rules } }
+    ]
+  };
+}
+document.getElementById('pform').addEventListener('submit', () => {
+  document.getElementById('jdm').value = JSON.stringify(buildJdm());
+});
+async function testPolicy() {
+  const pid = document.getElementById('pid').value;
+  const out = document.getElementById('testout');
+  if (!pid || pid === '0') { out.textContent = 'Save the policy first, then test.'; return; }
+  let facts;
+  try { facts = JSON.parse(document.getElementById('facts').value || '{}'); }
+  catch (e) { out.textContent = 'Facts must be valid JSON: ' + e.message; return; }
+  out.textContent = 'evaluating…';
+  try {
+    const r = await fetch('/policy/' + pid + '/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ facts: facts })
+    });
+    const j = await r.json();
+    out.textContent = JSON.stringify(j, null, 2);
+  } catch (e) { out.textContent = 'ERROR: ' + e; }
+}
+function fillFacts() {
+  const grid = document.getElementById('grid');
+  const f = {};
+  grid.querySelectorAll('thead th[data-kind=in] .f').forEach(i => { if (i.value) f[i.value] = ''; });
+  document.getElementById('facts').value = JSON.stringify(f, null, 2);
+}
+"""
+
+
+@app.get("/policy/{pid}", response_class=HTMLResponse)
+async def policy_editor(request: Request, pid: int, flash: str = ""):
+    client = _authed(request)
+    if not client:
+        return RedirectResponse("/login", status_code=303)
+
+    def q():
+        with _db() as c:
+            row = c.execute(
+                "SELECT id, name, description, version, jdm, client_id "
+                "FROM portal_rulesets WHERE id=%s", (pid,)).fetchone()
+            return row
+    row = await _run(q) if pid else None
+    editable = bool(pid) and row and row[5] == client["id"]
+    if pid and not row:
+        return RedirectResponse("/policies", status_code=303)
+    if pid and row[5] is not None and row[5] != client["id"]:
+        return RedirectResponse("/policies", status_code=303)
+
+    if row:
+        name, desc, ver = row[1], row[2], row[3]
+        model = _policy_model(row[4]) or {
+            "hitPolicy": "first", "inputs": [("fact", "Fact", "c1")],
+            "outputs": [("decision", "Decision", "o1")], "rules": []}
+    else:
+        name, desc, ver = "", "", 1
+        model = {"hitPolicy": "first",
+                 "inputs": [("customer_tier", "Tier", "c1"),
+                            ("days_since_purchase", "Days", "c2")],
+                 "outputs": [("decision", "Decision", "o1"),
+                             ("rule", "Rule fired", "o2")],
+                 "rules": [{"name": "example", "cells": [
+                     '== "premium"', "<= 30", '"approved"', '"example"']}]}
+
+    def th(col, kind):
+        f, lbl, _ = col
+        return (f'<th data-kind="{kind}">'
+                f'<input class="f mono" value="{_e(f)}" placeholder="field" '
+                f'style="font-size:.72rem"{" disabled" if not editable else ""}>'
+                f'<input class="n" value="{_e(lbl)}" placeholder="label" '
+                f'style="font-size:.72rem"{" disabled" if not editable else ""}>'
+                + (f'<button type="button" class="mini" '
+                   f'onclick="delCol(this)">✕</button>' if editable else "")
+                + "</th>")
+
+    head = ('<th style="min-width:110px">rule</th>'
+            + "".join(th(c, "in") for c in model["inputs"])
+            + "".join(th(c, "out") for c in model["outputs"])
+            + '<th class="mini-col"></th>')
+    rows_html = ""
+    for r in model["rules"]:
+        cells = ""
+        for i, val in enumerate(r["cells"]):
+            kind = "in" if i < len(model["inputs"]) else "out"
+            ci = i if kind == "in" else i - len(model["inputs"])
+            cells += (f'<td><input class="cell" data-kind="{kind}" '
+                      f'data-col="{ci}" value="{_e(val)}"'
+                      + ("" if editable else " disabled") + "></td>")
+        rows_html += (f'<tr><td><input class="rname" value="{_e(r["name"])}"'
+                      + ("" if editable else " disabled") + "></td>"
+                      + cells
+                      + ("<td><button type='button' class='mini' "
+                         "onclick='this.closest(\"tr\").remove()'>✕</button>"
+                         "</td>" if editable else "<td></td>")
+                      + "</tr>")
+
+    hp = model["hitPolicy"]
+    ro = "" if editable else " disabled"
+    save_btn = (f'<button class="btn">Save policy</button>' if editable
+                else '<span class="tag">read-only · global policy</span>')
+    new_btns = (f'<div class="inline" style="margin:.4rem 0 1rem">'
+                f'<button type="button" class="btn ghost" '
+                f'style="padding:.3rem .8rem;font-size:.75rem" '
+                f'onclick="addRule()">+ rule</button>'
+                f'<button type="button" class="btn ghost" '
+                f'style="padding:.3rem .8rem;font-size:.75rem" '
+                f'onclick="addCol(\'in\')">+ condition column</button>'
+                f'<button type="button" class="btn ghost" '
+                f'style="padding:.3rem .8rem;font-size:.75rem" '
+                f'onclick="addCol(\'out\')">+ output column</button></div>'
+                if editable else "")
+
+    body = f"""
+<form method="post" action="/policy/save" id="pform">
+<input type="hidden" name="id" value="{pid}">
+<input type="hidden" name="jdm" id="jdm" value="">
+<div class="inline" style="margin-bottom:1rem">
+<a class="btn ghost" href="/policies">← policies</a>
+<span class="mono note">{"v" + str(ver) if pid else "new"}</span></div>
+<label>policy name</label>
+<input id="pname" name="name" value="{_e(name)}" required{ro}>
+<label>description</label>
+<input name="description" value="{_e(desc)}"{ro}>
+<label>hit policy</label>
+<select id="hitpolicy" name="hitpolicy"{ro}>
+<option value="first"{' selected' if hp == 'first' else ''}>first match — first rule that fits decides</option>
+<option value="collect"{' selected' if hp == 'collect' else ''}>collect — all matching rules combine</option>
+</select>
+{new_btns}
+<div style="overflow-x:auto"><table id="grid" class="ptable">
+<thead><tr>{head}</tr></thead><tbody>{rows_html}</tbody></table></div>
+<div class="inline" style="margin-top:1rem">{save_btn}
+</div></form>
+<p class="note">Condition cells are ZEN expressions relative to the column
+field — e.g. <span class="mono">&lt;= 30</span>,
+<span class="mono">== "enterprise"</span>, empty means any. Output cells
+are values or expressions — quote strings:
+<span class="mono">"approved"</span>.</p>
+<div class="box" id="test" style="margin-top:1.6rem">
+<h2 style="font-family:Georgia,serif">Test this policy</h2>
+<p class="note">Evaluate saved facts against the ruleset — no agent,
+no cost, instant.</p>
+<input type="hidden" id="pid" value="{pid}">
+<div class="inline" style="margin:.6rem 0">
+<button type="button" class="btn ghost" style="padding:.3rem .8rem;
+font-size:.75rem" onclick="fillFacts()">skeleton from fields</button></div>
+<label>facts (JSON)</label>
+<textarea id="facts" style="min-height:90px">{{}}</textarea>
+<div class="inline" style="margin-top:.8rem">
+<button type="button" class="btn" onclick="testPolicy()">Run test</button>
+<span class="note" id="testnote"></span></div>
+<div class="view-body mono" id="testout" style="margin-top:.8rem;
+min-height:50px;font-size:.78rem">(result)</div></div>
+<script>{POLICY_JS}</script>"""
+    return _page(request, client, name or "New policy", body, flash)
+
+
+@app.post("/policy/save")
+async def policy_save(request: Request):
+    client = _authed(request)
+    if not client:
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    pid = int(form.get("id") or 0)
+    name = str(form.get("name", "")).strip()[:120]
+    desc = str(form.get("description", "")).strip()[:400]
+    jdm = str(form.get("jdm", "")).strip()
+
+    if not name or not jdm or not _jdm_valid(jdm):
+        return RedirectResponse(
+            f"/policy/{pid}?flash=invalid+or+unparsable+policy", status_code=303)
+
+    def save():
+        with _db() as c:
+            if pid:
+                cur = c.execute(
+                    "UPDATE portal_rulesets SET name=%s, description=%s, "
+                    "jdm=%s, version=version+1, updated_at=now() "
+                    "WHERE id=%s AND client_id=%s RETURNING id",
+                    (name, desc, jdm, pid, client["id"])).fetchone()
+                return cur[0] if cur else None
+            return c.execute(
+                "INSERT INTO portal_rulesets (name, description, version,"
+                " jdm, client_id) VALUES (%s,%s,1,%s,%s) RETURNING id",
+                (name, desc, jdm, client["id"])).fetchone()[0]
+    new_id = await _run(save)
+    if not new_id:
+        return RedirectResponse("/policies?flash=not+yours+to+edit",
+                                status_code=303)
+    return RedirectResponse(f"/policy/{new_id}?flash=policy+saved",
+                            status_code=303)
+
+
+@app.post("/policy/{pid}/delete")
+async def policy_delete(request: Request, pid: int):
+    client = _authed(request)
+    if not client:
+        return RedirectResponse("/login", status_code=303)
+
+    def q():
+        with _db() as c:
+            c.execute("DELETE FROM portal_rulesets WHERE id=%s AND "
+                      "client_id=%s", (pid, client["id"]))
+    await _run(q)
+    return RedirectResponse("/policies?flash=policy+deleted", status_code=303)
+
+
+@app.post("/policy/{pid}/test")
+async def policy_test(request: Request, pid: int):
+    client = _authed(request)
+    if not client:
+        return JSONResponse({"error": "auth"}, status_code=403)
+    try:
+        body = await request.json()
+        facts = body.get("facts") or {}
+        if not isinstance(facts, dict):
+            raise ValueError
+    except Exception:
+        return JSONResponse({"error": "facts must be a JSON object"},
+                            status_code=400)
+
+    def q():
+        with _db() as c:
+            return c.execute(
+                "SELECT name, version, jdm, enabled FROM portal_rulesets "
+                "WHERE id=%s AND (client_id IS NULL OR client_id=%s)",
+                (pid, client["id"])).fetchone()
+    row = await _run(q)
+    if not row or not row[3]:
+        return JSONResponse({"error": "policy not found or disabled"},
+                            status_code=404)
+    try:
+        r = _evaluate_ruleset(row[2], facts)
+        return {"policy": f"{row[0]} v{row[1]}",
+                "result": r.get("result", {}),
+                "performance": r.get("performance", ""),
+                "missing_fields": _missing_fields(row[2], facts)}
+    except Exception as e:
+        return JSONResponse({"error": f"evaluation failed: {e!r}"},
+                            status_code=400)
+
+
 @app.get("/launch/{tid}", response_class=HTMLResponse)
 async def launch_form(request: Request, tid: int, flash: str = ""):
     client = _authed(request)
@@ -800,13 +1210,13 @@ async def launch_form(request: Request, tid: int, flash: str = ""):
         with _db() as c:
             return c.execute(
                 "SELECT name, description, goal_template, "
-                "criteria_template, parameters, schedule "
+                "criteria_template, parameters, schedule, ruleset_id "
                 "FROM portal_templates WHERE id=%s AND enabled",
                 (tid,)).fetchone()
     t = await _run(q)
     if not t:
         return RedirectResponse("/", status_code=303)
-    name, desc, goal_t, crit_t, params_json, sched = t
+    name, desc, goal_t, crit_t, params_json, sched, tpl_ruleset = t
     try:
         params = json.loads(params_json)
     except Exception:
@@ -821,6 +1231,28 @@ async def launch_form(request: Request, tid: int, flash: str = ""):
                       f'</textarea>' if kind == "textarea" else
                       f'<input type="text" name="{_e(p["name"])}" '
                       f'placeholder="{_e(p.get("placeholder", ""))}">'))
+
+    policy_html = ""
+    if tpl_ruleset:
+        def qp():
+            with _db() as c:
+                return c.execute(
+                    "SELECT id, name, version, (client_id IS NULL) "
+                    "FROM portal_rulesets WHERE enabled AND "
+                    "(client_id IS NULL OR client_id=%s) ORDER BY "
+                    "client_id IS NULL DESC, id", (client["id"],)).fetchall()
+        pols = await _run(qp)
+        opts = "".join(
+            f'<option value="{pid}"{" selected" if pid == tpl_ruleset else ""}>'
+            f'{_e(pname)} v{ver} · {"global" if glob else "mine"}</option>'
+            for pid, pname, ver, glob in pols)
+        policy_html = f"""
+<label>decision policy to apply</label>
+<select name="policy_id">{opts}</select>
+<p class="note" style="margin-top:.3rem">The agent extracts the facts;
+this policy decides — deterministically. Manage yours under
+<a href="/policies" style="color:var(--brassb)">Policies</a>.</p>"""
+
     opts = "".join(
         f'<option value="{v}"{" selected" if v == sched else ""}>{v}</option>'
         for v in ("manual", "daily", "weekly"))
@@ -832,6 +1264,7 @@ async def launch_form(request: Request, tid: int, flash: str = ""):
 <p class="note" style="margin-bottom:1rem">{_e(desc)}</p>
 <form method="post" action="/launch/{tid}">
 {fields}
+{policy_html}
 <label>schedule</label>
 <select name="schedule">{opts}</select>
 <label>task name</label>
@@ -877,15 +1310,29 @@ async def launch(request: Request, tid: int):
     if schedule not in ("manual", "daily", "weekly"):
         schedule = "manual"
 
+    # client may pick one of their own policies or a global one
+    try:
+        policy_id = int(form.get("policy_id") or 0)
+    except ValueError:
+        policy_id = 0
+
     def save():
         with _db() as c:
+            rid = ruleset_id
+            if policy_id:
+                ok = c.execute(
+                    "SELECT 1 FROM portal_rulesets WHERE id=%s AND enabled"
+                    " AND (client_id IS NULL OR client_id=%s)",
+                    (policy_id, client["id"])).fetchone()
+                if ok:
+                    rid = policy_id
             c.execute(
                 "INSERT INTO portal_tasks (client_id, name, goal, "
                 "success_criteria, inputs, schedule, next_run_at, "
                 "ruleset_id) VALUES (%s,%s,%s,%s,%s,%s, now(), %s)",
                 (client["id"], task_name, goal, crit,
                  "\n".join(f"{k}: {v}" for k, v in values.items()
-                           if v), schedule, ruleset_id))
+                           if v), schedule, rid))
     await _run(save)
     return RedirectResponse("/?flash=task+launched", status_code=303)
 

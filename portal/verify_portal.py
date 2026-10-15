@@ -43,9 +43,17 @@ check("URL statuses in report", "datagatelodge.com" in r.text, "report missing U
 # templates gallery page
 r = c.get(f"{BASE}/templates")
 check("templates page 200", r.status_code == 200, r.status_code)
-check("gallery has 5 templates", r.text.count("Use this template") == 5, r.text.count("Use this template"))
+check("gallery has 6 templates", r.text.count("Use this template") == 6, r.text.count("Use this template"))
 check("gallery not stub", "coming soon" not in r.text, "still stub")
 check("decision template present", "Refund eligibility" in r.text, "missing")
+check("triage template present", "Support ticket triage" in r.text, "missing")
+
+# policies page (per-client rulesets)
+r = c.get(f"{BASE}/policies")
+check("policies page 200", r.status_code == 200, r.status_code)
+check("global policies listed", "Refund eligibility policy" in r.text
+      and "Support ticket triage policy" in r.text, "missing")
+check("new policy button", "New policy" in r.text, "missing")
 
 # decision run viewer (run 3 = Contoso refund decision, ent-90d)
 r = c.get(f"{BASE}/run/3")
