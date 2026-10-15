@@ -104,6 +104,19 @@ CREATE TABLE IF NOT EXISTS portal_steps (
   status TEXT DEFAULT 'ok',
   created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS portal_rulesets (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  version INT DEFAULT 1,
+  jdm TEXT NOT NULL,
+  enabled BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE portal_templates ADD COLUMN IF NOT EXISTS ruleset_id BIGINT;
+ALTER TABLE portal_tasks ADD COLUMN IF NOT EXISTS ruleset_id BIGINT;
+ALTER TABLE portal_runs ADD COLUMN IF NOT EXISTS facts TEXT DEFAULT '';
+ALTER TABLE portal_runs ADD COLUMN IF NOT EXISTS decision TEXT DEFAULT '';
 """
 
 _schema_ok = False
@@ -238,6 +251,97 @@ async def t_report(text: str) -> str:
     return f"REPORT RECORDED:\n{text[:8000]}"
 
 
+@tool("submit_facts",
+      "Submit the structured FACTS you extracted as ONE JSON object "
+      "(values as proper JSON types — numbers unquoted, categories "
+      "quoted). A deterministic decision policy will be evaluated "
+      "against them; do NOT decide yourself. Input: the JSON object.")
+async def t_submit_facts(spec: str) -> str:
+    try:
+        d = json.loads(spec)
+        if not isinstance(d, dict) or not d:
+            raise ValueError("not an object")
+    except Exception:
+        return ("ERROR: input must be a single JSON object of facts, "
+                'e.g. {"days_since_purchase": 12, "reason": "defective"}')
+    _RUN_STATE["facts"] = d
+    return "FACTS RECORDED: " + json.dumps(d, sort_keys=True)
+
+
+# ── decision policies: deterministic, versioned, auditable ───────────────
+# The agent EXTRACTS facts; the rules engine DECIDES. The decision never
+# comes from the LLM — that is the whole point of the hybrid pattern.
+
+_RUN_STATE: dict = {}   # facts for the run in flight (runner is single-task)
+
+
+def _evaluate_ruleset(jdm_json: str, facts: dict) -> dict:
+    """Evaluate a JDM decision graph against extracted facts (µs-scale)."""
+    from zen import ZenEngine  # deferred: not needed for UI-only paths
+    graph = json.loads(jdm_json)
+    decision = ZenEngine().create_decision(graph)
+    return decision.evaluate(facts)
+
+
+def _missing_fields(jdm_json: str, facts: dict) -> list[str]:
+    """Input columns the ruleset expects but the agent did not supply."""
+    try:
+        g = json.loads(jdm_json)
+        need = [i.get("field", "") for n in g.get("nodes", [])
+                if n.get("type") == "decisionTableNode"
+                for i in n.get("content", {}).get("inputs", [])]
+        return [f for f in need if f and f not in facts]
+    except Exception:
+        return []
+
+
+def _apply_policy(run_id: int, ruleset_id: int, report: str,
+                  transcript: list[str]) -> tuple[str, str]:
+    """Evaluate the task's ruleset against submitted facts. Returns
+    (report, decision_json) — decision appended to the report verbatim."""
+    facts = _RUN_STATE.get("facts") or {}
+    if not facts:
+        return report, ""
+    try:
+        with _db() as c:
+            rs = c.execute(
+                "SELECT name, version, jdm FROM portal_rulesets "
+                "WHERE id=%s AND enabled", (ruleset_id,)).fetchone()
+        if not rs:
+            return report, ""
+        rs_name, rs_ver, jdm = rs
+        r = _evaluate_ruleset(jdm, facts)
+        res = r.get("result", {}) if isinstance(r, dict) else {}
+        perf = r.get("performance", "") if isinstance(r, dict) else ""
+        decision_json = json.dumps(res, sort_keys=True)
+        missing = _missing_fields(jdm, facts)
+        note = (f"\nMISSING FIELDS (decision may be unreliable): "
+                f"{', '.join(missing)}") if missing else ""
+        detail = (f"DECISION: {decision_json}\n"
+                  f"RULESET: {rs_name} v{rs_ver} · evaluated in {perf}"
+                  f"{note}")
+        with _db() as c:
+            c.execute("INSERT INTO portal_steps (run_id, seq, tool, input,"
+                      " output, status) VALUES (%s,%s,%s,%s,%s,%s)",
+                      (run_id, 900, "policy_check",
+                       json.dumps(facts, sort_keys=True)[:4000],
+                       detail[:6000], "ok"))
+        report += (f"\n\n---\n**Policy decision** — `{rs_name}` v{rs_ver}"
+                   f" (deterministic rules engine, not the agent's "
+                   f"judgment):\n\n`{decision_json}`")
+        transcript.append(f"policy_check (ok): {rs_name} v{rs_ver} → "
+                          f"{decision_json}")
+        return report, decision_json
+    except Exception as e:
+        with _db() as c:
+            c.execute("INSERT INTO portal_steps (run_id, seq, tool, input,"
+                      " output, status) VALUES (%s,%s,%s,%s,%s,%s)",
+                      (run_id, 900, "policy_check",
+                       json.dumps(facts, sort_keys=True)[:4000],
+                       f"ERROR: {e!r}", "error"))
+        return report, ""
+
+
 async def _gw_json(system: str, messages: list[dict]) -> str:
     async with httpx.AsyncClient(timeout=90) as c:
         r = await c.post(
@@ -333,15 +437,17 @@ def _run_task(task_id: int) -> None:
     """Synchronous core (runs in a thread); the portal runner calls it."""
     with _db() as c:
         row = c.execute(
-            "SELECT name, goal, success_criteria, inputs "
+            "SELECT name, goal, success_criteria, inputs, ruleset_id "
             "FROM portal_tasks WHERE id=%s", (task_id,)).fetchone()
     if not row:
         return
-    name, goal, criteria, inputs = row
+    name, goal, criteria, inputs, ruleset_id = row
     with _db() as c:
         run_id = c.execute(
             "INSERT INTO portal_runs (task_id) VALUES (%s) RETURNING id",
             (task_id,)).fetchone()[0]
+    _RUN_STATE.clear()
+    _RUN_STATE["run_id"] = run_id
     print(f"[portal] task '{name}' run {run_id}")
 
     user = f"TASK: {goal}"
@@ -391,6 +497,12 @@ def _run_task(task_id: int) -> None:
 
     if not report:
         report = "(no report produced)"
+
+    decision_json = ""
+    if ruleset_id:
+        report, decision_json = _apply_policy(
+            run_id, ruleset_id, report, transcript)
+
     classification, summary = "review", ""
     try:
         rv = asyncio.run(_gw_json(
@@ -407,10 +519,15 @@ def _run_task(task_id: int) -> None:
     except Exception as e:
         summary = f"Review error: {e!r}"
 
+    submitted = _RUN_STATE.get("facts") or {}
     with _db() as c:
         c.execute("UPDATE portal_runs SET status=%s, classification=%s, "
-                  "summary=%s, report=%s, finished_at=now() WHERE id=%s",
-                  (classification, classification, summary, report, run_id))
+                  "summary=%s, report=%s, facts=%s, decision=%s, "
+                  "finished_at=now() WHERE id=%s",
+                  (classification, classification, summary, report,
+                   json.dumps(submitted, sort_keys=True)
+                   if submitted else "",
+                   decision_json, run_id))
         interval = {"hourly": "1 hour", "daily": "1 day",
                     "weekly": "7 days"}.get(
                     _schedule(task_id), None)
@@ -736,13 +853,13 @@ async def launch(request: Request, tid: int):
     def q():
         with _db() as c:
             return c.execute(
-                "SELECT goal_template, criteria_template, parameters "
-                "FROM portal_templates WHERE id=%s AND enabled",
+                "SELECT goal_template, criteria_template, parameters, "
+                "ruleset_id FROM portal_templates WHERE id=%s AND enabled",
                 (tid,)).fetchone()
     t = await _run(q)
     if not t:
         return RedirectResponse("/", status_code=303)
-    goal_t, crit_t, params_json = t
+    goal_t, crit_t, params_json, ruleset_id = t
     try:
         params = json.loads(params_json)
     except Exception:
@@ -764,11 +881,11 @@ async def launch(request: Request, tid: int):
         with _db() as c:
             c.execute(
                 "INSERT INTO portal_tasks (client_id, name, goal, "
-                "success_criteria, inputs, schedule, next_run_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s, now())",
+                "success_criteria, inputs, schedule, next_run_at, "
+                "ruleset_id) VALUES (%s,%s,%s,%s,%s,%s, now(), %s)",
                 (client["id"], task_name, goal, crit,
                  "\n".join(f"{k}: {v}" for k, v in values.items()
-                           if v), schedule))
+                           if v), schedule, ruleset_id))
     await _run(save)
     return RedirectResponse("/?flash=task+launched", status_code=303)
 
@@ -850,7 +967,8 @@ async def run_detail(request: Request, rid: int):
         with _db() as c:
             run = c.execute(
                 "SELECT r.task_id, t.name, t.client_id, r.classification,"
-                " r.summary, r.report, r.started_at FROM portal_runs r "
+                " r.summary, r.report, r.started_at, r.facts, r.decision"
+                " FROM portal_runs r "
                 "JOIN portal_tasks t ON t.id=r.task_id WHERE r.id=%s",
                 (rid,)).fetchone()
             steps = c.execute(
@@ -861,7 +979,31 @@ async def run_detail(request: Request, rid: int):
     run, steps = await _run(q)
     if not run or run[2] != client["id"]:
         return RedirectResponse("/", status_code=303)
-    tid, tname, _, cl, su, report, sa = run
+    tid, tname, _, cl, su, report, sa, facts_txt, dec_txt = run
+
+    decision_html = ""
+    if dec_txt:
+        try:
+            dj = json.loads(dec_txt)
+        except Exception:
+            dj = {}
+        dv = str(dj.get("decision", dec_txt))
+        dcolor = {"approved": "ok", "denied": "bad"}.get(dv, "warn")
+        rule = dj.get("rule", "")
+        decision_html = f"""
+<h2>Policy decision</h2>
+<div class="box" style="border-left:3px solid var(--brass)">
+<p style="font-size:1.05rem"><b>{_e(dv)}</b>
+<span class="tag {dcolor}">deterministic</span></p>
+<p class="note mono">{_e(f'rule: {rule}' if rule else dec_txt)}</p>
+<p class="note">Produced by a versioned rules engine against the
+extracted facts — not the agent's judgment.</p></div>"""
+
+    facts_html = ""
+    if facts_txt and facts_txt not in ("", "{}"):
+        facts_html = f"""
+<h2>Extracted facts</h2>
+<div class="view-body mono" style="font-size:.78rem">{_e(facts_txt)}</div>"""
 
     step_html = ""
     for seq, tool, inp, out, stat in steps:
@@ -872,8 +1014,10 @@ async def run_detail(request: Request, rid: int):
                 draft_link = (f'<p class="note" style="margin-top:.5rem">'
                               f'Draft recorded — send it from your own '
                               f'email client using the details above.</p>')
+        label = ("Policy evaluation" if tool == "policy_check"
+                 else f"Step {seq + 1}")
         step_html += f"""
-<div class="box"><p><b>Step {seq + 1}</b> — <span class="tag">
+<div class="box"><p><b>{_e(label)}</b> — <span class="tag">
 {'ok' if stat == 'ok' else stat}</span> <span class="mono note">
 {_e(tool)}</span></p>
 <div class="view-body" style="font-size:.78rem;margin-top:.5rem">
@@ -883,6 +1027,8 @@ async def run_detail(request: Request, rid: int):
 <div class="inline" style="margin-bottom:1rem">
 <span class="tag">{_e(cl or 'running')}</span>
 <span class="mono note">{_e(tname)} · run #{rid} · {str(sa)[:16]}</span></div>
+{decision_html}
+{facts_html}
 <h2>Review</h2>
 <div class="view-body">{_e(su or '(pending)')}</div>
 <h2>Report</h2>
