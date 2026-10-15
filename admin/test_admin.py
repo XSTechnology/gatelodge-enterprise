@@ -145,20 +145,84 @@ with TestClient(app.app) as client:
     check("kb override created", ov is not None
           and "install a key" in ov[0], str(ov)[:80])
 
-    # 8. KB save + reset
+    # 8. KB save (structured) + reset
     r = client.post("/kb/save", data={
-        "name": "presales", "content": "title: t\ndescription: d\nedited"},
-        follow_redirects=False)
+        "name": "presales", "title": "Presales — what Gatelodge is",
+        "description": "Product overview",
+        "content": "## edited body"}, follow_redirects=False)
     check("kb save redirects", r.status_code == 303)
     with psycopg.connect(os.environ["DATABASE_URL"]) as c:
         v = c.execute("SELECT content FROM kb_overrides "
                       "WHERE name='presales'").fetchone()
-    check("kb override stored", v is not None and "edited" in v[0])
+    check("kb override stored with header",
+          v is not None and "edited body" in v[0]
+          and v[0].startswith("# Presales")
+          and "title: Presales — what Gatelodge is" in v[0]
+          and "description: Product overview" in v[0], str(v)[:100])
     client.get("/kb/reset", params={"name": "presales"})
     with psycopg.connect(os.environ["DATABASE_URL"]) as c:
         v = c.execute("SELECT COUNT(*) FROM kb_overrides "
                       "WHERE name='presales'").fetchone()[0]
     check("kb reset removes override", v == 0)
+
+    # 8b. header parse/assemble round-trip
+    t, d, b = app._parse_doc(
+        "# T\ntitle: T\ndescription: D\n\nbody line")
+    check("parse_doc splits header", (t, d, b) == ("T", "D", "body line"),
+          f"{t!r} {d!r} {b!r}")
+    t, d, b = app._parse_doc("just a body, no header")
+    check("parse_doc tolerant (no header)", (t, d, b) == ("", "", "just a body, no header"))
+    check("assemble_doc round-trip",
+          app._parse_doc(app._assemble_doc("T", "D", "body"))
+          == ("T", "D", "body"))
+
+    # 8c. new document (create) -> listed as custom
+    r = client.post("/kb/new", data={
+        "name": "channel-faq", "title": "Channel partners — FAQ",
+        "description": "Partner questions about co-branded trials",
+        "content": "## How long is the trial?\n\n90 days."},
+        follow_redirects=False)
+    check("kb new redirects to edit", r.status_code == 303
+          and "/kb/edit?name=channel-faq" in r.headers.get("location", ""))
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT content FROM kb_overrides "
+                      "WHERE name='channel-faq'").fetchone()
+    check("custom doc stored with header", v is not None
+          and "title: Channel partners — FAQ" in v[0]
+          and "90 days" in v[0])
+    r = client.get("/kb")
+    check("custom doc listed", "channel-faq" in r.text
+          and "custom" in r.text)
+    r = client.get("/kb/edit", params={"name": "channel-faq"})
+    check("edit form parses header fields",
+          r.status_code == 200
+          and 'value="Channel partners — FAQ"' in r.text
+          and 'value="Partner questions about co-branded trials"' in r.text
+          and "90 days" in r.text)
+
+    # 8d. validation: bad name, missing fields, built-in collision
+    r = client.post("/kb/new", data={
+        "name": "Bad Name!", "title": "t", "description": "d",
+        "content": "c"}, follow_redirects=False)
+    check("kb new rejects bad name", r.status_code == 303
+          and "name+must+be" in r.headers.get("location", ""))
+    r = client.post("/kb/new", data={
+        "name": "fine-name", "title": "", "description": "d",
+        "content": "c"}, follow_redirects=False)
+    check("kb new requires fields", r.status_code == 303
+          and "required" in r.headers.get("location", ""))
+    r = client.post("/kb/new", data={
+        "name": "presales", "title": "t", "description": "d",
+        "content": "c"}, follow_redirects=False)
+    check("kb new rejects built-in collision", r.status_code == 303
+          and "already+exists" in r.headers.get("location", ""))
+
+    # 8e. remove the custom doc
+    client.get("/kb/reset", params={"name": "channel-faq"})
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT COUNT(*) FROM kb_overrides "
+                      "WHERE name='channel-faq'").fetchone()[0]
+    check("kb reset removes custom doc", v == 0)
 
     # 9. leads CSV
     r = client.get("/leads.csv")

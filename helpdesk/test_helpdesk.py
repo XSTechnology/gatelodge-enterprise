@@ -97,7 +97,8 @@ with TestClient(app.app) as client:
     check("healthz", r.status_code == 200 and r.json()["ok"], r.text)
     check("gateway configured", r.json()["gateway"] is True)
     check("db configured", r.json()["db"] is True)
-    check("kb docs = 7", r.json()["kb_docs"] == 7, r.text)
+    check("kb docs = builtin count",
+          r.json()["kb_docs"] == len(app.KB), r.text)
     r = client.get("/api/config")
     check("config name", r.json().get("name") == "The Gatekeeper")
 
@@ -193,6 +194,40 @@ check("user+assistant stored",
       any(r[0] == "user" for r in rows)
       and any(r[0] == "assistant" and r[1] and r[2] == "presales"
               for r in rows), str(rows))
+
+# 11. KB override merge: existing names patched, NEW names ADDED to the
+#     catalog (docs created in the Lodge Office) with parsed title/desc
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("INSERT INTO kb_overrides (name, content) VALUES (%s, %s) "
+              "ON CONFLICT (name) DO UPDATE SET content = %s",
+              ("channel-faq",
+               "# Channel FAQ\ntitle: Channel partners — FAQ\n"
+               "description: Partner trial questions\n\n## How long?\n"
+               "\n90 days.",
+               "# Channel FAQ\ntitle: Channel partners — FAQ\n"
+               "description: Partner trial questions\n\n## How long?\n"
+               "\n90 days."))
+    c.execute("INSERT INTO kb_overrides (name, content) VALUES (%s, %s) "
+              "ON CONFLICT (name) DO UPDATE SET content = %s",
+              ("presales", "title: Overridden\n"
+               "description: overridden desc\n\npatched body", 
+               "title: Overridden\n"
+               "description: overridden desc\n\npatched body"))
+merged = app._load_kb_overrides()
+check("override patches existing doc",
+      merged["presales"]["title"] == "Overridden"
+      and "patched body" in merged["presales"]["content"])
+check("NEW doc joins catalog",
+      "channel-faq" in merged
+      and merged["channel-faq"]["title"] == "Channel partners — FAQ"
+      and merged["channel-faq"]["summary"]
+      == "Partner trial questions"
+      and "90 days" in merged["channel-faq"]["content"],
+      str(merged.get("channel-faq"))[:100])
+check("builtin docs still present",
+      len(merged) >= len(app.KB) + 1)
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM kb_overrides")
 
 print()
 if fails:

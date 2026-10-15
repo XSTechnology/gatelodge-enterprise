@@ -28,6 +28,7 @@ import hmac
 import html as _html
 import json
 import os
+import re
 import time
 
 import httpx
@@ -615,48 +616,191 @@ async def issue(request: Request):
             status_code=303)
 
 
+# ── knowledge base (document CRUD + live overrides) ────────────────────────
+
+
+def _kb_dir():
+    import pathlib
+    return pathlib.Path(__file__).resolve().parent / "kb"
+
+
+def _parse_doc(content: str) -> tuple[str, str, str]:
+    """Split a KB doc into (title, description, body).
+
+    Docs carry a small header the Gatekeeper's triage stage routes on:
+        # Title
+        title: …
+        description: …
+        <markdown body>
+    Tolerant: if the header lines are missing, everything is body.
+    """
+    lines = content.splitlines()
+    title, desc, last = "", "", -1
+    for i, ln in enumerate(lines[:8]):
+        s = ln.strip()
+        m = re.match(r"^title:\s*(.+)$", s)
+        if m and not title:
+            title, last = m.group(1).strip(), i
+            continue
+        m = re.match(r"^description:\s*(.+)$", s)
+        if m and not desc:
+            desc, last = m.group(1).strip(), i
+    if last < 0:
+        return "", "", content.strip("\n")
+    body = "\n".join(lines[last + 1:]).strip("\n")
+    if body.startswith("# "):          # drop the stale H1 — save re-adds it
+        body = "\n".join(body.splitlines()[1:]).strip("\n")
+    return title, desc, body
+
+
+def _assemble_doc(title: str, description: str, body: str) -> str:
+    return (f"# {title}\ntitle: {title}\ndescription: {description}\n\n"
+            + body.strip("\n") + "\n")
+
+
 @app.get("/kb", response_class=HTMLResponse)
-async def kb_index(request: Request):
+async def kb_index(request: Request, flash: str = ""):
     if (r := _guard(request)):
         return r
-    import pathlib
-    base = sorted(p.stem for p in
-                  (pathlib.Path(__file__).resolve().parent / "kb")
-                  .glob("*.md"))
+    base = sorted(p.stem for p in _kb_dir().glob("*.md"))
     over = {n for n, in await _q("SELECT name FROM kb_overrides")}
-    rows = "".join(
-        f"<tr><td class='pill'>{_e(n)}</td>"
-        f"<td>{'<span class=tag warn>live-edited</span>' if n in over else '<span class=tag ok>built-in</span>'}</td>"
-        f"<td><a class='btn ghost' style='padding:.2rem .7rem;font-size:.72rem' "
-        f"href='/kb/edit?name={_e(n)}'>edit</a></td></tr>"
-        for n in base)
+    custom = sorted(over - set(base))
+
+    rows = ""
+    for n in base:
+        state = ('<span class="tag warn">live-edited</span>' if n in over
+                 else '<span class="tag ok">built-in</span>')
+        rows += (f"<tr><td class='pill'>{_e(n)}</td><td>{state}</td>"
+                 f"<td><a class='btn ghost' style='padding:.2rem .7rem;"
+                 f"font-size:.72rem' href='/kb/edit?name={_e(n)}'>edit</a>"
+                 f"</td></tr>")
+    for n in custom:
+        rows += (f"<tr><td class='pill'>{_e(n)}</td>"
+                 f"<td><span class='tag'>custom</span></td>"
+                 f"<td><a class='btn ghost' style='padding:.2rem .7rem;"
+                 f"font-size:.72rem' href='/kb/edit?name={_e(n)}'>edit</a> "
+                 f"<a class='btn ghost' style='padding:.2rem .7rem;"
+                 f"font-size:.72rem' href='/kb/reset?name={_e(n)}'"
+                 f" onclick=\"return confirm('remove {_e(n)}?')\""
+                 f">remove</a></td></tr>")
+
+    new_form = """
+<div class="box" style="margin-bottom:1.4rem">
+<p class="note" style="letter-spacing:.14em;text-transform:uppercase;
+color:var(--brass);margin-bottom:.7rem">New document</p>
+<form method="post" action="/kb/new" class="grid2">
+<div>
+<p class="note">name <span class="mono">(lowercase, e.g. channel-faq)</span></p>
+<input type="text" name="name" placeholder="doc-name" required
+ style="width:100%">
+<p class="note" style="margin-top:.7rem">title
+ <span class="mono">(what the triage model matches on)</span></p>
+<input type="text" name="title" placeholder="Channel partners — FAQ"
+ required style="width:100%">
+<p class="note" style="margin-top:.7rem">description
+ <span class="mono">(when to pick this doc)</span></p>
+<input type="text" name="description"
+ placeholder="Questions from inference partners about co-branded trials"
+ required style="width:100%">
+</div>
+<div>
+<p class="note">content <span class="mono">(markdown)</span></p>
+<textarea name="content" style="min-height:200px"
+ placeholder="## Question visitors ask…&#10;&#10;The answer, in plain terms."
+ ></textarea>
+</div></div>
+<div class="inline" style="margin-top:.4rem">
+<button class="btn">Create document (live)</button>
+<span class="note">custom docs join the agent's catalog on the next
+question — no redeploy</span></div>
+</form></div>"""
+
     body = f"""
-<p class="note" style="margin-bottom:1.2rem">Edits apply LIVE — the
-Gatekeeper merges these over its built-in docs on the next question. No
-redeploy needed.</p>
+<p class="note" style="margin-bottom:1.2rem">Edits and new documents
+apply LIVE — the Gatekeeper merges these over its built-in docs on the
+next question. Title + description are what its triage model routes on,
+so write them as the question a visitor would ask.</p>
+{new_form}
 <table><tr><th>doc</th><th>state</th><th></th></tr>{rows}</table>"""
-    return page(request, "Knowledge base", body)
+    return page(request, "Knowledge base", body, flash=flash)
+
+
+@app.post("/kb/new")
+async def kb_new(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    name = str(form.get("name", "")).strip().lower()
+    title = str(form.get("title", "")).strip()
+    description = str(form.get("description", "")).strip()
+    content = str(form.get("content", "")).strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", name):
+        return RedirectResponse(
+            "/kb?flash=name+must+be+lowercase+letters,+digits+and+dashes",
+            status_code=303)
+    if not (title and description and content):
+        return RedirectResponse(
+            "/kb?flash=title,+description+and+content+are+all+required",
+            status_code=303)
+    if (_kb_dir() / f"{name}.md").exists() or name in {
+            n for n, in await _q("SELECT name FROM kb_overrides")}:
+        return RedirectResponse(
+            f"/kb?flash=a+document+named+{name}+already+exists"
+            f"+—+edit+it+instead", status_code=303)
+    doc = _assemble_doc(title, description, content)
+    await _x("INSERT INTO kb_overrides (name, content) VALUES (%s, %s) "
+             "ON CONFLICT (name) DO UPDATE SET content=%s, "
+             "updated_at=now()", (name, doc, doc))
+    await _audit("kb-new", f"{name} ({len(doc)} chars)")
+    return RedirectResponse(
+        f"/kb/edit?name={name}&flash=document+created+—+live+on+the"
+        f"+next+question", status_code=303)
 
 
 @app.get("/kb/edit", response_class=HTMLResponse)
-async def kb_edit(request: Request, name: str = ""):
+async def kb_edit(request: Request, name: str = "", flash: str = ""):
     if (r := _guard(request)):
         return r
-    import pathlib
     ov = await _q("SELECT content FROM kb_overrides WHERE name=%s",
                   (name,), fetch="one")
-    content = ov[0] if ov else (
-        (pathlib.Path(__file__).resolve().parent / "kb" / f"{name}.md"
-         ).read_text(encoding="utf-8"))
-    body = f"""
+    if ov:
+        content = ov[0]
+    else:
+        p = _kb_dir() / f"{name}.md"
+        if not p.exists():
+            return RedirectResponse(
+                "/kb?flash=document+not+found", status_code=303)
+        content = p.read_text(encoding="utf-8")
+    title, desc, body = _parse_doc(content)
+    builtin = (_kb_dir() / f"{name}.md").exists()
+    danger = ("<a class='btn ghost' href='/kb/reset?name="
+              f"{_e(name)}'>reset to built-in</a>" if builtin else
+              f"<a class='btn ghost' href='/kb/reset?name={_e(name)}'"
+              f" onclick=\"return confirm('remove {name}?')\""
+              f">remove document</a>")
+    body_form = f"""
 <form method="post" action="/kb/save">
 <input type="hidden" name="name" value="{_e(name)}">
-<textarea name="content">{_e(content)}</textarea>
+<div class="grid2">
+<div>
+<p class="note">title <span class="mono">(triage matches on this)</span></p>
+<input type="text" name="title" value="{_e(title)}" required
+ style="width:100%">
+<p class="note" style="margin-top:.7rem">description
+ <span class="mono">(when to pick this doc)</span></p>
+<input type="text" name="description" value="{_e(desc)}" required
+ style="width:100%">
+</div>
+<div>
+<p class="note">content <span class="mono">(markdown)</span></p>
+<textarea name="content">{_e(body)}</textarea>
+</div></div>
 <div class="inline" style="margin-top:.8rem">
 <button class="btn">Save (live)</button>
-<a class="btn ghost" href="/kb/reset?name={_e(name)}">reset to built-in</a>
+{danger}
 <a class="btn ghost" href="/kb">back</a></div></form>"""
-    return page(request, f"Knowledge · <em>{_e(name)}</em>", body)
+    return page(request, f"Knowledge · <em>{_e(name)}</em>", body_form,
+                flash=flash)
 
 
 @app.post("/kb/save")
@@ -665,12 +809,21 @@ async def kb_save(request: Request):
         return RedirectResponse("/login", status_code=303)
     form = await request.form()
     name = str(form.get("name", ""))
-    content = str(form.get("content", ""))
+    title = str(form.get("title", "")).strip()
+    description = str(form.get("description", "")).strip()
+    content = str(form.get("content", "")).strip()
+    if not (title and description and content):
+        return RedirectResponse(
+            f"/kb/edit?name={_e(name)}&flash=title,+description+and"
+            f"+content+are+all+required", status_code=303)
+    doc = _assemble_doc(title, description, content)
     await _x("INSERT INTO kb_overrides (name, content) VALUES (%s, %s) "
              "ON CONFLICT (name) DO UPDATE SET content=%s, "
-             "updated_at=now()", (name, content, content))
-    await _audit("kb-save", f"{name} ({len(content)} chars)")
-    return RedirectResponse(f"/kb/edit?name={name}", status_code=303)
+             "updated_at=now()", (name, doc, doc))
+    await _audit("kb-save", f"{name} ({len(doc)} chars)")
+    return RedirectResponse(
+        f"/kb/edit?name={name}&flash=saved+—+live+on+the+next+question",
+        status_code=303)
 
 
 @app.get("/kb/reset")

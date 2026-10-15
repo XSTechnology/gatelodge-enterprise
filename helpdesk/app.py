@@ -137,7 +137,11 @@ CREATE TABLE IF NOT EXISTS kb_overrides (
 
 
 def _load_kb_overrides() -> dict:
-    """DB overrides merged over the built-in docs (admin live edits)."""
+    """DB overrides merged over the built-in docs (admin live edits).
+
+    A row whose name is NOT in the built-in set is a document created in
+    the Lodge Office — it is ADDED to the catalog (title/description
+    parsed from its content, which the triage stage routes on)."""
     docs = dict(KB)
     if not DATABASE_URL:
         return docs
@@ -148,17 +152,17 @@ def _load_kb_overrides() -> dict:
     except Exception:
         return docs
     for name, content in rows:
-        if name in docs:
-            title = re.search(r"^title:\s*(.+)$", content, re.M)
-            desc = re.search(r"^description:\s*(.+)$", content, re.M)
-            docs[name] = {
-                "name": name,
-                "title": (title.group(1).strip() if title
-                          else docs[name]["title"]),
-                "summary": (desc.group(1).strip() if desc
-                            else docs[name]["summary"]),
-                "content": content,
-            }
+        title = re.search(r"^title:\s*(.+)$", content, re.M)
+        desc = re.search(r"^description:\s*(.+)$", content, re.M)
+        base = docs.get(name)
+        docs[name] = {
+            "name": name,
+            "title": (title.group(1).strip() if title
+                      else (base["title"] if base else name)),
+            "summary": (desc.group(1).strip() if desc
+                        else (base["summary"] if base else "")),
+            "content": content,
+        }
     return docs
 
 
