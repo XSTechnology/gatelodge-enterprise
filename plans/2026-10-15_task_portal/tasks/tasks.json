@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[p3-1] portal/app.py — standalone client service: portal_* tables, own runner, client-safe tools (web_fetch, kb_search, email_draft, report), branded UI, templates, login, dashboard, run viewer",
+    "id": "p3-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[p3-2] Seed 4 templates + demo client",
+    "id": "p3-2",
+    "status": "pending"
+  },
+  {
+    "content": "[p3-3] Tests",
+    "id": "p3-3",
+    "status": "pending"
+  },
+  {
+    "content": "[p3-4] Deploy portal:1 on VM + DNS portal.datagatelodge.com + tunnel ingress",
+    "id": "p3-4",
+    "status": "pending"
+  },
+  {
+    "content": "[p3-5] Live verify + commit + context",
+    "id": "p3-5",
+    "status": "pending"
+  }
+]
