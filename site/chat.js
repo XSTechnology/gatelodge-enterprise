@@ -208,10 +208,55 @@
         dom.msgs.scrollTop = dom.msgs.scrollHeight;
       } else if (ev === "done") {
         if (!bubble2.textContent) bubble2.textContent = "(no answer)";
+        renderSources(bubble2, d.sources || []);
       } else if (ev === "escalate") {
         bubble2.textContent = d.message ||
           "I want to get this exactly right — can I take your email?";
         askEmail();
+      }
+    }
+
+    /* citations — the passages the answer was built from */
+    var SRC_LINKS = {
+      "faq": "/gatelodge.html#faq",
+      "presales": "/gatelodge.html",
+      "agent-services": "/services.html",
+      "licensing": "/gatelodge.html#download",
+      "backends": "/gatelodge.html#capabilities",
+      "console": "/gatelodge.html#capabilities",
+      "governance": "/gatelodge.html#capabilities",
+      "troubleshooting": "/gatelodge.html#faq",
+      "eula-summary": "/eula.html"
+    };
+
+    function renderSources(bubble2, sources) {
+      if (!sources.length) return;
+      var line = el("div", "gk-src");
+      var seen = {};
+      sources.forEach(function (s) {
+        if (!s || !s.doc || seen[s.doc]) return;
+        seen[s.doc] = true;
+        if (line.childNodes.length) {
+          line.appendChild(document.createTextNode(" · "));
+        }
+        var label = s.doc + (s.section
+          ? " — " + String(s.section).toLowerCase() : "");
+        var href = SRC_LINKS[s.doc];
+        if (href) {
+          var a = document.createElement("a");
+          a.href = href;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.textContent = label;
+          line.appendChild(a);
+        } else {
+          line.appendChild(document.createTextNode(label));
+        }
+      });
+      if (line.childNodes.length) {
+        bubble2.appendChild(document.createElement("br"));
+        bubble2.appendChild(line);
+        dom.msgs.scrollTop = dom.msgs.scrollHeight;
       }
     }
   }

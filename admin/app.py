@@ -27,9 +27,11 @@ import hashlib
 import hmac
 import html as _html
 import json
+import math
 import os
 import re
 import time
+import urllib.parse
 
 import httpx
 import psycopg
@@ -658,6 +660,97 @@ def _assemble_doc(title: str, description: str, body: str) -> str:
             + body.strip("\n") + "\n")
 
 
+# ── knowledge gaps (v2): cluster the questions that went to the team ─────
+
+_GAP_STOP = frozenset("""a an and are as at be but by can could do does for
+from has have how i if in into is it its may might must of on or our so than
+that the their them then there these they this to too us was we what when
+where which who why will with would you your""".split())
+
+
+def _gap_tok(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9']+", text.lower())
+            if len(t) > 2 and t not in _GAP_STOP]
+
+
+async def _gap_clusters(limit: int = 6) -> list[dict]:
+    """Questions from review/escalated sessions, clustered by TF-IDF
+    similarity — each cluster of >=2 is a candidate new document."""
+    rows = await _q(
+        "SELECT m.content FROM chat_messages m JOIN chat_sessions s "
+        "ON s.id = m.session_id WHERE m.role = 'user' AND "
+        "(s.needs_review OR s.escalated) ORDER BY m.id DESC LIMIT 200")
+    qs = [r[0].strip()[:300] for r in rows if r[0] and r[0].strip()]
+    if len(qs) < 2:
+        return []
+    tfs: list[dict[str, int]] = []
+    for q in qs:
+        tf: dict[str, int] = {}
+        for t in _gap_tok(q):
+            tf[t] = tf.get(t, 0) + 1
+        tfs.append(tf)
+    n = len(qs)
+    df: dict[str, int] = {}
+    for tf in tfs:
+        for t in tf:
+            df[t] = df.get(t, 0) + 1
+    idf = {t: math.log((n + 1) / (d + 1)) + 1.0 for t, d in df.items()}
+    vecs = []
+    for tf in tfs:
+        v = {t: (1.0 + math.log(c)) * idf.get(t, 1.0) for t, c in tf.items()}
+        vecs.append((v, math.sqrt(sum(w * w for w in v.values())) or 1.0))
+
+    def sim(i: int, j: int) -> float:
+        a, an = vecs[i]
+        b, bn = vecs[j]
+        return sum(w * b.get(t, 0.0) for t, w in a.items()) / (an * bn)
+
+    assigned = [False] * n
+    clusters: list[dict] = []
+    for i in range(n):
+        if assigned[i]:
+            continue
+        members = [i]
+        assigned[i] = True
+        for j in range(i + 1, n):
+            if not assigned[j] and sim(i, j) >= 0.22:
+                members.append(j)
+                assigned[j] = True
+        if len(members) < 2:
+            continue
+        counts: dict[str, int] = {}
+        for m in members:
+            for t in tfs[m]:
+                counts[t] = counts.get(t, 0) + 1
+        shared = [t for t, c in counts.items()
+                  if c >= (len(members) + 1) // 2]
+        shared.sort(key=lambda t: -idf.get(t, 1.0))
+        clusters.append({"count": len(members), "terms": shared[:5],
+                         "examples": [qs[m] for m in members[:3]]})
+    clusters.sort(key=lambda c: -c["count"])
+    return clusters[:limit]
+
+
+# ── FAQ site → KB sync (the site FAQ page is the source of truth) ────────
+
+SITE_FAQ_URL = os.environ.get(
+    "SITE_FAQ_URL", "https://datagatelodge.com/gatelodge.html")
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _parse_faq_html(html: str) -> list[tuple[str, str]]:
+    pairs = re.findall(
+        r'<p class="faq-q">(.*?)</p>\s*<p class="faq-a">(.*?)</p>',
+        html, re.S)
+    out = []
+    for q, a in pairs:
+        q = _html.unescape(_TAG.sub("", q)).strip()
+        a = _html.unescape(_TAG.sub("", a)).strip()
+        if q and a:
+            out.append((q, a))
+    return out
+
+
 @app.get("/kb", response_class=HTMLResponse)
 async def kb_index(request: Request, flash: str = ""):
     if (r := _guard(request)):
@@ -684,45 +777,127 @@ async def kb_index(request: Request, flash: str = ""):
                  f" onclick=\"return confirm('remove {_e(n)}?')\""
                  f">remove</a></td></tr>")
 
-    new_form = """
+    # knowledge gaps — questions that went to the team, clustered
+    gaps_html = ""
+    for g in await _gap_clusters():
+        terms = " · ".join(g["terms"]) or "misc"
+        guess = " ".join(g["terms"][:3]).strip().title() or "Visitor"
+        prefill = urllib.parse.urlencode({
+            "title": f"Questions about {guess}",
+            "description": (f"Common visitor questions about {guess} — "
+                            f"clustered from {g['count']} questions that "
+                            f"went to the team"),
+            "content": "\n\n".join(f"## {e}\n\n(answer pending)"
+                                   for e in g["examples"]),
+        })
+        exs = "".join(f"<p class='note' style='margin:.15rem 0'>— "
+                      f"{_e(e[:110])}</p>" for e in g["examples"])
+        gaps_html += (
+            f"<div class='box' style='margin-bottom:.8rem'>"
+            f"<p><b>{_e(terms)}</b> &nbsp;"
+            f"<span class='tag warn'>{g['count']} questions</span></p>"
+            f"{exs}"
+            f"<a class='btn ghost' style='padding:.2rem .7rem;font-size:"
+            f".72rem;margin-top:.4rem;display:inline-block' "
+            f"href='/kb/new?{prefill}'>draft document</a></div>")
+    gaps_inner = gaps_html if gaps_html else (
+        '<p class="note">No clusters yet — gaps appear once visitors ask '
+        'questions the knowledge base did not confidently answer.</p>')
+    gaps_block = """
 <div class="box" style="margin-bottom:1.4rem">
 <p class="note" style="letter-spacing:.14em;text-transform:uppercase;
-color:var(--brass);margin-bottom:.7rem">New document</p>
-<form method="post" action="/kb/new" class="grid2">
+color:var(--brass);margin-bottom:.7rem">Knowledge gaps — questions that
+went to the team</p>
+""" + gaps_inner + "</div>"
+
+    actions = """
+<div class="inline" style="margin-bottom:1.2rem">
+<a class="btn" href="/kb/new">New document</a>
+<form method="post" action="/kb/sync_faq" class="inline">
+<button class="btn ghost">Sync FAQ from site</button></form>
+<span class="note">edits and new documents go live on the next question</span>
+</div>"""
+
+    body = f"""
+<p class="note" style="margin-bottom:1.2rem">The Gatekeeper's knowledge:
+documents merged live over its built-ins. Title + description are what
+its retrieval routes on — write them as the question a visitor would
+ask.</p>
+{actions}
+{gaps_block}
+<table><tr><th>doc</th><th>state</th><th></th></tr>{rows}</table>"""
+    return page(request, "Knowledge base", body, flash=flash)
+
+
+@app.get("/kb/new", response_class=HTMLResponse)
+async def kb_new_form(request: Request, title: str = "",
+                      description: str = "", content: str = ""):
+    if (r := _guard(request)):
+        return r
+    body = f"""
+<form method="post" action="/kb/new">
+<div class="grid2">
 <div>
 <p class="note">name <span class="mono">(lowercase, e.g. channel-faq)</span></p>
 <input type="text" name="name" placeholder="doc-name" required
  style="width:100%">
 <p class="note" style="margin-top:.7rem">title
- <span class="mono">(what the triage model matches on)</span></p>
-<input type="text" name="title" placeholder="Channel partners — FAQ"
- required style="width:100%">
+ <span class="mono">(what the retrieval matches on)</span></p>
+<input type="text" name="title" value="{_e(title)}" required
+ placeholder="Channel partners — FAQ" style="width:100%">
 <p class="note" style="margin-top:.7rem">description
  <span class="mono">(when to pick this doc)</span></p>
-<input type="text" name="description"
+<input type="text" name="description" value="{_e(description)}" required
  placeholder="Questions from inference partners about co-branded trials"
- required style="width:100%">
+ style="width:100%">
 </div>
 <div>
-<p class="note">content <span class="mono">(markdown)</span></p>
-<textarea name="content" style="min-height:200px"
- placeholder="## Question visitors ask…&#10;&#10;The answer, in plain terms."
- ></textarea>
+<p class="note">content <span class="mono">(markdown — '##' sections
+become retrieval passages)</span></p>
+<textarea name="content">{_e(content)}</textarea>
 </div></div>
-<div class="inline" style="margin-top:.4rem">
+<div class="inline" style="margin-top:.8rem">
 <button class="btn">Create document (live)</button>
-<span class="note">custom docs join the agent's catalog on the next
-question — no redeploy</span></div>
-</form></div>"""
+<a class="btn ghost" href="/kb">back</a></div></form>"""
+    return page(request, "Knowledge · <em>new document</em>", body)
 
-    body = f"""
-<p class="note" style="margin-bottom:1.2rem">Edits and new documents
-apply LIVE — the Gatekeeper merges these over its built-in docs on the
-next question. Title + description are what its triage model routes on,
-so write them as the question a visitor would ask.</p>
-{new_form}
-<table><tr><th>doc</th><th>state</th><th></th></tr>{rows}</table>"""
-    return page(request, "Knowledge base", body, flash=flash)
+
+@app.post("/kb/sync_faq")
+async def kb_sync_faq(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(SITE_FAQ_URL,
+                            headers={"user-agent": "lodge-office-sync"})
+        items = _parse_faq_html(r.text)
+    except Exception as e:
+        return RedirectResponse(
+            f"/kb?flash=sync+failed:+{_e(repr(e)[:60])}", status_code=303)
+    if not items:
+        return RedirectResponse(
+            "/kb?flash=no+FAQ+items+found+on+the+site+page", status_code=303)
+    ov = await _q("SELECT content FROM kb_overrides WHERE name='faq'",
+                  (), fetch="one")
+    if ov:
+        title, desc, _ = _parse_doc(ov[0])
+    else:
+        p = _kb_dir() / "faq.md"
+        if p.exists():
+            title, desc, _ = _parse_doc(p.read_text(encoding="utf-8"))
+        else:
+            title, desc = "FAQ — frequently asked questions", ""
+    content = "\n\n".join(f"## {q}\n\n{a}" for q, a in items)
+    doc = _assemble_doc(title or "FAQ — frequently asked questions",
+                        desc or "Direct answers to common questions",
+                        content)
+    await _x("INSERT INTO kb_overrides (name, content) VALUES ('faq', %s) "
+             "ON CONFLICT (name) DO UPDATE SET content=%s, "
+             "updated_at=now()", (doc, doc))
+    await _audit("kb-sync-faq", f"{len(items)} items from {SITE_FAQ_URL}")
+    return RedirectResponse(
+        f"/kb?flash=synced+{len(items)}+FAQ+items+from+the+site",
+        status_code=303)
 
 
 @app.post("/kb/new")

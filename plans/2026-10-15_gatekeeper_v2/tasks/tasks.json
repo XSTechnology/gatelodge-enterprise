@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[v2-1] Read current message flow + chat.js + test mocks",
+    "id": "v2-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[v2-2] helpdesk: chunker + TF-IDF vector index + hybrid rerank (multi-doc, calibrated confidence, follow-up context, sources)",
+    "id": "v2-2",
+    "status": "pending"
+  },
+  {
+    "content": "[v2-3] admin: gap suggestions (cluster unanswered questions → draft docs) + FAQ site→KB sync",
+    "id": "v2-3",
+    "status": "pending"
+  },
+  {
+    "content": "[v2-4] chat.js: citation line under answers",
+    "id": "v2-4",
+    "status": "pending"
+  },
+  {
+    "content": "[v2-5] Test suites both services",
+    "id": "v2-5",
+    "status": "pending"
+  },
+  {
+    "content": "[v2-6] Deploy gatekeeper:7 + lodge-office:3 + site ?v= bump",
+    "id": "v2-6",
+    "status": "pending"
+  },
+  {
+    "content": "[v2-7] Live verify + commit + context",
+    "id": "v2-7",
+    "status": "pending"
+  }
+]

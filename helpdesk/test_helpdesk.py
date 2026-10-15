@@ -13,6 +13,7 @@ review queue, reviewed, 404/400 handling.
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -31,22 +32,28 @@ from fastapi.responses import StreamingResponse           # noqa: E402
 
 mock = FastAPI()
 MODE = {"triage": "confident"}
+CAPTURE = []          # answer-model request bodies (prompt assertions)
 
 
 @mock.post("/v1/chat/completions")
 async def completions(request: Request):
     body = await request.json()
     model = body.get("model")
+    if model == "answer":
+        CAPTURE.append(body)
     if model == "triage":
+        # pick the first candidates the retrieval stage actually offered
+        ids = re.findall(r"\[(\d+)\] doc=",
+                         body["messages"][0]["content"])
         if MODE["triage"] == "confident":
-            d = {"doc": "presales", "answerable": True, "confident": True,
-                 "legal": False, "topic": "what-is"}
+            d = {"ids": ids[:2], "confident": True, "legal": False,
+                 "topic": "what-is"}
         elif MODE["triage"] == "legal":
-            d = {"doc": "eula-summary", "answerable": True, "confident":
-                 True, "legal": True, "topic": "license-legal"}
+            d = {"ids": ids[:1], "confident": True, "legal": True,
+                 "topic": "license-legal"}
         else:
-            d = {"doc": None, "answerable": False, "confident": False,
-                 "legal": False, "topic": "off-topic"}
+            d = {"ids": [], "confident": False, "legal": False,
+                 "topic": "off-topic"}
         return {"choices": [{"message": {"content": json.dumps(d)}}]}
 
     async def gen():
@@ -122,7 +129,20 @@ with TestClient(app.app) as client:
           "Gatelodge is a self-hosted AI gateway.", str(toks))
     check("done event", "done" in kinds and done.get("doc") == "presales",
           str(evs))
+    check("done carries sources",
+          isinstance(done.get("sources"), list)
+          and done["sources"]
+          and done["sources"][0]["doc"] == "presales"
+          and done["sources"][0].get("section"), str(done))
     check("no escalate", "escalate" not in kinds)
+    ans_req = next((b for b in CAPTURE if b.get("model") == "answer"), None)
+    check("answer prompt uses passages",
+          ans_req is not None and "PASSAGE 1" in
+          ans_req["messages"][0]["content"])
+    check("answer prompt carries history + question",
+          ans_req is not None and any(
+              m["role"] == "user" and "What is Gatelodge?" in m["content"]
+              for m in ans_req["messages"]))
 
     # 4. legal question -> always escalate
     MODE["triage"] = "legal"
@@ -228,6 +248,30 @@ check("builtin docs still present",
       len(merged) >= len(app.KB) + 1)
 with psycopg.connect(os.environ["DATABASE_URL"]) as c:
     c.execute("DELETE FROM kb_overrides")
+
+# 12. retrieval engine (hybrid: TF-IDF chunks + rerank)
+kb2 = app._load_kb_overrides()
+chunks = app._chunk_kb(kb2)
+check("chunks built from sections", len(chunks) >= 20, str(len(chunks)))
+check("chunks carry doc+section",
+      all("doc" in c and "section" in c and "text" in c for c in chunks))
+idf = app._build_index(chunks)
+top = app._search("what is gatelodge", chunks, idf)
+check("retrieval: what-is -> presales",
+      bool(top) and top[0]["doc"] == "presales",
+      str([(c["doc"], c["section"]) for c in top[:3]]))
+top = app._search("what happens when the trial ends", chunks, idf)
+check("retrieval: trial-end -> faq chunk",
+      bool(top) and any(c["doc"] == "faq" for c in top[:3]),
+      str([(c["doc"], c["section"]) for c in top[:3]]))
+top = app._search("agent development methodology survey the estate",
+                  chunks, idf)
+check("retrieval: methodology -> agent-services",
+      bool(top) and any(c["doc"] == "agent-services" for c in top[:3]),
+      str([(c["doc"], c["section"]) for c in top[:3]]))
+top = app._search("purple elephant zebra quantum", chunks, idf)
+check("retrieval: nonsense -> no candidates", top == [],
+      str([(c["doc"], c["section"]) for c in top[:3]]))
 
 print()
 if fails:

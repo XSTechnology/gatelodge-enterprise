@@ -8,12 +8,44 @@ Run: docker run -d --name helpdesk-pg -p 5433:5432 -e POSTGRES_PASSWORD=test \
 """
 import os
 import sys
+import threading
 import time
 
 os.environ.setdefault("DATABASE_URL",
                       "postgresql://postgres:test@127.0.0.1:5433/helpdesk")
 os.environ.setdefault("ADMIN_KEY", "test-admin-key")
 os.environ.pop("RESEND_API_KEY", None)
+
+# ── fixture "site" on :8436 — the FAQ-sync source ─────────────────────────
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+
+FAQ_HTML = """<html><body>
+<div class="faq-item">
+    <p class="faq-q">What happens when the trial ends?</p>
+    <p class="faq-a">Local inference keeps working — <a href="#x">free</a>.
+      Cloud serving pauses until you enter a key.</p>
+</div>
+<div class="faq-item">
+    <p class="faq-q">Does our data pass through your servers?</p>
+    <p class="faq-a">No. Gatelodge is self-hosted.</p>
+</div>
+</body></html>""".encode()
+
+
+class _FixtureSite(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(FAQ_HTML)
+
+    def log_message(self, *a):
+        pass
+
+
+_osrv = HTTPServer(("127.0.0.1", 8436), _FixtureSite)
+threading.Thread(target=_osrv.serve_forever, daemon=True).start()
+os.environ.setdefault("SITE_FAQ_URL", "http://127.0.0.1:8436/faq")
 
 import psycopg                                            # noqa: E402
 
@@ -223,6 +255,60 @@ with TestClient(app.app) as client:
         v = c.execute("SELECT COUNT(*) FROM kb_overrides "
                       "WHERE name='channel-faq'").fetchone()[0]
     check("kb reset removes custom doc", v == 0)
+
+    # 8f. /kb/new GET page renders + prefills from gap suggestions
+    r = client.get("/kb/new", params={
+        "title": "Questions about Enterprise Pricing",
+        "description": "clustered from 3 questions",
+        "content": "## how much?\n\n(answer pending)"})
+    check("kb new page prefills", r.status_code == 200
+          and 'value="Questions about Enterprise Pricing"' in r.text
+          and "(answer pending)" in r.text)
+
+    # 8g. knowledge gaps — seeded questions cluster into a suggestion
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        for i, q in enumerate([
+                "how much does the enterprise edition cost per month",
+                "what is the enterprise pricing for 50 users",
+                "do you offer enterprise plans and pricing",
+                "what is the capital of France"]):
+            sid = f"gaptest{i:04d}"
+            c.execute("INSERT INTO chat_sessions (id, needs_review) "
+                      "VALUES (%s, TRUE) ON CONFLICT (id) DO NOTHING",
+                      (sid,))
+            c.execute("INSERT INTO chat_messages (session_id, role, "
+                      "content) VALUES (%s, 'user', %s)", (sid, q))
+    r = client.get("/kb")
+    check("gap cluster suggested", "draft document" in r.text
+          and "enterprise" in r.text.lower()
+          and "questions" in r.text.lower(), r.text[:200])
+    check("gap examples rendered", "enterprise pricing" in r.text.lower())
+
+    # 8h. FAQ HTML parser (site -> KB sync)
+    items = app._parse_faq_html(FAQ_HTML.decode())
+    check("faq parser extracts pairs", len(items) == 2
+          and items[0][0] == "What happens when the trial ends?"
+          and "Local inference keeps working — free" in items[0][1]
+          and items[1][0].startswith("Does our data"), str(items)[:160])
+
+    # 8i. FAQ sync end-to-end (fixture site -> faq doc)
+    r = client.post("/kb/sync_faq", follow_redirects=False)
+    check("sync redirects", r.status_code == 303
+          and "synced+2" in r.headers.get("location", ""))
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT content FROM kb_overrides "
+                      "WHERE name='faq'").fetchone()
+    check("faq synced with header + Q&As",
+          v is not None and "## What happens when the trial ends?" in v[0]
+          and "## Does our data pass through your servers?" in v[0]
+          and v[0].startswith("# FAQ"), str(v)[:120])
+    client.get("/kb/reset", params={"name": "faq"})
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        for i in range(4):
+            c.execute("DELETE FROM chat_messages WHERE session_id = %s",
+                      (f"gaptest{i:04d}",))
+            c.execute("DELETE FROM chat_sessions WHERE id = %s",
+                      (f"gaptest{i:04d}",))
 
     # 9. leads CSV
     r = client.get("/leads.csv")

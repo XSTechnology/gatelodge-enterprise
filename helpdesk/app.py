@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -168,6 +169,98 @@ def _load_kb_overrides() -> dict:
 
 def _run(fn):
     return asyncio.to_thread(fn)
+
+
+# ── retrieval (v2 intelligence) ───────────────────────────────────────────
+# Hybrid: chunk the merged KB, score chunks with TF-IDF cosine vectors
+# (keyword recall), then let the triage model rerank and pick 1-3 passages
+# (semantic judgment, follow-up aware). Answers cite their passages and
+# may draw on several docs. Everything rebuilds per request, so Lodge
+# Office document CRUD applies instantly. When a real embedding model is
+# available through the gateway, it can replace the TF-IDF scorer behind
+# the same "scored chunks for a query" interface.
+
+_STOP = frozenset("""a an and are as at be but by can could do does for from
+has have how i if in into is it its may might must of on or our so than that
+the their them then there these they this to too us was we what when where
+which who why will with would you your""".split())
+
+
+def _tok(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9']+", text.lower())
+            if len(t) > 2 and t not in _STOP]
+
+
+def _chunk_kb(kb: dict) -> list[dict]:
+    """Every '## ' section of every doc is a retrieval chunk. The doc's
+    title/description/section-heading terms are folded into the chunk's
+    term counts, so doc-level and section-level queries both hit."""
+    chunks: list[dict] = []
+    for name, d in kb.items():
+        content = d["content"]
+        m = re.search(r"^description:.*$", content, re.M)
+        body = content[m.end():] if m else content
+        sections: list[tuple[str, list[str]]] = []
+        cur_title, cur = "overview", []
+        for ln in body.splitlines():
+            h = re.match(r"^##\s+(.+?)\s*$", ln)
+            if h:
+                sections.append((cur_title, cur))
+                cur_title, cur = h.group(1), []
+            else:
+                cur.append(ln)
+        sections.append((cur_title, cur))
+        for title, lines in sections:
+            text = "\n".join(lines).strip()
+            if not text:
+                continue
+            tf: dict[str, int] = {}
+            for t in _tok(f'{d["title"]} {d["summary"]} {title} {title} '
+                          f"{text}"):
+                tf[t] = tf.get(t, 0) + 1
+            chunks.append({"id": len(chunks), "doc": name,
+                           "doc_title": d["title"], "section": title,
+                           "text": text, "tf": tf})
+    return chunks
+
+
+def _build_index(chunks: list[dict]) -> dict:
+    n = max(len(chunks), 1)
+    df: dict[str, int] = {}
+    for c in chunks:
+        for t in c["tf"]:
+            df[t] = df.get(t, 0) + 1
+    idf = {t: math.log((n + 1) / (d + 1)) + 1.0 for t, d in df.items()}
+    for c in chunks:
+        c["vec"] = {t: (1.0 + math.log(cnt)) * idf.get(t, 1.0)
+                    for t, cnt in c["tf"].items()}
+        c["norm"] = math.sqrt(sum(w * w for w in c["vec"].values())) or 1.0
+    return idf
+
+
+def _search(query: str, chunks: list[dict], idf: dict,
+            k: int = 8) -> list[dict]:
+    qv: dict[str, float] = {}
+    for t in _tok(query):
+        qv[t] = qv.get(t, 0.0) + idf.get(t, 0.3)
+    if not qv:
+        return []
+    qn = math.sqrt(sum(w * w for w in qv.values()))
+    scored = []
+    for c in chunks:
+        dot = sum(w * c["vec"].get(t, 0.0) for t, w in qv.items())
+        if dot > 0:
+            scored.append((dot / (qn * c["norm"]), c))
+    scored.sort(key=lambda x: -x[0])
+    return [c for _, c in scored[:k]]
+
+
+def _retrieve(query: str) -> tuple[list[dict], list[dict]]:
+    """Merged KB -> (all chunks, top candidates for the query)."""
+    kb = _load_kb_overrides()
+    chunks = _chunk_kb(kb)
+    idf = _build_index(chunks)
+    return chunks, _search(query, chunks, idf)
 
 
 def _init_schema() -> None:
@@ -310,44 +403,77 @@ async def turnstile_ok(token: str, ip: str) -> bool:
 
 # ── gateway calls ─────────────────────────────────────────────────────────
 
-TRIAGE_SYSTEM = """You triage customer questions for the Gatelodge help \
-desk. Available knowledge-base documents:
+RERANK_SYSTEM = """You triage customer questions for the Gatelodge help \
+desk. Keyword search retrieved the CANDIDATE passages below; you pick the \
+best ones.
 
-{docs}
+Pick 1-3 candidate ids that answer the LATEST question (follow-ups refer \
+to earlier turns — judge them in conversation context). Calibrate:
+- confident=true ONLY when a passage clearly and fully answers it
+- vague, borderline, or partially-covered questions: confident=false
+- legal=true for requests to interpret the EULA/contract — always escalate
 
 Reply with ONLY a JSON object, no other text:
-{{"doc": "<best doc name or null>", "answerable": true|false, \
-"confident": true|false, "legal": true|false, "topic": "<short topic>"}}
+{{"ids": [candidate ids], "confident": true|false, "legal": true|false, \
+"topic": "<short topic>"}}
 
-- answerable: the KB likely answers this question
-- confident: the KB CLEARLY covers it (generic, vague, or borderline \
-questions are not confident)
-- legal: this is a request for legal/contractual interpretation of the \
-EULA (always true for "is this allowed under the license" questions)"""
+CANDIDATES:
+{candidates}"""
 
 ANSWER_SYSTEM = """You are the Gatekeeper, the support assistant for \
 Gatelodge (by DataGateLodge, a division of XS Technologies Inc.).
 
-Answer the customer's question using ONLY the knowledge-base document \
-below. If the document does not contain the answer, say you'll check \
-with the team. Be concise, warm, and precise — 2-6 sentences. Use plain \
-language; markdown bold is fine; no headings. Never invent features, \
-prices, or policy. The product name is Gatelodge.
+Answer the customer's LATEST question using ONLY the knowledge passages \
+below (the earlier conversation may add context). If the passages do not \
+contain the answer, say you'll check with the team — never guess. Be \
+concise, warm, and precise — 2-6 sentences. Use plain language; markdown \
+bold is fine; no headings. Never invent features, prices, or policy. The \
+product name is Gatelodge.
 
---- KNOWLEDGE BASE: {doc_title} ---
-{doc_content}
---- END KNOWLEDGE BASE ---"""
+{passages}"""
 
 
-async def triage(question: str) -> dict:
-    """Stage 1 — cheap model decides doc + confidence. Fail-safe to
-    escalate on any parse problem."""
+def _candidates_block(cands: list[dict]) -> str:
+    rows = []
+    for c in cands:
+        snippet = " ".join(c["text"].split())[:220]
+        rows.append(f'[{c["id"]}] doc={c["doc"]} · {c["section"]}\n'
+                    f"    {snippet}")
+    return "\n".join(rows)
+
+
+def _passages_block(chunks: list[dict]) -> str:
+    parts = []
+    for i, c in enumerate(chunks, 1):
+        parts.append(f'--- PASSAGE {i} — {c["doc_title"]} · '
+                     f'{c["section"]} ---\n{c["text"]}\n--- END ---')
+    return "\n\n".join(parts)
+
+
+async def triage(question: str, history: list[dict]) -> dict:
+    """Stage 1 — hybrid retrieval (TF-IDF) + LLM rerank (semantic pick,
+    calibrated confidence, follow-up aware). Fail-safe to escalate on
+    any error."""
+    empty = {"chunks": [], "confident": False, "legal": False, "topic": ""}
     if not GATEWAY_URL or not GATEWAY_KEY:
-        return {"doc": None, "answerable": False, "confident": False,
-                "legal": False, "topic": "gateway-unconfigured"}
-    kb = await _run(_load_kb_overrides)
-    listing = "\n".join(f'- {d["name"]}: {d["summary"]}'
-                        for d in kb.values())
+        return {**empty, "topic": "gateway-unconfigured"}
+
+    # retrieval query: the question plus the previous user turn, so
+    # follow-ups ("and after that?") still surface the right passages
+    prev_users = [m["content"] for m in history if m["role"] == "user"]
+    query = " ".join(prev_users[-2:] + [question])[-800:]
+    try:
+        _, cands = await _run(lambda: _retrieve(query))
+    except Exception as e:
+        print(f"[gatekeeper] retrieval error: {e!r}")
+        return {**empty, "topic": "retrieval-error"}
+    if not cands:
+        return {**empty, "topic": "no-matches"}
+
+    convo = "\n".join(f'{m["role"]}: {m["content"][:200]}'
+                      for m in history[-4:])
+    user_msg = (f"Conversation so far:\n{convo}\n\n"
+                f"LATEST question: {question}") if convo else question
     try:
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(
@@ -356,27 +482,28 @@ async def triage(question: str) -> dict:
                 json={"model": TRIAGE_MODEL,
                       "messages": [
                           {"role": "system",
-                           "content": TRIAGE_SYSTEM.format(docs=listing)},
-                          {"role": "user", "content": question}],
+                           "content": RERANK_SYSTEM.format(
+                               candidates=_candidates_block(cands))},
+                          {"role": "user", "content": user_msg}],
                       "max_tokens": 600, "temperature": 0.0})
             content = r.json()["choices"][0]["message"]["content"] or ""
     except Exception as e:
-        print(f"[gatekeeper] triage error: {e!r}")
-        return {"doc": None, "answerable": False, "confident": False,
-                "legal": False, "topic": "triage-error"}
+        print(f"[gatekeeper] rerank error: {e!r}")
+        return {**empty, "topic": "rerank-error"}
     m = re.search(r"\{.*\}", content, re.S)
     if not m:
-        return {"doc": None, "answerable": False, "confident": False,
-                "legal": False, "topic": "triage-unparseable"}
+        return {**empty, "topic": "rerank-unparseable"}
     try:
         d = json.loads(m.group(0))
-        return {"doc": d.get("doc"), "answerable": bool(d.get("answerable")),
-                "confident": bool(d.get("confident")),
+        by_id = {c["id"]: c for c in cands}
+        ids = [i for i in (d.get("ids") or [])
+               if str(i).isdigit() and int(i) in by_id][:3]
+        picked = [by_id[int(i)] for i in ids]
+        return {"chunks": picked, "confident": bool(d.get("confident")),
                 "legal": bool(d.get("legal")),
                 "topic": str(d.get("topic", ""))[:60]}
     except Exception:
-        return {"doc": None, "answerable": False, "confident": False,
-                "legal": False, "topic": "triage-unparseable"}
+        return {**empty, "topic": "rerank-unparseable"}
 
 
 async def load_history(session_id: str) -> list[dict]:
@@ -474,7 +601,9 @@ async def chat_message(body: MessageRequest, request: Request):
     if not await _run(lambda: _record_user_message(body.session_id, text)):
         raise HTTPException(404, "unknown session")
 
-    t = await triage(text)
+    # history includes the just-recorded question as its last message
+    history = await load_history(body.session_id)
+    t = await triage(text, history[:-1])
 
     async def mark(needs_review: bool, escalated: bool = False,
                    email: str | None = None) -> None:
@@ -492,7 +621,7 @@ async def chat_message(body: MessageRequest, request: Request):
                 "message": ("Licensing-law questions go to the team — "
                             "can I take your email so a human follows up?")})
             return
-        if not (t["answerable"] and t["confident"] and t["doc"] in KB):
+        if not (t["confident"] and t["chunks"]):
             await mark(True)
             yield await sse("escalate", {
                 "reason": t["topic"] or "uncovered",
@@ -500,11 +629,12 @@ async def chat_message(body: MessageRequest, request: Request):
                             "take your email? The team will follow up.")})
             return
 
-        kb = await _run(_load_kb_overrides)
-        doc = kb[t["doc"]]
-        history = await load_history(body.session_id)
+        picked = t["chunks"]
+        sources = [{"doc": c["doc"], "section": c["section"]}
+                   for c in picked]
+        primary = picked[0]["doc"]
         messages = ([{"role": "system", "content": ANSWER_SYSTEM.format(
-                        doc_title=doc["title"], doc_content=doc["content"])}]
+                        passages=_passages_block(picked))}]
                     + history)          # last message = the current question
         answer_parts: list[str] = []
         try:
@@ -542,8 +672,9 @@ async def chat_message(body: MessageRequest, request: Request):
 
         answer = "".join(answer_parts)
         await _run(lambda: _save_assistant(body.session_id, answer,
-                                           t["doc"], ANSWER_MODEL))
-        yield await sse("done", {"doc": t["doc"], "topic": t["topic"]})
+                                           primary, ANSWER_MODEL))
+        yield await sse("done", {"doc": primary, "topic": t["topic"],
+                                 "sources": sources})
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
