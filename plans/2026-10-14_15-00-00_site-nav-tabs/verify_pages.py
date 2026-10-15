@@ -80,8 +80,8 @@ def run():
         page.goto(BASE + "/gatelodge.html", wait_until="networkidle")
         gpages = page.eval_on_selector_all(
             ".nav-pages a", "els => els.map(a => a.textContent.trim())")
-        check("gate: 8 pages", gpages == ["One Gateway", "Problem", "Capabilities", "ROI",
-                                          "Editions", "Channel", "Download", "Contact"], str(gpages))
+        check("gate: 10 pages", gpages == ["One Gateway", "How It Works", "Problem", "Capabilities", "ROI",
+                                           "Editions", "Channel", "Download", "FAQ", "Contact"], str(gpages))
         check("gate: gateway section current", page.eval_on_selector(
             '.nav-sections a[aria-current="page"]', "el => el.textContent") == "The Gateway")
         check("gate: no CTA", page.eval_on_selector_all(
@@ -94,14 +94,25 @@ def run():
         check("gate: One Gateway fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
         page.screenshot(path=os.path.join(SHOTS, "02-gate-intro.png"))
 
-        for pid in ["problem", "capabilities", "roi", "editions",
-                    "partners", "download", "contact"]:
+        for pid in ["how", "problem", "capabilities", "roi", "editions",
+                    "partners", "download", "faq", "contact"]:
             page.click(f'.nav-pages a[href="#{pid}"]')
             page.wait_for_timeout(350)
             h, _ = fit_report(pid)
             check(f"gate: {pid} fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
             if pid == "problem":
                 page.screenshot(path=os.path.join(SHOTS, "03-gate-problem.png"))
+            if pid == "how":
+                page.screenshot(path=os.path.join(SHOTS, "03b-gate-how.png"))
+                check("gate: how has lifecycle diagram", page.eval_on_selector(
+                    "#how .flow-diagram", "el => !!el"))
+                check("gate: how has run strip", page.eval_on_selector_all(
+                    "#how .method-map .mm-node", "els => els.length") == 4)
+                check("gate: how lists 10 backend types", "Bedrock" in page.eval_on_selector(
+                    "#how .backend-chips", "el => el.textContent"))
+            if pid == "faq":
+                check("gate: faq has 7 items", page.eval_on_selector_all(
+                    "#faq .faq-item", "els => els.length") == 7)
             if pid == "capabilities":
                 # title block alignment on a full-bleed band page
                 align = page.eval_on_selector("#capabilities", """el => {
@@ -110,6 +121,21 @@ def run():
                     return Math.abs(l.left - h2.left) < 2;
                 }""")
                 check("gate: label aligns with content (alt band)", align)
+
+        # editions compare modal
+        page.click('.nav-pages a[href="#editions"]')
+        page.wait_for_timeout(300)
+        page.click('[data-modal-open="compare-modal"]')
+        page.wait_for_timeout(300)
+        check("gate: compare modal opens", page.eval_on_selector(
+            "#compare-modal", "el => el.open"))
+        check("gate: matrix has 12 rows", page.eval_on_selector_all(
+            "#compare-modal .matrix-table tbody tr", "els => els.length") == 12)
+        page.screenshot(path=os.path.join(SHOTS, "03c-editions-matrix.png"))
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+        check("gate: compare modal closes", not page.eval_on_selector(
+            "#compare-modal", "el => el.open"))
 
         # deep link still works
         page.goto(BASE + "/gatelodge.html#download", wait_until="networkidle")
@@ -138,6 +164,10 @@ def run():
                                               "Design", "Post", "Walk", "Proof", "Start"], str(spages))
         h, _ = fit_report("intro")
         check("services: What We Build fits", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+        check("services: method map on landing", page.eval_on_selector_all(
+            "#intro .method-map .mm-node", "els => els.length") == 5)
+        check("services: loop-back line present", "estate evolves" in page.eval_on_selector(
+            "#intro .mm-loop", "el => el.textContent"))
         page.screenshot(path=os.path.join(SHOTS, "04-services-intro.png"))
 
         for pid in ["expertise", "survey", "map", "design", "post", "walk", "proof", "what-we-need"]:
@@ -147,6 +177,15 @@ def run():
             check(f"services: {pid} fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
             if pid == "design":
                 page.screenshot(path=os.path.join(SHOTS, "05-services-design.png"))
+
+        # you-are-here strips: current node marked on each method page
+        for pid in ["survey", "map", "design", "post", "walk"]:
+            page.click(f'.nav-pages a[href="#{pid}"]')
+            page.wait_for_timeout(250)
+            marked = page.eval_on_selector(
+                f"#{pid} .method-map a[aria-current='step']",
+                "el => el.getAttribute('href')")
+            check(f"services: {pid} marks itself on the map", marked == f"#{pid}", str(marked))
 
         # step-nav flow across method pages
         page.click('.nav-pages a[href="#survey"]')

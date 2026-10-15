@@ -84,7 +84,7 @@
   wireConfig();
   wireTrialForm();
   initTabs();
-  initEula();
+  initModals();
 
   /* ── pages ────────────────────────────────────────────────────────── */
   // The nav carries a contextual page list (.nav-pages). Links swap the
@@ -160,49 +160,60 @@
     resolve();
   }
 
-  /* ── EULA pop-up window ───────────────────────────────────────────── */
-  // The dock button (and any [data-eula-open] link) opens the agreement
-  // in a scrollable <dialog>. Content is lifted from /eula.html at
-  // runtime, so there is exactly one source of truth for the text.
-  function initEula() {
-    var modal = document.getElementById("eula-modal");
-    if (!modal || !modal.showModal) return;
-    var body = document.getElementById("eula-body");
-    var loaded = false;
-
-    function open() {
-      modal.showModal();
-      if (loaded) return;
-      loaded = true;
-      fetch("eula.html").then(function (r) { return r.text(); })
-        .then(function (html) {
-          var doc = new DOMParser().parseFromString(html, "text/html");
-          var src = doc.querySelector(".legal-doc");
-          if (src && body) body.innerHTML = src.innerHTML;
-        })
-        .catch(function () {
-          if (body) body.innerHTML =
-            '<p>Could not load the agreement here — ' +
-            '<a href="eula.html">open it as a page</a> instead.</p>';
-        });
-    }
-
+  /* ── pop-up windows (EULA, edition comparison, …) ──────────────────── */
+  // Any [data-modal-open] opens the <dialog class="modal"> it names;
+  // the ✕ button ([data-modal-close]) and a click on the dimmed area
+  // close it. The EULA text itself is lifted from /eula.html on first
+  // open, so there is exactly one source of truth for the agreement.
+  function initModals() {
     Array.prototype.forEach.call(
-      document.querySelectorAll("[data-eula-open]"),
+      document.querySelectorAll("[data-modal-open]"),
       function (el) {
         el.addEventListener("click", function (ev) {
           ev.preventDefault();
-          open();
+          var d = document.getElementById(
+            el.getAttribute("data-modal-open"));
+          if (d && d.showModal) d.showModal();
         });
       });
 
-    var close = document.getElementById("eula-close");
-    if (close) close.addEventListener("click", function () { modal.close(); });
+    Array.prototype.forEach.call(
+      document.querySelectorAll("dialog.modal"),
+      function (d) {
+        d.addEventListener("click", function (ev) {
+          if (ev.target === d) d.close();
+        });
+        var c = d.querySelector("[data-modal-close]");
+        if (c) c.addEventListener("click", function () { d.close(); });
+      });
 
-    // click on the dimmed area around the document closes it
-    modal.addEventListener("click", function (ev) {
-      if (ev.target === modal) modal.close();
-    });
+    var eula = document.getElementById("eula-modal");
+    var body = document.getElementById("eula-body");
+    var loaded = false;
+    if (eula && body) {
+      // <dialog> fires no "open" event of its own, so the lazy load
+      // rides on the same clicks that open it
+      Array.prototype.forEach.call(
+        document.querySelectorAll('[data-modal-open="eula-modal"]'),
+        function (b) {
+          b.addEventListener("click", function () {
+            if (loaded) return;
+            loaded = true;
+            fetch("eula.html").then(function (r) { return r.text(); })
+              .then(function (html) {
+                var doc = new DOMParser().parseFromString(
+                  html, "text/html");
+                var src = doc.querySelector(".legal-doc");
+                if (src) body.innerHTML = src.innerHTML;
+              })
+              .catch(function () {
+                body.innerHTML =
+                  '<p>Could not load the agreement here — ' +
+                  '<a href="eula.html">open it as a page</a> instead.</p>';
+              });
+          });
+        });
+    }
   }
 
 

@@ -20,7 +20,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20261014b">
+<link rel="stylesheet" href="styles.css?v=20261014c">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
@@ -37,12 +37,14 @@
   </div>
   <div class="nav-pages" role="tablist" aria-label="The Gateway — pages">
     <a href="#intro" role="tab" id="tab-intro" aria-controls="intro" aria-selected="true">One Gateway</a>
+    <a href="#how" role="tab" id="tab-how" aria-controls="how" aria-selected="false">How It Works</a>
     <a href="#problem" role="tab" id="tab-problem" aria-controls="problem" aria-selected="false">Problem</a>
     <a href="#capabilities" role="tab" id="tab-capabilities" aria-controls="capabilities" aria-selected="false">Capabilities</a>
     <a href="#roi" role="tab" id="tab-roi" aria-controls="roi" aria-selected="false">ROI</a>
     <a href="#editions" role="tab" id="tab-editions" aria-controls="editions" aria-selected="false">Editions</a>
     <a href="#partners" role="tab" id="tab-partners" aria-controls="partners" aria-selected="false">Channel</a>
     <a href="#download" role="tab" id="tab-download" aria-controls="download" aria-selected="false">Download</a>
+    <a href="#faq" role="tab" id="tab-faq" aria-controls="faq" aria-selected="false">FAQ</a>
     <a href="#contact" role="tab" id="tab-contact" aria-controls="contact" aria-selected="false">Contact</a>
   </div>
 </nav>
@@ -97,9 +99,114 @@
 
 </section>
 
-<!-- ── Page 2 — The problem ─────────────────────────────────────────── -->
+<!-- ── Page 2 — How it works ────────────────────────────────────────── -->
+<section class="section tab-panel" id="how" role="tabpanel" aria-labelledby="tab-how" hidden>
+  <p class="section-label mono">Checkpoint 01 — How it works</p>
+  <h2>One request,<br><em>end to end.</em></h2>
+  <p class="section-lede">Your apps talk to one endpoint. The gate resolves who's asking,
+    checks the budget, routes the task down the right chain, and writes the exchange
+    to a ledger that cannot be quietly edited.</p>
+
+  <svg class="flow-diagram" viewBox="0 0 958 340" role="img" aria-label="Request lifecycle: your app calls one endpoint; Gatelodge resolves the key and role, checks budgets, routes through alias chains with a semantic cache, fans out to allowlisted providers, and appends every exchange to a hash-chained audit ledger.">
+    <defs>
+      <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+        <path d="M0,0 L8,4 L0,8 Z" class="fd-head"/>
+      </marker>
+    </defs>
+
+    <!-- your app -->
+    <rect class="fd-box" x="8" y="112" width="112" height="56" rx="10"/>
+    <text class="fd-label" x="64" y="136" text-anchor="middle">your app</text>
+    <text class="fd-small" x="64" y="152" text-anchor="middle">any SDK · curl</text>
+
+    <line class="fd-line" x1="120" y1="140" x2="162" y2="140" marker-end="url(#ah)"/>
+
+    <!-- the one endpoint -->
+    <rect class="fd-box" x="168" y="116" width="118" height="48" rx="24"/>
+    <text class="fd-label" x="227" y="137" text-anchor="middle">one endpoint</text>
+    <text class="fd-small" x="227" y="152" text-anchor="middle">OpenAI-compatible</text>
+
+    <line class="fd-line" x1="286" y1="140" x2="330" y2="140" marker-end="url(#ah)"/>
+
+    <!-- the gate -->
+    <rect class="fd-gate" x="338" y="28" width="310" height="224" rx="12"/>
+    <text class="fd-title" x="493" y="54" text-anchor="middle">GATELODGE</text>
+    <text class="fd-small" x="493" y="68" text-anchor="middle">self-hosted · your perimeter</text>
+
+    <rect class="fd-chip" x="358" y="80" width="270" height="26" rx="7"/>
+    <text class="fd-label" x="368" y="97" font-size="10">01 · resolve key → role</text>
+    <rect class="fd-chip" x="358" y="112" width="270" height="26" rx="7"/>
+    <text class="fd-label" x="368" y="129" font-size="10">02 · budget check — hard stop</text>
+    <rect class="fd-chip" x="358" y="144" width="270" height="26" rx="7"/>
+    <text class="fd-label" x="368" y="161" font-size="10">03 · alias chain · hedge routing</text>
+    <rect class="fd-chip" x="358" y="176" width="270" height="26" rx="7"/>
+    <text class="fd-label" x="368" y="193" font-size="10">04 · semantic cache — hits never bill</text>
+    <rect class="fd-chip-brass" x="358" y="208" width="270" height="26" rx="7" stroke-dasharray="4 3"/>
+    <text class="fd-brass" x="368" y="225">＋ embedded local GGUF — no provider needed</text>
+
+    <!-- fan out to providers -->
+    <text class="fd-brass" x="875" y="24" text-anchor="middle">YOUR PROVIDERS · ALLOWLISTED</text>
+    <line class="fd-line" x1="648" y1="140" x2="794" y2="49" marker-end="url(#ah)"/>
+    <line class="fd-line" x1="648" y1="140" x2="794" y2="91" marker-end="url(#ah)"/>
+    <line class="fd-line" x1="648" y1="140" x2="794" y2="133" marker-end="url(#ah)"/>
+    <line class="fd-line" x1="648" y1="140" x2="794" y2="175" marker-end="url(#ah)"/>
+    <line class="fd-line" x1="648" y1="140" x2="794" y2="217" marker-end="url(#ah)"/>
+
+    <rect class="fd-box" x="800" y="34" width="150" height="30" rx="8"/>
+    <text class="fd-small" x="875" y="53" text-anchor="middle">groq</text>
+    <rect class="fd-box" x="800" y="76" width="150" height="30" rx="8"/>
+    <text class="fd-small" x="875" y="95" text-anchor="middle">anthropic</text>
+    <rect class="fd-box" x="800" y="118" width="150" height="30" rx="8"/>
+    <text class="fd-small" x="875" y="137" text-anchor="middle">openai</text>
+    <rect class="fd-box" x="800" y="160" width="150" height="30" rx="8"/>
+    <text class="fd-small" x="875" y="179" text-anchor="middle">azure · vertex · bedrock</text>
+    <rect class="fd-box" x="800" y="202" width="150" height="30" rx="8"/>
+    <text class="fd-small" x="875" y="221" text-anchor="middle">runpod · serverless</text>
+
+    <!-- the ledger -->
+    <line class="fd-line" x1="612" y1="252" x2="612" y2="266" marker-end="url(#ah)"/>
+    <text class="fd-small" x="624" y="264">every exchange</text>
+
+    <rect class="fd-chip" x="560" y="272" width="104" height="26" rx="7"/>
+    <text class="fd-small" x="612" y="289" text-anchor="middle">req 8d1f…</text>
+    <line class="fd-dash" x1="664" y1="285" x2="678" y2="285"/>
+    <text class="fd-brass" x="671" y="268" text-anchor="middle" font-size="8">hash</text>
+    <rect class="fd-chip" x="680" y="272" width="104" height="26" rx="7"/>
+    <text class="fd-small" x="732" y="289" text-anchor="middle">req c4a2…</text>
+    <line class="fd-dash" x1="784" y1="285" x2="798" y2="285"/>
+    <text class="fd-brass" x="791" y="268" text-anchor="middle" font-size="8">hash</text>
+    <rect class="fd-chip" x="800" y="272" width="104" height="26" rx="7"/>
+    <text class="fd-small" x="852" y="289" text-anchor="middle">req 91be…</text>
+    <text class="fd-small" x="918" y="289">…</text>
+
+    <text class="fd-small" x="731" y="318" text-anchor="middle">append-only · hash-chained — alter any block and every later hash breaks</text>
+  </svg>
+  <p class="console-caption mono">the gate decides · the ledger remembers</p>
+
+  <div class="mm-wrap" style="margin-top:1.1rem">
+    <p class="section-label mono" style="margin-bottom:.1rem">Run it — four steps</p>
+    <div class="method-map">
+      <span class="mm-node"><span class="mm-no">01</span><span class="mm-name">Download</span><span class="mm-desc">one binary, no installer</span></span>
+      <span class="mm-arrow" aria-hidden="true"></span>
+      <span class="mm-node"><span class="mm-no">02</span><span class="mm-name">Run</span><span class="mm-desc">one command</span></span>
+      <span class="mm-arrow" aria-hidden="true"></span>
+      <span class="mm-node"><span class="mm-no">03</span><span class="mm-name">Add backends</span><span class="mm-desc">presets in the console</span></span>
+      <span class="mm-arrow" aria-hidden="true"></span>
+      <span class="mm-node"><span class="mm-no">04</span><span class="mm-name">Point apps</span><span class="mm-desc">at the one endpoint</span></span>
+    </div>
+  </div>
+
+  <p class="backend-chips" style="margin-top:1.2rem">
+    <span class="bc-head">10 backend types</span>
+    <span>embedded GGUF</span><span>llama-server</span><span>RunPod</span><span>OpenAI</span>
+    <span>Anthropic</span><span>Gemini</span><span>Responses</span><span>Azure</span>
+    <span>Vertex</span><span>Bedrock</span>
+  </p>
+</section>
+
+<!-- ── Page 3 — The problem ─────────────────────────────────────────── -->
 <section class="section tab-panel" id="problem" role="tabpanel" aria-labelledby="tab-problem" hidden>
-  <p class="section-label mono">Checkpoint 01 — The problem</p>
+  <p class="section-label mono">Checkpoint 02 — The problem</p>
   <h2>You know these pains.<br><em>Your teams live them.</em></h2>
   <p class="section-lede">Every organization building AI features hits the same wall —
     usually in the same order.</p>
@@ -153,7 +260,7 @@
 
 <!-- ── Page 3 — Capabilities ─────────────────────────────────────────── -->
 <section class="section section-alt tab-panel" id="capabilities" role="tabpanel" aria-labelledby="tab-capabilities" hidden>
-  <p class="section-label mono">Checkpoint 02 — Capabilities</p>
+  <p class="section-label mono">Checkpoint 03 — Capabilities</p>
   <h2>Five pillars.<br><em>One gatehouse.</em></h2>
   <p class="section-lede">Everything below ships in the binary you download —
     the free edition carries the full governance stack.
@@ -209,7 +316,7 @@
 
 <!-- ── ROI ─────────────────────────────────────────────────────────────── -->
 <section class="section tab-panel" id="roi" role="tabpanel" aria-labelledby="tab-roi" hidden>
-  <p class="section-label mono">Checkpoint 03 — Return on investment</p>
+  <p class="section-label mono">Checkpoint 04 — Return on investment</p>
   <h2>The math of<br><em>the front door</em></h2>
   <p class="section-lede">Direct savings from caching and routing, cost avoidance from
     audit readiness, and one governance layer across every provider.</p>
@@ -251,7 +358,7 @@
 
 <!-- ── Editions ────────────────────────────────────────────────────────── -->
 <section class="section section-alt tab-panel" id="editions" role="tabpanel" aria-labelledby="tab-editions" hidden>
-  <p class="section-label mono">Checkpoint 04 — Editions</p>
+  <p class="section-label mono">Checkpoint 05 — Editions</p>
   <h2>Free at the gate.<br><em>Paid at the estate.</em></h2>
   <p class="section-lede">One product, two editions. The free binary is the full
     governance stack — not a demo.</p>
@@ -292,11 +399,14 @@
 
   <p class="edition-fine mono">Self-hosted always. No SaaS tier — your prompts never
     transit our infrastructure, because there is no “our infrastructure.”</p>
+  <div style="margin-top:.45rem">
+    <button class="btn btn-ghost btn-sm" type="button" data-modal-open="compare-modal">Compare editions in detail</button>
+  </div>
 </section>
 
 <!-- ── Partners ────────────────────────────────────────────────────────── -->
 <section class="section tab-panel" id="partners" role="tabpanel" aria-labelledby="tab-partners" hidden>
-  <p class="section-label mono">Checkpoint 05 — Channel partners</p>
+  <p class="section-label mono">Checkpoint 06 — Channel partners</p>
   <h2>Your inference.<br><em>Our gatehouse. Co-branded.</em></h2>
   <p class="section-lede">For inference platforms without a governance layer —
     which is all of them — Gatelodge ships as a 90-day co-branded trial for your
@@ -331,7 +441,7 @@
 
 <!-- ── Download ─────────────────────────────────────────────────────────── -->
 <section class="section tab-panel" id="download" role="tabpanel" aria-labelledby="tab-download" hidden>
-  <p class="section-label mono">Checkpoint 06 — Get Gatelodge</p>
+  <p class="section-label mono">Checkpoint 07 — Get Gatelodge</p>
   <h2>One binary.<br><em>Thirty days, everything.</em></h2>
   <p class="section-lede">The Community binary is the full gatehouse — governance, observability,
     cost-saver, local inference — free for a 30-day evaluation from first boot. No license file,
@@ -346,7 +456,7 @@
         <li>After the trial: buy the perpetual key, or keep using local inference</li>
       </ul>
       <p class="download-eula mono">By downloading you agree to the
-        <a href="/eula.html" data-eula-open>End-User License Agreement</a>.</p>
+        <a href="/eula.html" data-modal-open="eula-modal">End-User License Agreement</a>.</p>
     </div>
 
     <div class="download-card" id="trial-card">
@@ -375,9 +485,59 @@
   </div>
 </section>
 
-<!-- ── Contact ─────────────────────────────────────────────────────────── -->
+<!-- ── Page 9 — FAQ ──────────────────────────────────────────────────── -->
+<section class="section tab-panel" id="faq" role="tabpanel" aria-labelledby="tab-faq" hidden>
+  <p class="section-label mono">Checkpoint 08 — Questions at the gate</p>
+  <h2>Asked at the door.<br><em>Answered here.</em></h2>
+  <p class="section-lede">The questions buyers and security teams ask —
+    the Gatekeeper (bottom-right) answers them too, live.</p>
+
+  <div class="faq-item">
+    <p class="faq-q">What happens when the 30-day trial ends?</p>
+    <p class="faq-a">Local inference keeps working — free, forever. Cloud serving pauses until
+      you enter a key: a one-time $99 Community key, or an enterprise license. The check
+      runs locally; nothing phones home.</p>
+  </div>
+  <div class="faq-item">
+    <p class="faq-q">Does our data pass through your servers?</p>
+    <p class="faq-a">No. Gatelodge is self-hosted — requests go from your gateway directly to
+      the providers you configured. There is no DataGateLodge SaaS; nothing of yours
+      transits our infrastructure.</p>
+  </div>
+  <div class="faq-item">
+    <p class="faq-q">How much work is self-hosting, really?</p>
+    <p class="faq-a">One binary, one command, Windows or Linux. The admin console opens at
+      localhost:8010, provider presets add backends in a click, and your apps point at the
+      endpoint they already speak.</p>
+  </div>
+  <div class="faq-item">
+    <p class="faq-q">Which models and providers does it support?</p>
+    <p class="faq-a">Ten backend types — embedded GGUF, llama-server, RunPod, OpenAI, Anthropic,
+      Gemini, Responses, Azure, Vertex, and Bedrock — all behind one OpenAI-compatible
+      endpoint, swappable per task with alias chains.</p>
+  </div>
+  <div class="faq-item">
+    <p class="faq-q">What's actually in a license key?</p>
+    <p class="faq-a">A signed set of claims: edition, expiry, entitled providers, and feature
+      flags. Keys never display secrets, hot-reload without a restart, and are revocable
+      through a tamper-evident list.</p>
+  </div>
+  <div class="faq-item">
+    <p class="faq-q">Can we try it before talking to anyone?</p>
+    <p class="faq-a">Yes. The Community binary is the full product on a 30-day trial — take it
+      from the <a href="#download">Download page</a>. Or ask the Gatekeeper in the corner:
+      it runs through Gatelodge itself.</p>
+  </div>
+  <div class="faq-item">
+    <p class="faq-q">How do we get support?</p>
+    <p class="faq-a">support@datagatelodge.com, the chat widget on this site, or enterprise
+      support with your license. We answer within a business day.</p>
+  </div>
+</section>
+
+<!-- ── Page 10 — Contact ─────────────────────────────────────────────── -->
 <section class="section section-alt tab-panel" id="contact" role="tabpanel" aria-labelledby="tab-contact" hidden>
-  <p class="section-label mono">Checkpoint 07 — The lodge</p>
+  <p class="section-label mono">Checkpoint 09 — The lodge</p>
   <h2>Knock.<br><em>The gate opens.</em></h2>
   <p class="section-lede">Request the community binary, book an enterprise walkthrough,
     or talk channel trials. We answer within a business day.</p>
@@ -405,18 +565,18 @@
     <svg class="dock-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
     <p class="dock-legal"><strong>datagatelodge.solutions</strong><span class="sep">·</span>a division of XS Technologies Inc., a Delaware corporation<span class="sep">·</span>© 2026 XS Technologies Inc.</p>
     <p class="dock-line">Every model. One gateway. Fully governed.</p>
-    <button class="dock-eula" type="button" data-eula-open>EULA</button>
+    <button class="dock-eula" type="button" data-modal-open="eula-modal">EULA</button>
   </div>
 </footer>
 
-<dialog class="eula-modal" id="eula-modal" aria-labelledby="eula-title">
+<dialog class="eula-modal modal" id="eula-modal" aria-labelledby="eula-title">
   <div class="eula-frame">
     <div class="eula-head">
       <div>
         <p class="eula-kicker">XS Technologies Inc. · DataGateLodge division</p>
         <p class="eula-title" id="eula-title">Software End-User License Agreement</p>
       </div>
-      <button class="eula-close" type="button" id="eula-close" aria-label="Close agreement">✕</button>
+      <button class="eula-close" type="button" data-modal-close aria-label="Close agreement">✕</button>
     </div>
     <div class="eula-body" id="eula-body">
       <p class="mono">Loading the agreement…</p>
@@ -426,7 +586,39 @@
   </div>
 </dialog>
 
-<script src="site.js?v=20261014b"></script>
-<script src="chat.js?v=20261014b"></script>
+<dialog class="eula-modal modal" id="compare-modal" aria-labelledby="compare-title">
+  <div class="eula-frame">
+    <div class="eula-head">
+      <div>
+        <p class="eula-kicker">Community vs Enterprise</p>
+        <p class="eula-title" id="compare-title">Edition comparison</p>
+      </div>
+      <button class="eula-close" type="button" data-modal-close aria-label="Close comparison">✕</button>
+    </div>
+    <div class="eula-body">
+      <table class="matrix-table">
+        <thead><tr><th></th><th>Community</th><th>Enterprise</th></tr></thead>
+        <tbody>
+          <tr><td>License</td><td>30-day trial, then optional key</td><td>Required — no license, no boot</td></tr>
+          <tr><td>Price</td><td>$99 one-time</td><td>from $39/user/mo · $499–$1,499/mo tiered</td></tr>
+          <tr><td>Governance — RBAC, audit chain, budgets, keys</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+          <tr><td>Observability — OTLP, Prometheus, JSONL, console</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+          <tr><td>Cost-saver — semantic cache, cost accounting</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+          <tr><td>Local inference — embedded GGUF</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+          <tr><td>Named cloud providers</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+          <tr><td>Instances</td><td>Single instance</td><td>Multi-replica tier D · shared state</td></tr>
+          <tr><td>SSO/OIDC · SCIM provisioning</td><td class="no">—</td><td class="yes">✓</td></tr>
+          <tr><td>Teams &amp; workspaces</td><td class="no">—</td><td class="yes">✓</td></tr>
+          <tr><td>Session budgets · MCP gateway governance</td><td class="no">—</td><td class="yes">✓</td></tr>
+          <tr><td>Support</td><td>Email + this site's agent</td><td>Support, compliance &amp; audit assistance</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="eula-foot mono">Self-hosted always — no SaaS tier · your prompts never transit our infrastructure</div>
+  </div>
+</dialog>
+
+<script src="site.js?v=20261014c"></script>
+<script src="chat.js?v=20261014c"></script>
 </body>
 </html>

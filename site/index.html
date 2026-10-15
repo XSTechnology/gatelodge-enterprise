@@ -20,7 +20,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20261014b">
+<link rel="stylesheet" href="styles.css?v=20261014c">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
@@ -140,7 +140,7 @@
         </aside>
       </div>
     </div>
-    <p class="console-caption mono">The gatehouse in operation — one console page, the whole AI estate</p>
+    <p class="console-caption mono">The gatehouse in operation · <a href="/gatelodge.html#how">see how a request flows →</a></p>
   </section>
 </section>
 
@@ -213,18 +213,18 @@
     <svg class="dock-mark" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50 V30 A18 18 0 0 1 50 30 V50" fill="none" stroke="currentColor" stroke-width="5"/><rect x="26" y="30" width="12" height="20" rx="1" fill="currentColor"/></svg>
     <p class="dock-legal"><strong>datagatelodge.solutions</strong><span class="sep">·</span>a division of XS Technologies Inc., a Delaware corporation<span class="sep">·</span>© 2026 XS Technologies Inc.</p>
     <p class="dock-line">Every model. One gateway. Fully governed.</p>
-    <button class="dock-eula" type="button" data-eula-open>EULA</button>
+    <button class="dock-eula" type="button" data-modal-open="eula-modal">EULA</button>
   </div>
 </footer>
 
-<dialog class="eula-modal" id="eula-modal" aria-labelledby="eula-title">
+<dialog class="eula-modal modal" id="eula-modal" aria-labelledby="eula-title">
   <div class="eula-frame">
     <div class="eula-head">
       <div>
         <p class="eula-kicker">XS Technologies Inc. · DataGateLodge division</p>
         <p class="eula-title" id="eula-title">Software End-User License Agreement</p>
       </div>
-      <button class="eula-close" type="button" id="eula-close" aria-label="Close agreement">✕</button>
+      <button class="eula-close" type="button" data-modal-close aria-label="Close agreement">✕</button>
     </div>
     <div class="eula-body" id="eula-body">
       <p class="mono">Loading the agreement…</p>
@@ -234,7 +234,7 @@
   </div>
 </dialog>
 
-<script src="site.js?v=20261014b"></script>
-<script src="chat.js?v=20261014b"></script>
+<script src="site.js?v=20261014c"></script>
+<script src="chat.js?v=20261014c"></script>
 </body>
 </html>
