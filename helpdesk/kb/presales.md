@@ -46,6 +46,33 @@ Tagline: **Every model. One gateway. Fully governed.**
 There is no open-source edition — Gatelodge ships as machine code only
 (closed distribution).
 
+## Feature comparison — Community vs Enterprise
+
+What each edition includes, side by side:
+
+- **License**: Community — 30-day trial, then an optional key.
+  Enterprise — required; no license, no boot.
+- **Price**: Community — US$99 one-time. Enterprise — from
+  US$39/user/mo, or US$499–$1,499/mo tiered per deployment.
+- **Governance** (RBAC, audit chain, budgets, keys): both editions.
+- **Observability** (OTLP tracing, Prometheus metrics, JSONL logs,
+  live console): both editions.
+- **Cost-saver** (semantic cache, per-team cost accounting): both
+  editions.
+- **Local inference** (embedded GGUF): both editions.
+- **Named cloud providers** (per license): both editions.
+- **Instances**: Community — single instance. Enterprise —
+  multi-replica tier D with shared state over Redis.
+- **SSO/OIDC + SCIM provisioning**: Enterprise only.
+- **Teams & workspaces**: Enterprise only.
+- **Session budgets + MCP gateway governance**: Enterprise only.
+- **Support**: Community — email plus the site's agent. Enterprise —
+  support, compliance, and audit assistance.
+
+In short: the free edition carries the full governance stack; the
+enterprise edition adds the multi-team, multi-instance, and compliance
+capabilities.
+
 ## Deployment model
 
 - Single Windows executable (64-bit, ~156 MB, no installer)
