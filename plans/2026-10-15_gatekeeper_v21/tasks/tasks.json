@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[em-1] Check groq catalog for embedding models (swap feasibility)",
+    "id": "em-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[em-2] helpdesk: inbound_emails table + last_topic migration + /api/email/inbound (loop guards, per-sender cap, agent reply via Resend, review queue) + store topic on escalation",
+    "id": "em-2",
+    "status": "pending"
+  },
+  {
+    "content": "[em-3] admin: Inbox review screen (approve-reply / ignore) + Analytics screen (sessions/day, confidence rate, doc hits, escalation topics, top unanswered)",
+    "id": "em-3",
+    "status": "pending"
+  },
+  {
+    "content": "[em-4] CF Email Worker script (repo, deploy-ready when token exists)",
+    "id": "em-4",
+    "status": "pending"
+  },
+  {
+    "content": "[em-5] Test suites (inbound flow, inbox, analytics)",
+    "id": "em-5",
+    "status": "pending"
+  },
+  {
+    "content": "[em-6] Deploy gatekeeper:8 + lodge-office:5, live verify with simulated inbound",
+    "id": "em-6",
+    "status": "pending"
+  },
+  {
+    "content": "[em-7] Commit + context + summary",
+    "id": "em-7",
+    "status": "pending"
+  }
+]

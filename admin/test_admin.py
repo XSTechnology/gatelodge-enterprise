@@ -83,16 +83,35 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
     c.execute("""CREATE TABLE IF NOT EXISTS admin_audit (
         id BIGSERIAL PRIMARY KEY, action TEXT NOT NULL,
         detail TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS inbound_emails (
+        id TEXT PRIMARY KEY, from_addr TEXT NOT NULL,
+        subject TEXT DEFAULT '', body TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'review', confident BOOLEAN,
+        doc TEXT, topic TEXT, reply TEXT,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        handled_at TIMESTAMPTZ)""")
+    c.execute("ALTER TABLE chat_sessions "
+              "ADD COLUMN IF NOT EXISTS last_topic TEXT")
     # deterministic: own the tables for this run
     for t in ("chat_messages", "chat_sessions", "licenses", "leads",
-              "email_log", "admin_audit", "kb_overrides"):
+              "email_log", "admin_audit", "kb_overrides", "inbound_emails"):
         c.execute(f"TRUNCATE {t}")
-    c.execute("INSERT INTO chat_sessions (id, email, needs_review) "
-              "VALUES ('testsess0001', 'cust@example.com', TRUE) "
-              "ON CONFLICT (id) DO UPDATE SET needs_review = TRUE, "
-              "email = 'cust@example.com'")
+    c.execute("INSERT INTO chat_sessions (id, email, needs_review, "
+              "last_topic) VALUES ('testsess0001', 'cust@example.com', "
+              "TRUE, 'trial-question') ON CONFLICT (id) DO UPDATE SET "
+              "needs_review = TRUE, email = 'cust@example.com', "
+              "last_topic = 'trial-question'")
     c.execute("INSERT INTO chat_messages (session_id, role, content) "
               "VALUES ('testsess0001', 'user', 'how do I install a key?')")
+    c.execute("INSERT INTO chat_messages (session_id, role, content, "
+              "confident, doc) VALUES ('testsess0001', 'assistant', "
+              "'answered ok', TRUE, 'presales')")
+    c.execute("INSERT INTO inbound_emails (id, from_addr, subject, body, "
+              "status, topic, doc) VALUES "
+              "('inb-a', 'waiting@example.com', 'Trial question', "
+              "'How long is the trial?', 'review', 'trial', 'faq'), "
+              "('inb-b', 'done@example.com', 'Answered', 'thanks', "
+              "'answered', 'what-is', 'presales')")
     c.execute("INSERT INTO leads (email, business_name, ip) "
               "VALUES ('lead@example.com', 'Acme Corp', '1.2.3.4')")
     c.execute("INSERT INTO licenses (serial, email, edition, kind, "
@@ -328,7 +347,50 @@ with TestClient(app.app) as client:
                        "WHERE serial='GL-TEST00000001'").fetchone()[0]
     check("unrevoke toggles back", rv is False)
 
-    # 11. healthz
+    # 11. inbox (inbound email review)
+    r = client.get("/inbox")
+    check("inbox renders", r.status_code == 200
+          and "waiting@example.com" in r.text
+          and "How long is the trial?" in r.text
+          and "done@example.com" in r.text)
+    r = client.post("/inbox/reply", data={
+        "id": "inb-a", "reply": "The trial runs 30 days from first boot."},
+        follow_redirects=False)
+    check("inbox reply redirects", r.status_code == 303)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT status, reply FROM inbound_emails "
+                      "WHERE id='inb-a'").fetchone()
+        el = c.execute("SELECT COUNT(*) FROM email_log WHERE kind="
+                       "'inbox-reply'").fetchone()[0]
+    check("inbox reply stored + logged",
+          v and v[0] == "answered" and "30 days" in v[1] and el == 1,
+          str(v))
+    r = client.get("/inbox/ignore", params={"id": "inb-b"},
+                   follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT status FROM inbound_emails "
+                      "WHERE id='inb-b'").fetchone()
+    check("inbox ignore", r.status_code == 303 and v[0] == "ignored")
+
+    # 12. analytics
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        c.execute("INSERT INTO chat_sessions (id, needs_review, "
+                  "escalated, last_topic) VALUES ('analytics1', TRUE, "
+                  "TRUE, 'trial-question') ON CONFLICT (id) DO UPDATE "
+                  "SET needs_review=TRUE, escalated=TRUE, "
+                  "last_topic='trial-question'")
+    r = client.get("/analytics")
+    check("analytics renders", r.status_code == 200
+          and "chat sessions" in r.text
+          and "answer confidence" in r.text
+          and "Knowledge-base hit rates" in r.text
+          and "bar-fill" in r.text)
+    check("analytics shows doc hit (presales)",
+          "presales" in r.text)
+    check("analytics shows escalation topic",
+          "trial-question" in r.text)
+
+    # 13. healthz
     r = client.get("/healthz")
     check("healthz", r.status_code == 200 and r.json()["ok"])
 

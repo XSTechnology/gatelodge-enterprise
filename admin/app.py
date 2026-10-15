@@ -101,6 +101,18 @@ async def _init() -> None:
                 content TEXT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS inbound_emails (
+                id TEXT PRIMARY KEY,
+                from_addr TEXT NOT NULL,
+                subject TEXT DEFAULT '',
+                body TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'review',
+                confident BOOLEAN, doc TEXT, topic TEXT, reply TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                handled_at TIMESTAMPTZ
+            )""")
+            conn.execute("ALTER TABLE chat_sessions "
+                         "ADD COLUMN IF NOT EXISTS last_topic TEXT")
     await _run(run)
 
 
@@ -125,9 +137,10 @@ def _guard(request: Request):
 # ── page chrome ───────────────────────────────────────────────────────────
 
 NAV = [("/", "Dashboard"), ("/conversations", "Conversations"),
-       ("/reviews", "Reviews"), ("/leads", "Leads"),
+       ("/reviews", "Reviews"), ("/inbox", "Inbox"), ("/leads", "Leads"),
        ("/licenses", "Licenses"), ("/kb", "Knowledge"),
-       ("/emails", "Emails"), ("/gateway", "Gateway")]
+       ("/analytics", "Analytics"), ("/emails", "Emails"),
+       ("/gateway", "Gateway")]
 
 CSS = """
 :root { --ink:#0e1411; --ink2:#121a15; --surface:#1a241d; --line:#2c3a30;
@@ -203,6 +216,19 @@ kbd.code { font-family:Consolas,monospace; background:var(--ink2);
 .flash { background:rgba(87,180,129,.12); border:1px solid var(--ok);
   border-radius:8px; padding:.6rem .9rem; margin-bottom:1.2rem;
   font-size:.85rem; }
+.bars { margin-bottom:1.6rem; }
+.bar-row { display:flex; align-items:center; gap:.6rem; margin:.28rem 0;
+  font-size:.8rem; }
+.bar-label { width:130px; color:var(--muted); text-align:right; flex:none;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bar-track { flex:1; background:var(--ink2); border-radius:4px; height:14px;
+  overflow:hidden; }
+.bar-fill { height:100%; background:linear-gradient(90deg,var(--brass),
+  var(--brassb)); border-radius:4px; }
+.bar-fill.dim { background:var(--line); }
+.bar-num { width:52px; color:var(--paper); font-size:.75rem; flex:none; }
+.bigstats { display:grid; grid-template-columns:repeat(auto-fit,
+  minmax(150px,1fr)); gap:.9rem; margin-bottom:1.6rem; }
 """
 
 SHELL = """<!doctype html><html><head><meta charset="utf-8">
@@ -1008,6 +1034,210 @@ async def kb_reset(request: Request, name: str = ""):
     await _x("DELETE FROM kb_overrides WHERE name=%s", (name,))
     await _audit("kb-reset", name)
     return RedirectResponse("/kb", status_code=303)
+
+
+# ── inbox (inbound support mail handled by the agent) ─────────────────────
+
+
+@app.get("/inbox", response_class=HTMLResponse)
+async def inbox(request: Request, flash: str = ""):
+    if (r := _guard(request)):
+        return r
+    pending = await _q(
+        "SELECT id, from_addr, subject, body, topic, doc, created_at "
+        "FROM inbound_emails WHERE status='review' "
+        "ORDER BY created_at DESC LIMIT 50")
+    recent = await _q(
+        "SELECT id, from_addr, subject, status, doc, created_at "
+        "FROM inbound_emails WHERE status != 'review' "
+        "ORDER BY created_at DESC LIMIT 30")
+
+    cards = ""
+    for i, (mid, frm, subject, body, topic, doc, at) in enumerate(pending):
+        cards += f"""
+<div class="box">
+<p><b>{_e(subject or '(no subject)')}</b> &nbsp;
+<span class="tag warn">needs review</span>
+<span class="mono note">{_e(frm)} · {str(at)[:16]} · {_e(topic or '-')}</span></p>
+<p style="margin:.6rem 0; white-space:pre-wrap; max-width:760px">{_e(body[:500])}</p>
+<form method="post" action="/inbox/reply" class="inline">
+<input type="hidden" name="id" value="{_e(mid)}">
+<textarea name="reply" style="min-height:110px; flex:1"
+ placeholder="Type the reply this customer should receive…"></textarea>
+<div style="display:flex; flex-direction:column; gap:.5rem">
+<button class="btn">Send reply</button>
+<a class="btn ghost" href="/inbox/ignore?id={_e(mid)}">ignore</a></div>
+</form></div>"""
+    if not pending:
+        cards = ('<div class="box"><p class="note">Inbox clear — no '
+                 'inbound mail waiting for review.</p></div>')
+
+    rows = "".join(
+        f"<tr><td class='pill'>{_e(frm)}</td><td>{_e(subject[:60])}</td>"
+        f"<td>{'<span class=tag ok>' + _e(st) + '</span>' if st == 'answered' else '<span class=tag>' + _e(st) + '</span>'}</td>"
+        f"<td class='pill'>{_e(doc or '-')}</td>"
+        f"<td class='note'>{str(at)[:16]}</td></tr>"
+        for mid, frm, subject, st, doc, at in recent)
+
+    body = f"""
+<p class="note" style="margin-bottom:1.2rem">Inbound support mail. The
+agent auto-replies to confident questions; everything else lands here.</p>
+{cards}
+<h1 style="font-size:1.2rem">Recently handled</h1>
+<table><tr><th>from</th><th>subject</th><th>status</th><th>doc</th>
+<th>at</th></tr>{rows or '<tr><td colspan=5 class=note>none yet</td></tr>'}</table>"""
+    return page(request, "Inbox", body, flash=flash)
+
+
+@app.post("/inbox/reply")
+async def inbox_reply(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    mid = str(form.get("id", ""))
+    reply = str(form.get("reply", "")).strip()
+    if not reply:
+        return RedirectResponse("/inbox", status_code=303)
+    row = await _q("SELECT from_addr, subject FROM inbound_emails "
+                   "WHERE id=%s", (mid,), fetch="one")
+    if not row:
+        return RedirectResponse("/inbox?flash=email+not+found",
+                                status_code=303)
+    to, subject = row
+    sent = False
+    if RESEND_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.post(
+                    "https://api.resend.com/emails",
+                    json={"from": SUPPORT_EMAIL, "reply_to": to, "to": [to],
+                          "subject": f"Re: {subject}" if subject
+                          else "Your Gatelodge question — answered",
+                          "text": reply + "\n\n— The Gatelodge team"},
+                    headers={"Authorization": f"Bearer {RESEND_API_KEY}"})
+                sent = r.status_code in (200, 201)
+        except Exception:
+            sent = False
+    await _x("INSERT INTO email_log (kind, to_addr, serial, ok, detail) "
+             "VALUES ('inbox-reply', %s, %s, %s, %s)",
+             (to, mid[:12], int(sent), "ok" if sent else "failed"))
+    await _x("UPDATE inbound_emails SET status='answered', reply=%s, "
+             "handled_at=now() WHERE id=%s", (reply, mid))
+    await _audit("inbox-reply", f"{mid[:16]} -> {to}")
+    return RedirectResponse(
+        f"/inbox?flash=reply+{'sent' if sent else 'saved+(send+failed)'}",
+        status_code=303)
+
+
+@app.get("/inbox/ignore")
+async def inbox_ignore(request: Request, id: str = ""):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    await _x("UPDATE inbound_emails SET status='ignored', "
+             "handled_at=now() WHERE id=%s", (id,))
+    await _audit("inbox-ignore", id[:16])
+    return RedirectResponse("/inbox", status_code=303)
+
+
+# ── analytics ─────────────────────────────────────────────────────────────
+
+
+def _bar(label: str, value: int, maxv: int, dim: bool = False) -> str:
+    pct = (100 * value / maxv) if maxv else 0
+    return (f'<div class="bar-row"><span class="bar-label" '
+            f'title="{_e(label)}">{_e(label)}</span>'
+            f'<div class="bar-track"><div class="bar-fill'
+            f'{" dim" if dim else ""}" style="width:{pct:.0f}%"></div>'
+            f'</div><span class="bar-num">{value}</span></div>')
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics(request: Request):
+    if (r := _guard(request)):
+        return r
+
+    # headline numbers
+    tot = await _q("SELECT COUNT(*) FROM chat_sessions", fetch="one")
+    conf = await _q(
+        "SELECT COUNT(*) FILTER (WHERE confident)::float / "
+        "NULLIF(COUNT(*), 0) FROM chat_messages WHERE role='assistant'",
+        fetch="one")
+    esc = await _q(
+        "SELECT COUNT(*) FROM chat_sessions "
+        "WHERE needs_review OR escalated", fetch="one")
+    inb = await _q(
+        "SELECT COUNT(*) FILTER (WHERE status='answered'), COUNT(*) "
+        "FILTER (WHERE status='review'), COUNT(*) "
+        "FROM inbound_emails", fetch="one") or (0, 0, 0)
+
+    # daily volume (30d): sessions vs escalated
+    days = await _q(
+        "SELECT to_char(date_trunc('day', created_at), 'MM-DD') d, "
+        "COUNT(*) total, COUNT(*) FILTER "
+        "(WHERE needs_review OR escalated) esc "
+        "FROM chat_sessions WHERE created_at > now() - interval '30 days' "
+        "GROUP BY date_trunc('day', created_at) ORDER BY 1")
+    maxd = max([r[1] for r in days], default=0)
+    vol = "".join(_bar(r[0], r[1], maxd) + _bar("", r[2], maxd, dim=True)
+                  for r in days) or '<p class="note">no sessions yet</p>'
+
+    # doc hit rates
+    docs = await _q(
+        "SELECT doc, COUNT(*) FROM chat_messages "
+        "WHERE role='assistant' AND doc IS NOT NULL "
+        "GROUP BY doc ORDER BY 2 DESC LIMIT 12")
+    maxdoc = max([r[1] for r in docs], default=0)
+    dochits = "".join(_bar(r[0], r[1], maxdoc) for r in docs) \
+        or '<p class="note">no answered questions yet</p>'
+
+    # escalation topics
+    topics = await _q(
+        "SELECT COALESCE(NULLIF(last_topic, ''), '(unclassified)') t, "
+        "COUNT(*) FROM chat_sessions WHERE needs_review OR escalated "
+        "GROUP BY 1 ORDER BY 2 DESC LIMIT 10")
+    maxt = max([r[1] for r in topics], default=0)
+    tophits = "".join(_bar(r[0], r[1], maxt, dim=True) for r in topics) \
+        or '<p class="note">none yet</p>'
+
+    # top unanswered questions (frequency across review/escalated sessions)
+    unans = await _q(
+        "SELECT m.content, COUNT(*) FROM chat_messages m "
+        "JOIN chat_sessions s ON s.id = m.session_id "
+        "WHERE m.role='user' AND (s.needs_review OR s.escalated) "
+        "GROUP BY m.content ORDER BY 2 DESC LIMIT 8")
+    maxu = max([r[1] for r in unans], default=0)
+    unbars = "".join(_bar(r[0][:70], r[1], maxu, dim=True)
+                     for r in unans) or '<p class="note">none yet</p>'
+
+    rate = f"{(conf[0] or 0) * 100:.0f}%" if conf and conf[0] is not None \
+        else "—"
+    body = f"""
+<div class="bigstats">
+<div class="card"><div class="num">{tot[0] if tot else 0}</div>
+<div class="lbl">chat sessions</div></div>
+<div class="card"><div class="num">{rate}</div>
+<div class="lbl">answer confidence</div></div>
+<div class="card"><div class="num">{esc[0] if esc else 0}</div>
+<div class="lbl">escalated / reviewed</div></div>
+<div class="card"><div class="num">{inb[0]}</div>
+<div class="lbl">inbound auto-replied</div></div>
+<div class="card"><div class="num">{inb[1]}</div>
+<div class="lbl">inbox pending</div></div>
+</div>
+
+<h1 style="font-size:1.2rem">Sessions per day — 30 days
+<span class="note">(brass = sessions, grey = escalated)</span></h1>
+<div class="bars">{vol}</div>
+
+<h1 style="font-size:1.2rem">Knowledge-base hit rates</h1>
+<div class="bars">{dochits}</div>
+
+<h1 style="font-size:1.2rem">Escalation topics</h1>
+<div class="bars">{tophits}</div>
+
+<h1 style="font-size:1.2rem">Top unanswered questions</h1>
+<div class="bars">{unbars}</div>"""
+    return page(request, "Analytics", body)
 
 
 @app.get("/emails", response_class=HTMLResponse)

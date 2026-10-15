@@ -68,10 +68,12 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM",
                             "Gatekeeper <support@datagatelodge.com>")
 SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "support@datagatelodge.com")
 REVIEW_KEY = os.environ.get("REVIEW_KEY", "")
+INBOUND_KEY = os.environ.get("INBOUND_KEY", "")
 PORT = int(os.environ.get("PORT", "8100"))
 
 MAX_HISTORY = 6            # messages of context sent to the answer model
 MAX_MESSAGE_LEN = 4000
+INBOUND_DAILY_CAP = 3      # auto-replies per sender per day
 
 app = FastAPI(title="Gatelodge Gatekeeper", version="1.0.0")
 app.add_middleware(
@@ -134,6 +136,20 @@ CREATE TABLE IF NOT EXISTS kb_overrides (
   content TEXT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS inbound_emails (
+  id TEXT PRIMARY KEY,
+  from_addr TEXT NOT NULL,
+  subject TEXT DEFAULT '',
+  body TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'review',
+  confident BOOLEAN,
+  doc TEXT,
+  topic TEXT,
+  reply TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  handled_at TIMESTAMPTZ
+);
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS last_topic TEXT;
 """
 
 
@@ -304,11 +320,12 @@ def _save_assistant(sid: str, answer: str, doc: str, model: str) -> None:
 
 
 def _mark_session(sid: str, needs_review: bool, escalated: bool,
-                  email: str | None) -> None:
+                  email: str | None, topic: str = "") -> None:
     with psycopg.connect(DATABASE_URL) as conn:
         conn.execute("UPDATE chat_sessions SET needs_review = %s, "
-                     "escalated = %s, email = COALESCE(%s, email) "
-                     "WHERE id = %s", (needs_review, escalated, email, sid))
+                     "escalated = %s, email = COALESCE(%s, email), "
+                     "last_topic = COALESCE(%s, last_topic) WHERE id = %s",
+                     (needs_review, escalated, email, topic or None, sid))
 
 
 def _transcript(sid: str) -> list[tuple] | None:
@@ -606,23 +623,24 @@ async def chat_message(body: MessageRequest, request: Request):
     t = await triage(text, history[:-1])
 
     async def mark(needs_review: bool, escalated: bool = False,
-                   email: str | None = None) -> None:
+                   email: str | None = None,
+                   topic: str = "") -> None:
         await _run(lambda: _mark_session(body.session_id, needs_review,
-                                         escalated, email))
+                                         escalated, email, topic))
 
     async def sse(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
     async def stream():
         if t["legal"]:
-            await mark(True)
+            await mark(True, topic=t["topic"])
             yield await sse("escalate", {
                 "reason": "legal",
                 "message": ("Licensing-law questions go to the team — "
                             "can I take your email so a human follows up?")})
             return
         if not (t["confident"] and t["chunks"]):
-            await mark(True)
+            await mark(True, topic=t["topic"])
             yield await sse("escalate", {
                 "reason": t["topic"] or "uncovered",
                 "message": ("I want to get this exactly right — can I "
@@ -663,7 +681,7 @@ async def chat_message(body: MessageRequest, request: Request):
                             yield await sse("token", {"t": tok})
         except Exception as e:
             print(f"[gatekeeper] answer error: {e!r}")
-            await mark(True)
+            await mark(True, topic=t["topic"])
             yield await sse("escalate", {
                 "reason": "answer-error",
                 "message": ("Something went wrong on my side — can I take "
@@ -706,22 +724,185 @@ async def escalate(body: EscalateRequest, request: Request):
     return {"ok": True}      # identical whether or not the email delivered
 
 
-def _log_email(to_addr: str, ok: bool, detail: str) -> None:
+# ── inbound email agent (support@ via CF Email Worker webhook) ────────────
+
+
+class InboundEmail(BaseModel):
+    message_id: str = ""
+    from_addr: str = ""
+    subject: str = ""
+    text: str = ""
+    raw: str = ""
+
+
+def _insert_inbound(mid: str, frm: str, subject: str, body: str,
+                    status: str, confident: bool, doc: str, topic: str,
+                    reply: str) -> None:
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute(
+            "INSERT INTO inbound_emails (id, from_addr, subject, body, "
+            "status, confident, doc, topic, reply, handled_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "CASE WHEN %s = 'review' THEN NULL ELSE now() END)",
+            (mid, frm, subject, body, status, confident, doc, topic,
+             reply, status))
+
+
+def _inbound_seen(mid: str) -> bool:
+    with psycopg.connect(DATABASE_URL) as conn:
+        return bool(conn.execute(
+            "SELECT 1 FROM inbound_emails WHERE id = %s", (mid,)).fetchone())
+
+
+def _inbound_sender_count(frm: str) -> int:
+    with psycopg.connect(DATABASE_URL) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM inbound_emails WHERE from_addr = %s "
+            "AND status = 'answered' AND created_at > now() - interval '1 day'",
+            (frm,)).fetchone()[0]
+
+
+async def answer_once(question: str, chunks: list[dict]) -> str:
+    """Non-streaming answer (inbound email path)."""
+    messages = ([{"role": "system", "content": ANSWER_SYSTEM.format(
+                    passages=_passages_block(chunks))},
+                {"role": "user", "content": question}])
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+            json={"model": ANSWER_MODEL, "messages": messages,
+                  "max_tokens": 1200, "temperature": 0.3})
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
+async def send_reply_email(to: str, subject: str, answer: str,
+                           mid: str) -> tuple[bool, str]:
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY unset"
+    payload = {
+        "from": EMAIL_FROM, "reply_to": SUPPORT_EMAIL, "to": [to],
+        "subject": f"Re: {subject}" if subject else "Your question — Gatelodge",
+        "text": (answer + "\n\n— The Gatekeeper, Gatelodge support agent\n"
+                 f"(ref {mid[:12]})\n"),
+        "headers": {"In-Reply-To": f"<{mid}>" if mid else None}}
+    payload["headers"] = {k: v for k, v in payload["headers"].items() if v}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post("https://api.resend.com/emails", json=payload,
+                             headers={"Authorization":
+                                      f"Bearer {RESEND_API_KEY}"})
+        if r.status_code in (200, 201):
+            return True, r.json().get("id", "")
+        return False, f"resend {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, f"send error: {e!r}"
+
+
+@app.post("/api/email/inbound")
+async def email_inbound(body: InboundEmail, request: Request):
+    """Webhook for inbound support mail (CF Email Worker posts here).
+    Confident questions get an immediate agent reply; anything else
+    queues for the Lodge Office inbox."""
+    if not INBOUND_KEY:
+        raise HTTPException(503, "inbound email not configured")
+    if request.headers.get("authorization", "") != f"Bearer {INBOUND_KEY}":
+        raise HTTPException(401, "unauthorized")
+
+    # raw MIME (worker) or structured fields (tests) — parse raw if given
+    frm, subject, text = body.from_addr, body.subject, body.text
+    if body.raw:
+        import email as _email
+        try:
+            msg = _email.message_from_string(body.raw)
+            frm = frm or _email.utils.parseaddr(msg.get("From", ""))[1]
+            subject = subject or (msg.get("Subject", "") or "")
+            parts = []
+            if msg.is_multipart():
+                for p in msg.walk():
+                    if p.get_content_type() == "text/plain" \
+                            and not p.get_filename():
+                        parts.append(p.get_payload(decode=True).decode(
+                            errors="replace"))
+            else:
+                parts.append(msg.get_payload(decode=True).decode(
+                    errors="replace"))
+            text = text or "\n".join(parts)
+        except Exception as e:
+            print(f"[gatekeeper] inbound parse error: {e!r}")
+
+    frm = frm.strip().lower()[:200]
+    subject = subject.strip()[:300]
+    text = text.strip()[:8000]
+    mid = (body.message_id.strip() or f"gen-{uuid.uuid4().hex}")[:200]
+    if not frm or not text:
+        raise HTTPException(400, "from_addr and text required")
+
+    # loop guards: never reply to machines or ourselves
+    local = frm.split("@")[0]
+    if any(t in local for t in ("noreply", "no-reply", "auto", "donotreply",
+                                "postmaster", "mailer-daemon")):
+        return {"status": "ignored", "reason": "autoresponder"}
+    if frm.endswith("@datagatelodge.com"):
+        return {"status": "ignored", "reason": "self"}
+    if await _run(lambda: _inbound_seen(mid)):
+        return {"status": "ignored", "reason": "duplicate"}
+    if await _run(lambda: _inbound_sender_count(frm)) >= INBOUND_DAILY_CAP:
+        await _run(lambda: _insert_inbound(
+            mid, frm, subject, text, "review", False, None,
+            "daily-cap", ""))
+        return {"status": "review", "reason": "daily-cap"}
+
+    t = await triage(text, [])
+    primary = t["chunks"][0]["doc"] if t["chunks"] else None
+    if t["legal"] or not (t["confident"] and t["chunks"]):
+        await _run(lambda: _insert_inbound(
+            mid, frm, subject, text, "review", False, primary,
+            t["topic"], ""))
+        print(f"[gatekeeper] inbound queued for review ({t['topic'] or 'uncovered'})")
+        return {"status": "review", "reason": t["topic"] or "uncovered"}
+
+    try:
+        answer = await answer_once(text, t["chunks"])
+    except Exception as e:
+        print(f"[gatekeeper] inbound answer error: {e!r}")
+        await _run(lambda: _insert_inbound(
+            mid, frm, subject, text, "review", False, primary,
+            t["topic"], ""))
+        return {"status": "review", "reason": "answer-error"}
+
+    ok, detail = await send_reply_email(frm, subject, answer, mid)
+    status = "answered" if ok else "review"
+    await _run(lambda: _insert_inbound(
+        mid, frm, subject, text, status, True, primary, t["topic"],
+        answer if ok else ""))
+    await _run_email_log(frm, ok, detail or "inbound auto-reply",
+                         kind="gatekeeper-email-reply")
+    print(f"[gatekeeper] inbound {mid[:12]} from {frm}: "
+          f"{'answered (' + primary + ')' if ok else 'QUEUED (send failed)'}")
+    return {"status": status, "doc": primary,
+            "sources": [{"doc": c["doc"], "section": c["section"]}
+                        for c in t["chunks"]]}
+
+
+def _log_email(to_addr: str, ok: bool, detail: str,
+               kind: str = "gatekeeper-escalation") -> None:
     if not DATABASE_URL:
         return
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             conn.execute(
                 "INSERT INTO email_log (kind, to_addr, serial, ok, detail) "
-                "VALUES ('gatekeeper-escalation', %s, '', %s, %s)",
-                (to_addr or "unknown", int(bool(ok)),
+                "VALUES (%s, %s, '', %s, %s)",
+                (kind, to_addr or "unknown", int(bool(ok)),
                  str(detail)[:300]))
     except Exception as e:
         print(f"[gatekeeper] email_log write failed: {e!r}")
 
 
-async def _run_email_log(to_addr: str, ok: bool, detail: str) -> None:
-    await _run(lambda: _log_email(to_addr, ok, detail))
+async def _run_email_log(to_addr: str, ok: bool, detail: str,
+                         kind: str = "gatekeeper-escalation") -> None:
+    await _run(lambda: _log_email(to_addr, ok, detail, kind))
 
 
 def _require_review_key(request: Request) -> None:

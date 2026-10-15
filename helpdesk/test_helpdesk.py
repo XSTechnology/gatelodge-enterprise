@@ -56,6 +56,11 @@ async def completions(request: Request):
                  "topic": "off-topic"}
         return {"choices": [{"message": {"content": json.dumps(d)}}]}
 
+    if not body.get("stream"):
+        # non-streaming answer (inbound email path)
+        return {"choices": [{"message": {
+            "content": "Gatelodge is a self-hosted AI gateway."}}]}
+
     async def gen():
         for tok in ("Gatelodge ", "is a ", "self-hosted ", "AI gateway."):
             yield ("data: " + json.dumps(
@@ -70,6 +75,23 @@ server = uvicorn.Server(uvicorn.Config(mock, host="127.0.0.1",
                                        port=8435, log_level="error"))
 threading.Thread(target=server.run, daemon=True).start()
 time.sleep(1.5)
+
+import psycopg                                            # noqa: E402
+
+# inbound-email table + last_topic migration for this test DB
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("""CREATE TABLE IF NOT EXISTS inbound_emails (
+        id TEXT PRIMARY KEY, from_addr TEXT NOT NULL,
+        subject TEXT DEFAULT '', body TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'review', confident BOOLEAN,
+        doc TEXT, topic TEXT, reply TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        handled_at TIMESTAMPTZ)""")
+    c.execute("ALTER TABLE chat_sessions "
+              "ADD COLUMN IF NOT EXISTS last_topic TEXT")
+    c.execute("TRUNCATE inbound_emails")
+
+os.environ.setdefault("INBOUND_KEY", "inbound-test-key")
 
 import app                                                 # noqa: E402
 from fastapi.testclient import TestClient                  # noqa: E402
@@ -272,6 +294,103 @@ check("retrieval: methodology -> agent-services",
 top = app._search("purple elephant zebra quantum", chunks, idf)
 check("retrieval: nonsense -> no candidates", top == [],
       str([(c["doc"], c["section"]) for c in top[:3]]))
+
+# 13. inbound email agent
+IH = {"Authorization": "Bearer inbound-test-key"}
+r = client.post("/api/email/inbound", json={"from_addr": "a@b.co",
+                                            "text": "hi"})
+check("inbound requires auth", r.status_code == 401)
+r = client.post("/api/email/inbound", headers=IH,
+                json={"from_addr": "", "text": "hi"})
+check("inbound validates fields", r.status_code == 400)
+
+# confident question -> answered (send simulated)
+async def _fake_send(to, subject, answer, mid):
+    return True, "sim-" + mid[:6]
+app.send_reply_email = _fake_send
+MODE["triage"] = "confident"
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-001", "from_addr": "buyer@example.com",
+    "subject": "Question about the trial",
+    "text": "What happens when the 30 day trial ends?"})
+check("inbound confident -> answered",
+      r.status_code == 200 and r.json().get("status") == "answered"
+      and r.json().get("doc") == "faq", r.text[:200])
+check("inbound done carries sources",
+      isinstance(r.json().get("sources"), list) and r.json()["sources"],
+      r.text[:200])
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    row = c.execute("SELECT status, confident, doc, reply FROM "
+                    "inbound_emails WHERE id='inb-001'").fetchone()
+    elog = c.execute("SELECT ok FROM email_log WHERE kind="
+                     "'gatekeeper-email-reply'").fetchall()
+check("inbound row stored answered",
+      row and row[0] == "answered" and row[1] is True and row[2] == "faq"
+      and row[3], str(row))
+check("inbound reply logged", bool(elog) and elog[0][0] == 1)
+
+# uncertain question -> review (nonsense retrieves nothing -> early exit)
+MODE["triage"] = "off"
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-002", "from_addr": "buyer@example.com",
+    "subject": "weird", "text": "what is the meaning of life?"})
+check("inbound uncertain -> review",
+      r.json().get("status") == "review"
+      and r.json().get("reason") == "no-matches", r.text[:150])
+
+# loop guards
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-003", "from_addr": "noreply@zoom.us",
+    "text": "calendar invite"})
+check("inbound ignores noreply", r.json().get("status") == "ignored")
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-004", "from_addr": "support@datagatelodge.com",
+    "text": "self"})
+check("inbound ignores self", r.json().get("status") == "ignored")
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-001", "from_addr": "x@y.co", "text": "again"})
+check("inbound dedupes message id", r.json().get("status") == "ignored")
+
+# daily cap: sender already has 3 answered today
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    for i in range(3):
+        c.execute("INSERT INTO inbound_emails (id, from_addr, status) "
+                  "VALUES (%s, 'capped@example.com', 'answered')",
+                  (f"cap-{i}",))
+MODE["triage"] = "confident"
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-005", "from_addr": "capped@example.com",
+    "text": "what is gatelodge?"})
+check("inbound daily cap queues for review",
+      r.json().get("status") == "review"
+      and r.json().get("reason") == "daily-cap", r.text[:150])
+
+# raw MIME parsing path
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-006",
+    "raw": ("From: Raw Sender <raw@example.com>\r\n"
+            "Subject: Raw question\r\n\r\n"
+            "What happens when the trial ends?\r\n")})
+check("inbound parses raw MIME",
+      r.status_code == 200 and r.json().get("status") in
+      ("answered", "review"), r.text[:150])
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    row = c.execute("SELECT from_addr, subject FROM inbound_emails "
+                    "WHERE id='inb-006'").fetchone()
+check("raw MIME fields extracted",
+      row and row[0] == "raw@example.com" and row[1] == "Raw question",
+      str(row))
+
+# 14. escalation topic stored on the session
+MODE["triage"] = "off"
+r = client.post("/api/chat/session", json={})
+sid2 = r.json()["session_id"]
+client.post("/api/chat/message", json={"session_id": sid2,
+                                       "text": "tell me a joke"})
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    t = c.execute("SELECT last_topic FROM chat_sessions WHERE id=%s",
+                  (sid2,)).fetchone()
+check("escalation topic stored", t and t[0] == "no-matches", str(t))
 
 print()
 if fails:
