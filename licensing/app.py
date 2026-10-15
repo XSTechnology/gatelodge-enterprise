@@ -122,6 +122,59 @@ def db():
     return c
 
 
+def _contact_upsert(c, email: str, name: str = "", company: str = "",
+                    source: str = "") -> None:
+    """Add/refresh an address-book contact (auto-capture). Works on both
+    sqlite and Postgres (ON CONFLICT upsert)."""
+    import datetime
+    email = (email or "").strip().lower()[:200]
+    if not email or "@" not in email:
+        return
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds")
+    c.execute(
+        "INSERT INTO contacts (email, name, company, source, first_seen,"
+        " last_seen, message_count) VALUES (?, ?, ?, ?, ?, ?, 1) "
+        "ON CONFLICT(email) DO UPDATE SET "
+        "name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name "
+        "ELSE contacts.name END, "
+        "company = CASE WHEN EXCLUDED.company != '' THEN EXCLUDED.company "
+        "ELSE contacts.company END, "
+        "source = CASE WHEN contacts.source IN ('', 'manual') AND "
+        "EXCLUDED.source != '' THEN EXCLUDED.source ELSE contacts.source "
+        "END, "
+        "last_seen = EXCLUDED.last_seen, "
+        "message_count = contacts.message_count + 1",
+        (email, (name or "").strip()[:120], (company or "").strip()[:160],
+         source, now, now))
+
+
+_CONTACTS_PG = """CREATE TABLE IF NOT EXISTS contacts (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    name TEXT DEFAULT '',
+    company TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    tags TEXT DEFAULT '',
+    source TEXT DEFAULT 'manual',
+    first_seen TEXT DEFAULT '',
+    last_seen TEXT DEFAULT '',
+    message_count INTEGER DEFAULT 0
+)"""
+_CONTACTS_SQLITE = """CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    name TEXT DEFAULT '',
+    company TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    tags TEXT DEFAULT '',
+    source TEXT DEFAULT 'manual',
+    first_seen TEXT DEFAULT '',
+    last_seen TEXT DEFAULT '',
+    message_count INTEGER DEFAULT 0
+)"""
+
+
 def init_db() -> None:
     if DATABASE_URL:
         with db() as c:
@@ -154,8 +207,15 @@ def init_db() -> None:
                 serial TEXT DEFAULT '',
                 ok INTEGER DEFAULT 0,
                 detail TEXT DEFAULT '',
-                created_at TIMESTAMPTZ DEFAULT now()
+                created_at TIMESTAMPTZ DEFAULT now(),
+                subject TEXT DEFAULT '',
+                body TEXT DEFAULT ''
             )""")
+            c.execute(_CONTACTS_PG)
+            c.execute("ALTER TABLE email_log "
+                      "ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT ''")
+            c.execute("ALTER TABLE email_log "
+                      "ADD COLUMN IF NOT EXISTS body TEXT DEFAULT ''")
         return
     with db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS leads (
@@ -186,12 +246,17 @@ def init_db() -> None:
             detail TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
         )""")
+        c.execute(_CONTACTS_SQLITE)
         for stmt in ("ALTER TABLE licenses "
                      "ADD COLUMN license_json TEXT DEFAULT ''",
                      "ALTER TABLE licenses "
                      "ADD COLUMN business_name TEXT DEFAULT ''",
                      "ALTER TABLE licenses "
-                     "ADD COLUMN revoked BOOLEAN DEFAULT 0"):
+                     "ADD COLUMN revoked BOOLEAN DEFAULT 0",
+                     "ALTER TABLE email_log "
+                     "ADD COLUMN subject TEXT DEFAULT ''",
+                     "ALTER TABLE email_log "
+                     "ADD COLUMN body TEXT DEFAULT ''"):
             try:
                 c.execute(stmt)
             except sqlite3.OperationalError:
@@ -283,6 +348,8 @@ async def trial_request(body: TrialRequest, request: Request):
         c.execute("INSERT INTO leads (email, business_name, ip) "
                   "VALUES (?, ?, ?)",
                   (email, body.business_name.strip()[:120], ip))
+        _contact_upsert(c, email, company=body.business_name,
+                        source="trial")
     email_sent = False
     if emailer.configured():
         subject, html_body, text_body = emailer.render_trial()
@@ -292,9 +359,10 @@ async def trial_request(body: TrialRequest, request: Request):
               f"{'OK ' + detail if email_sent else 'FAIL ' + detail}")
         with db() as c:
             c.execute("INSERT INTO email_log "
-                      "(kind, to_addr, serial, ok, detail) "
-                      "VALUES ('trial', ?, '', ?, ?)",
-                      (email, int(email_sent), detail[:300]))
+                      "(kind, to_addr, serial, ok, detail, subject, body) "
+                      "VALUES ('trial', ?, '', ?, ?, ?, ?)",
+                      (email, int(email_sent), detail[:300], subject,
+                       text_body[:20000]))
     return {
         "ok": True,
         "download": "/download/community",
@@ -355,9 +423,11 @@ async def license_recovery(body: RecoveryRequest, request: Request):
                   f"{'OK ' + detail if ok else 'FAIL ' + detail}")
             with db() as c:
                 c.execute("INSERT INTO email_log "
-                          "(kind, to_addr, serial, ok, detail) "
-                          "VALUES ('recovery', ?, ?, ?, ?)",
-                          (email, row[0], int(ok), detail[:300]))
+                          "(kind, to_addr, serial, ok, detail, subject, body)"
+                          " VALUES ('recovery', ?, ?, ?, ?, ?, ?)",
+                          (email, row[0], int(ok), detail[:300], subject,
+                           text_body[:20000]))
+                _contact_upsert(c, email, source="purchase")
     return {"ok": True}
 
 
@@ -455,9 +525,12 @@ async def deliver_purchase(rec: dict) -> None:
           f"{'OK ' + detail if ok else 'FAIL ' + detail}")
     with db() as c:
         c.execute("INSERT INTO email_log "
-                  "(kind, to_addr, serial, ok, detail) "
-                  "VALUES ('purchase', ?, ?, ?, ?)",
-                  (rec["email"], rec["serial"], int(ok), detail[:300]))
+                  "(kind, to_addr, serial, ok, detail, subject, body) "
+                  "VALUES ('purchase', ?, ?, ?, ?, ?, ?)",
+                  (rec["email"], rec["serial"], int(ok), detail[:300],
+                   subject, text_body[:20000]))
+        _contact_upsert(c, rec["email"], company=rec.get("business_name", ""),
+                        source="purchase")
 
 
 @app.post("/api/stripe/webhook")
@@ -539,10 +612,13 @@ async def admin_issue(body: AdminIssueRequest, request: Request):
               f"{'OK ' + detail if ok else 'FAIL ' + detail}")
         with db() as c:
             c.execute("INSERT INTO email_log "
-                      "(kind, to_addr, serial, ok, detail) "
-                      "VALUES ('manual-issue', ?, ?, ?, ?)",
+                      "(kind, to_addr, serial, ok, detail, subject, body) "
+                      "VALUES ('manual-issue', ?, ?, ?, ?, ?, ?)",
                       (rec["email"], rec["serial"], int(ok),
-                       detail[:300]))
+                       detail[:300], subject, text_body[:20000]))
+            _contact_upsert(c, rec["email"],
+                            company=rec.get("business_name", ""),
+                            source="purchase")
     return {"ok": True, "serial": rec["serial"],
             "license_json": rec["license_json"]}
 

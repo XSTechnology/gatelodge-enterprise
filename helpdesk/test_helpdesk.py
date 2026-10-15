@@ -392,6 +392,16 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
                   (sid2,)).fetchone()
 check("escalation topic stored", t and t[0] == "no-matches", str(t))
 
+# 15. address-book capture on inbound mail
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    ct = c.execute("SELECT source, message_count FROM contacts WHERE "
+                   "email='buyer@example.com'").fetchone()
+    cr = c.execute("SELECT source FROM contacts WHERE "
+                   "email='raw@example.com'").fetchone()
+check("inbound contact captured", ct and ct[0] == "inbound"
+      and ct[1] >= 2, str(ct))
+check("raw-MIME contact captured", cr and cr[0] == "inbound", str(cr))
+
 print()
 if fails:
     print("FAILED:", ", ".join(fails))

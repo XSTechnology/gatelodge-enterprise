@@ -111,6 +111,22 @@ async def _init() -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 handled_at TIMESTAMPTZ
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS contacts (
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT DEFAULT '',
+                company TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                tags TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                first_seen TEXT DEFAULT '',
+                last_seen TEXT DEFAULT '',
+                message_count INTEGER DEFAULT 0
+            )""")
+            conn.execute("ALTER TABLE email_log "
+                         "ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE email_log "
+                         "ADD COLUMN IF NOT EXISTS body TEXT DEFAULT ''")
             conn.execute("ALTER TABLE chat_sessions "
                          "ADD COLUMN IF NOT EXISTS last_topic TEXT")
     await _run(run)
@@ -139,7 +155,8 @@ def _guard(request: Request):
 NAV = [("/", "Dashboard"), ("/conversations", "Conversations"),
        ("/reviews", "Reviews"), ("/inbox", "Inbox"), ("/leads", "Leads"),
        ("/licenses", "Licenses"), ("/kb", "Knowledge"),
-       ("/analytics", "Analytics"), ("/emails", "Emails"),
+       ("/analytics", "Analytics"), ("/contacts", "Contacts"),
+       ("/compose", "Compose"), ("/emails", "Emails"),
        ("/gateway", "Gateway")]
 
 CSS = """
@@ -229,6 +246,12 @@ kbd.code { font-family:Consolas,monospace; background:var(--ink2);
 .bar-num { width:52px; color:var(--paper); font-size:.75rem; flex:none; }
 .bigstats { display:grid; grid-template-columns:repeat(auto-fit,
   minmax(150px,1fr)); gap:.9rem; margin-bottom:1.6rem; }
+.view-body { background:var(--ink2); border:1px solid var(--line);
+  border-radius:10px; padding:1.1rem 1.3rem; white-space:pre-wrap;
+  font-size:.88rem; line-height:1.65; max-width:860px; }
+.bulk-status { background:rgba(212,175,55,.1); border:1px solid var(--brass);
+  border-radius:8px; padding:.6rem .9rem; margin-bottom:1rem;
+  font-size:.85rem; }
 """
 
 SHELL = """<!doctype html><html><head><meta charset="utf-8">
@@ -462,9 +485,14 @@ async def review_reply(request: Request):
                 sent = r.status_code in (200, 201)
         except Exception:
             sent = False
-        await _x("INSERT INTO email_log (kind, to_addr, serial, ok, detail) "
-                 "VALUES ('admin-reply', %s, %s, %s, %s)",
-                 (to, sid[:12], int(sent), "resent ok" if sent else "failed"))
+        await _x("INSERT INTO email_log (kind, to_addr, serial, ok, detail,"
+                 " subject, body) VALUES ('admin-reply', %s, %s, %s, %s,"
+                 " %s, %s)",
+                 (to, sid[:12], int(sent), "resend ok" if sent else "failed",
+                  "Your Gatelodge question — answered",
+                  f"From your chat with the Gatekeeper:\n\n"
+                  f"Q: {question}\n\n{reply}\n\n— The Gatelodge team"))
+        await _contact_upsert(to)
 
     # append Q&A to the KB override
     if add_kb and question:
@@ -1036,6 +1064,297 @@ async def kb_reset(request: Request, name: str = ""):
     return RedirectResponse("/kb", status_code=303)
 
 
+# ── mail room: contacts, compose, email viewing ──────────────────────────
+
+
+async def _contact_upsert(email: str, name: str = "", company: str = "",
+                          source: str = "") -> None:
+    """Add/refresh a contact (auto-capture). Never overwrites a name or
+    company the owner set; bumps counters."""
+    email = email.strip().lower()[:200]
+    if not email or "@" not in email:
+        return
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds")
+    await _x(
+        "INSERT INTO contacts (email, name, company, source, first_seen,"
+        " last_seen, message_count) VALUES (%s, %s, %s, %s, %s, %s, 1) "
+        "ON CONFLICT (email) DO UPDATE SET "
+        "name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name "
+        "ELSE contacts.name END, "
+        "company = CASE WHEN EXCLUDED.company != '' THEN EXCLUDED.company "
+        "ELSE contacts.company END, "
+        "source = CASE WHEN contacts.source IN ('', 'manual') "
+        "AND EXCLUDED.source != '' THEN EXCLUDED.source "
+        "ELSE contacts.source END, "
+        "last_seen = EXCLUDED.last_seen, "
+        "message_count = contacts.message_count + 1",
+        (email, name.strip()[:120], company.strip()[:160], source, now,
+         now))
+
+
+async def _send_mail(to: str, subject: str, body: str,
+                     kind: str) -> tuple[bool, str]:
+    """Send one email from SUPPORT_EMAIL via Resend + log with content."""
+    sent, detail = False, "RESEND_API_KEY unset"
+    if RESEND_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.post(
+                    "https://api.resend.com/emails",
+                    json={"from": SUPPORT_EMAIL, "reply_to": SUPPORT_EMAIL,
+                          "to": [to], "subject": subject,
+                          "text": body + "\n\n— The Gatelodge team"},
+                    headers={"Authorization":
+                             f"Bearer {RESEND_API_KEY}"})
+                sent = r.status_code in (200, 201)
+                detail = (r.json().get("id", "")
+                          if sent else f"resend {r.status_code}")
+        except Exception as e:
+            sent, detail = False, f"send error: {e!r}"
+    await _x("INSERT INTO email_log (kind, to_addr, serial, ok, detail, "
+             "subject, body) VALUES (%s, %s, '', %s, %s, %s, %s)",
+             (kind, to, int(sent), str(detail)[:300], subject[:300],
+              body[:20000]))
+    return sent, detail
+
+
+# bulk send state (single-worker LAN admin — in-memory is fine)
+BULK = {"running": False, "sent": 0, "total": 0, "errors": 0, "label": ""}
+
+
+async def _bulk_worker(ids: list[int], subject: str, body: str) -> None:
+    BULK.update(running=True, sent=0, total=len(ids), errors=0,
+                label=subject[:60])
+    for i, cid in enumerate(ids):
+        row = await _q("SELECT email FROM contacts WHERE id=%s", (cid,),
+                       fetch="one")
+        if not row:
+            BULK["errors"] += 1
+            continue
+        try:
+            await _send_mail(row[0], subject, body, "bulk")
+            BULK["sent"] += 1
+            await _contact_upsert(row[0])      # refresh last_seen
+        except Exception:
+            BULK["errors"] += 1
+        await asyncio.sleep(0.7)               # stay under rate limits
+    BULK["running"] = False
+
+
+@app.get("/contacts", response_class=HTMLResponse)
+async def contacts(request: Request, flash: str = "", q: str = "",
+                   tag: str = ""):
+    if (r := _guard(request)):
+        return r
+    sql = ("SELECT id, email, name, company, tags, source, message_count,"
+           " last_seen FROM contacts")
+    args: list = []
+    conds = []
+    if q:
+        conds.append("(email ILIKE %s OR name ILIKE %s OR company ILIKE %s)")
+        args += [f"%{q}%"] * 3
+    if tag:
+        conds.append("tags ILIKE %s")
+        args.append(f"%{tag}%")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY last_seen DESC LIMIT 300"
+    rows = await _q(sql, tuple(args))
+
+    bulk_note = ""
+    if BULK["running"] or BULK["total"]:
+        bulk_note = (f'<div class="bulk-status">Bulk send: '
+                     f'<b>{_e(BULK["label"])}</b> — {BULK["sent"]}/'
+                     f'{BULK["total"]} sent'
+                     + (f', {BULK["errors"]} errors' if BULK["errors"] else '')
+                     + (' (running…)' if BULK["running"] else ' — done')
+                     + '</div>')
+
+    trs = "".join(
+        f"<tr><td><input type=checkbox name=ids value={i}></td>"
+        f"<td class='pill'>{_e(e)}</td><td>{_e(n or '—')}</td>"
+        f"<td>{_e(co or '—')}</td><td class='note'>{_e(t)}</td>"
+        f"<td><span class='tag'>{_e(s)}</span></td><td>{m}</td>"
+        f"<td class='note'>{_e(ls[:16] if ls else '')}</td>"
+        f"<td><a class='btn ghost' style='padding:.15rem .5rem;"
+        f"font-size:.7rem' href='/contacts/edit?id={i}'>edit</a> "
+        f"<a class='btn ghost' style='padding:.15rem .5rem;font-size:.7rem'"
+        f" href='/compose?to={_e(e)}'>mail</a> "
+        f"<a class='btn ghost' style='padding:.15rem .5rem;font-size:.7rem'"
+        f" href='/contacts/delete?id={i}'"
+        f" onclick=\"return confirm('delete {_e(e)}?')\">del</a></td></tr>"
+        for i, e, n, co, t, s, m, ls in rows)
+
+    body = f"""
+{bulk_note}
+<div class="inline" style="margin-bottom:1rem">
+<form method="get" action="/contacts" class="inline">
+<input type="text" name="q" value="{_e(q)}" placeholder="search email, name, company…"
+ style="min-width:260px">
+<button class="btn ghost">Search</button></form>
+<a class="btn" href="/contacts/edit">New contact</a>
+<a class="btn ghost" href="/compose">Compose</a>
+</div>
+<form method="post" action="/contacts/bulk" id="bulkform">
+<div class="inline" style="margin-bottom:.8rem">
+<button class="btn" type="button"
+ onclick="var f=document.getElementById('bulkform');
+  f.querySelectorAll('input[name=ids]').forEach(c=>c.checked=true)">
+ select all</button>
+<button class="btn ghost" type="submit"
+ onclick="return confirm('Send this email to every selected contact?')">
+ Email selected →</button>
+<input type="hidden" name="subject" id="bulk-subject">
+<input type="hidden" name="body" id="bulk-body">
+<span class="note">compose below, then select recipients and send</span>
+</div>
+<div class="box" style="margin-bottom:1rem">
+<p class="note">bulk message (sent individually to each selected contact)</p>
+<input type="text" id="bs" placeholder="Subject" style="width:100%">
+<textarea id="bb" style="min-height:110px" placeholder="Message…"
+ oninput="document.getElementById('bulk-subject').value=
+ document.getElementById('bs').value;
+ document.getElementById('bulk-body').value=this.value"></textarea>
+</div>
+<table><tr><th></th><th>email</th><th>name</th><th>company</th><th>tags</th>
+<th>source</th><th>msgs</th><th>last seen</th><th></th></tr>
+{trs or '<tr><td colspan=9 class=note>no contacts yet — the book fills '
+'automatically from inbound mail, trial downloads and purchases</td></tr>'}
+</table></form>"""
+    return page(request, "Contacts", body, flash=flash)
+
+
+@app.get("/contacts/edit", response_class=HTMLResponse)
+async def contacts_edit(request: Request, id: int = 0):
+    if (r := _guard(request)):
+        return r
+    row = None
+    if id:
+        row = await _q("SELECT email, name, company, notes, tags "
+                       "FROM contacts WHERE id=%s", (id,), fetch="one")
+    e, n, co, no, t = row if row else ("", "", "", "", "")
+    body = f"""
+<form method="post" action="/contacts/save">
+<input type="hidden" name="id" value="{id}">
+{'<p class="note">email cannot be changed</p><input type=hidden name=email value="' + _e(e) + '"><p class=pill>' + _e(e) + '</p>' if row else '<p class="note">email</p><input type="email" name="email" value="' + _e(e) + '" required style="width:100%">'}
+<div class="grid2" style="margin-top:.8rem">
+<div><p class="note">name</p><input type="text" name="name" value="{_e(n)}" style="width:100%">
+<p class="note" style="margin-top:.6rem">company</p><input type="text" name="company" value="{_e(co)}" style="width:100%"></div>
+<div><p class="note">tags <span class="mono">(comma-separated)</span></p><input type="text" name="tags" value="{_e(t)}" style="width:100%">
+<p class="note" style="margin-top:.6rem">notes</p><textarea name="notes" style="min-height:90px">{_e(no)}</textarea></div></div>
+<div class="inline" style="margin-top:.8rem">
+<button class="btn">Save</button>
+<a class="btn ghost" href="/contacts">back</a></div></form>"""
+    return page(request, "Contacts · " + ("edit" if row else "new"), body)
+
+
+@app.post("/contacts/save")
+async def contacts_save(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    cid = int(form.get("id", 0) or 0)
+    email = str(form.get("email", "")).strip().lower()
+    if cid:
+        await _x("UPDATE contacts SET name=%s, company=%s, notes=%s, "
+                 "tags=%s WHERE id=%s",
+                 (str(form.get("name", ""))[:120],
+                  str(form.get("company", ""))[:160],
+                  str(form.get("notes", ""))[:2000],
+                  str(form.get("tags", ""))[:200], cid))
+        await _audit("contact-save", f"#{cid}")
+        return RedirectResponse("/contacts?flash=saved", status_code=303)
+    if not email or "@" not in email:
+        return RedirectResponse("/contacts?flash=valid+email+required",
+                                status_code=303)
+    await _contact_upsert(email, str(form.get("name", "")),
+                          str(form.get("company", "")), "manual")
+    await _audit("contact-new", email)
+    return RedirectResponse("/contacts?flash=added", status_code=303)
+
+
+@app.get("/contacts/delete")
+async def contacts_delete(request: Request, id: int = 0):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    await _x("DELETE FROM contacts WHERE id=%s", (id,))
+    await _audit("contact-delete", f"#{id}")
+    return RedirectResponse("/contacts?flash=deleted", status_code=303)
+
+
+@app.post("/contacts/bulk")
+async def contacts_bulk(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    ids = [int(i) for i in (form.getlist("ids") or [])
+           if str(i).isdigit()][:200]
+    subject = str(form.get("subject", "")).strip()[:300]
+    body = str(form.get("body", "")).strip()
+    if not ids or not subject or not body:
+        return RedirectResponse(
+            "/contacts?flash=select+recipients+and+write+the+message",
+            status_code=303)
+    if BULK["running"]:
+        return RedirectResponse(
+            "/contacts?flash=a+bulk+send+is+already+running", status_code=303)
+    asyncio.create_task(_bulk_worker(ids, subject, body))
+    await _audit("bulk-send", f"{len(ids)} recipients: {subject[:60]}")
+    return RedirectResponse(
+        f"/contacts?flash=bulk+send+started+({len(ids)}+recipients)",
+        status_code=303)
+
+
+@app.get("/compose", response_class=HTMLResponse)
+async def compose(request: Request, to: str = "", ref: str = "",
+                  flash: str = ""):
+    if (r := _guard(request)):
+        return r
+    pref = f"Re: {ref}" if ref else ""
+    body = f"""
+<form method="post" action="/compose/send">
+<div class="grid2">
+<div>
+<p class="note">to</p>
+<input type="email" name="to" value="{_e(to)}" required style="width:100%">
+<p class="note" style="margin-top:.6rem">subject</p>
+<input type="text" name="subject" value="{_e(pref)}" required style="width:100%">
+<p class="note" style="margin-top:.6rem">from</p>
+<p class="pill">{_e(SUPPORT_EMAIL)}</p>
+</div>
+<div>
+<p class="note">message</p>
+<textarea name="body" style="min-height:260px"></textarea>
+</div></div>
+<div class="inline" style="margin-top:.8rem">
+<button class="btn">Send</button>
+<a class="btn ghost" href="/contacts">address book</a>
+<a class="btn ghost" href="/inbox">inbox</a></div></form>"""
+    return page(request, "Compose", body, flash=flash)
+
+
+@app.post("/compose/send")
+async def compose_send(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    to = str(form.get("to", "")).strip().lower()
+    subject = str(form.get("subject", "")).strip()[:300]
+    body = str(form.get("body", "")).strip()
+    if not to or "@" not in to or not subject or not body:
+        return RedirectResponse(
+            "/compose?flash=to,+subject+and+message+required",
+            status_code=303)
+    sent, _ = await _send_mail(to, subject, body, "compose")
+    await _contact_upsert(to)
+    await _audit("compose", f"-> {to}: {subject[:60]}")
+    return RedirectResponse(
+        f"/compose?flash={'sent' if sent else 'send+failed+(logged)'}",
+        status_code=303)
+
+
 # ── inbox (inbound support mail handled by the agent) ─────────────────────
 
 
@@ -1076,7 +1395,9 @@ async def inbox(request: Request, flash: str = ""):
         f"<tr><td class='pill'>{_e(frm)}</td><td>{_e(subject[:60])}</td>"
         f"<td>{'<span class=tag ok>' + _e(st) + '</span>' if st == 'answered' else '<span class=tag>' + _e(st) + '</span>'}</td>"
         f"<td class='pill'>{_e(doc or '-')}</td>"
-        f"<td class='note'>{str(at)[:16]}</td></tr>"
+        f"<td class='note'>{str(at)[:16]}</td>"
+        f"<td><a class='btn ghost' style='padding:.15rem .5rem;"
+        f"font-size:.7rem' href='/inbox/view?id={_e(mid)}'>view</a></td></tr>"
         for mid, frm, subject, st, doc, at in recent)
 
     body = f"""
@@ -1118,11 +1439,15 @@ async def inbox_reply(request: Request):
                 sent = r.status_code in (200, 201)
         except Exception:
             sent = False
-    await _x("INSERT INTO email_log (kind, to_addr, serial, ok, detail) "
-             "VALUES ('inbox-reply', %s, %s, %s, %s)",
-             (to, mid[:12], int(sent), "ok" if sent else "failed"))
+    await _x("INSERT INTO email_log (kind, to_addr, serial, ok, detail, "
+             "subject, body) VALUES ('inbox-reply', %s, %s, %s, %s, %s, %s)",
+             (to, mid[:12], int(sent), "ok" if sent else "failed",
+              f"Re: {subject}" if subject else
+              "Your Gatelodge question — answered",
+              reply + "\n\n— The Gatelodge team"))
     await _x("UPDATE inbound_emails SET status='answered', reply=%s, "
              "handled_at=now() WHERE id=%s", (reply, mid))
+    await _contact_upsert(to)
     await _audit("inbox-reply", f"{mid[:16]} -> {to}")
     return RedirectResponse(
         f"/inbox?flash=reply+{'sent' if sent else 'saved+(send+failed)'}",
@@ -1137,6 +1462,37 @@ async def inbox_ignore(request: Request, id: str = ""):
              "handled_at=now() WHERE id=%s", (id,))
     await _audit("inbox-ignore", id[:16])
     return RedirectResponse("/inbox", status_code=303)
+
+
+@app.get("/inbox/view", response_class=HTMLResponse)
+async def inbox_view(request: Request, id: str = ""):
+    if (r := _guard(request)):
+        return r
+    row = await _q(
+        "SELECT id, from_addr, subject, body, status, confident, doc, "
+        "topic, reply, created_at, handled_at FROM inbound_emails "
+        "WHERE id=%s", (id,), fetch="one")
+    if not row:
+        return RedirectResponse("/inbox?flash=email+not+found",
+                                status_code=303)
+    (mid, frm, subject, body, st, conf, doc, topic, reply, at,
+     handled) = row
+    reply_html = (f"<h1 style=font-size:1.1rem>Reply sent</h1>"
+                  f'<div class="view-body">{_e(reply)}</div>'
+                  if reply else
+                  '<p class="note">No reply sent yet — use the reply form '
+                  'on the Inbox screen or compose a follow-up.</p>')
+    body = f"""
+<div class="inline" style="margin-bottom:1rem">
+<span class="tag">{_e(st)}</span>
+<span class="mono note">{_e(frm)} · {str(at)[:19]} · doc: {_e(doc or '-')} · topic: {_e(topic or '-')}</span></div>
+<h1 style="font-size:1.2rem">{_e(subject or '(no subject)')}</h1>
+<div class="view-body">{_e(body)}</div>
+{reply_html}
+<div class="inline" style="margin-top:1rem">
+<a class="btn" href="/compose?to={_e(frm)}&ref={_e(subject)}">Compose follow-up</a>
+<a class="btn ghost" href="/inbox">back to inbox</a></div>"""
+    return page(request, "Inbox · message", body)
 
 
 # ── analytics ─────────────────────────────────────────────────────────────
@@ -1244,14 +1600,50 @@ async def analytics(request: Request):
 async def emails(request: Request):
     if (r := _guard(request)):
         return r
-    rows = await _q("SELECT kind, to_addr, serial, ok, detail, created_at "
-                    "FROM email_log ORDER BY id DESC LIMIT 150")
+    rows = await _q(
+        "SELECT id, kind, to_addr, serial, ok, detail, subject, created_at "
+        "FROM email_log ORDER BY id DESC LIMIT 150")
+    trs = "".join(
+        f"<tr><td><span class=tag>{_e(k)}</span></td><td>{_e(t)}</td>"
+        f"<td>{_e(s or '(no subject)')}</td>"
+        f"<td>{'<span class=tag ok>ok</span>' if o else '<span class=tag bad>fail</span>'}</td>"
+        f"<td class=note>{_e(c)}</td>"
+        f"<td><a class='btn ghost' style='padding:.15rem .5rem;"
+        f"font-size:.7rem' href='/email/view?id={i}'>view</a></td></tr>"
+        for i, k, t, s, o, d, c in
+        [(r[0], r[1], r[2], r[6], r[4], r[5], r[7]) for r in rows])
     body = f"""
-<table><tr><th>kind</th><th>to</th><th>serial/sess</th><th>state</th>
-<th>detail</th><th>when</th></tr>
-{''.join(f'<tr><td><span class=tag>{_e(k)}</span></td><td>{_e(t)}</td><td class=pill>{_e(s) or "—"}</td><td>{"<span class=tag ok>ok</span>" if o else "<span class=tag bad>fail</span>"}</td><td class=note style=max-width:280px>{_e(d)[:120]}</td><td class=note>{_e(c)}</td></tr>' for k, t, s, o, d, c in rows) or '<tr><td colspan=6 class=note>no emails yet</td></tr>'}
+<table><tr><th>kind</th><th>to</th><th>subject</th><th>state</th>
+<th>when</th><th></th></tr>
+{trs or '<tr><td colspan=6 class=note>no emails yet</td></tr>'}
 </table>"""
     return page(request, "Email log", body)
+
+
+@app.get("/email/view", response_class=HTMLResponse)
+async def email_view(request: Request, id: int = 0):
+    if (r := _guard(request)):
+        return r
+    row = await _q(
+        "SELECT kind, to_addr, serial, ok, detail, subject, body, "
+        "created_at FROM email_log WHERE id=%s", (id,), fetch="one")
+    if not row:
+        return RedirectResponse("/emails?flash=email+not+found",
+                                status_code=303)
+    kind, to, serial, ok, detail, subject, body, at = row
+    content = body or "(no content stored — sent before the mail-room update)"
+    body = f"""
+<div class="inline" style="margin-bottom:1rem">
+<span class="tag">{_e(kind)}</span>
+<span class="mono note">to: {_e(to)} · {str(at)[:19]}</span>
+{'<span class=tag ok>delivered</span>' if ok else '<span class=tag bad>send failed</span>'}
+</div>
+<h1 style="font-size:1.2rem">{_e(subject or '(no subject)')}</h1>
+<div class="view-body">{_e(content)}</div>
+<div class="inline" style="margin-top:1rem">
+<a class="btn" href="/compose?to={_e(to)}&ref={_e(subject)}">Compose follow-up</a>
+<a class="btn ghost" href="/emails">back to log</a></div>"""
+    return page(request, "Email · sent", body)
 
 
 @app.get("/gateway", response_class=HTMLResponse)

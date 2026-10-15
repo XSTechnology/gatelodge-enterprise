@@ -210,6 +210,28 @@ for name, doc in (("purchase", h1), ("trial", h2)):
 check("purchase license block present", "license.json" in h1)
 check("trial download link", "/download/community" in h2)
 
+# -- 11. mail room: contacts auto-capture + email content logging --------
+with app.db() as c:
+    rows = c.execute("SELECT email, company, source, message_count "
+                     "FROM contacts").fetchall()
+check("trial contact captured",
+      any(r[0] == "buyer@example.com" and r[2] == "trial" for r in rows),
+      str(rows))
+check("purchase bumped same contact",
+      any(r[0] == "buyer@example.com" and r[3] >= 2 for r in rows),
+      str(rows))
+check("second buyer captured",
+      any(r[0] == "buyer2@example.com" for r in rows), str(rows))
+with app.db() as c:
+    cols = [r[1] for r in c.execute(
+        "PRAGMA table_info(email_log)").fetchall()]
+check("email_log has subject+body columns",
+      "subject" in cols and "body" in cols, str(cols))
+with app.db() as c:
+    trial_logs = c.execute("SELECT COUNT(*) FROM email_log WHERE kind="
+                           "'trial' AND subject != ''").fetchone()[0]
+check("trial logs carry subject", trial_logs >= 1, str(trial_logs))
+
 print()
 print("previews :", out)
 print("db       :", TD / "leads.db")

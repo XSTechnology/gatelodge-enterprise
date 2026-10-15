@@ -150,6 +150,20 @@ CREATE TABLE IF NOT EXISTS inbound_emails (
   handled_at TIMESTAMPTZ
 );
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS last_topic TEXT;
+CREATE TABLE IF NOT EXISTS contacts (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  name TEXT DEFAULT '',
+  company TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  tags TEXT DEFAULT '',
+  source TEXT DEFAULT 'manual',
+  first_seen TEXT DEFAULT '',
+  last_seen TEXT DEFAULT '',
+  message_count INTEGER DEFAULT 0
+);
+ALTER TABLE email_log ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT '';
+ALTER TABLE email_log ADD COLUMN IF NOT EXISTS body TEXT DEFAULT '';
 """
 
 
@@ -720,7 +734,10 @@ async def escalate(body: EscalateRequest, request: Request):
                                              transcript)
     print(f"[gatekeeper] escalation {body.session_id[:8]} "
           f"({email or 'no email'}): {'OK ' + detail if ok else 'FAIL ' + detail}")
-    await _run_email_log(email, ok, detail)
+    await _run_email_log(email, ok, detail,
+                         subject=f"Gatekeeper escalation — "
+                                 f"{body.session_id[:8]}",
+                         body=transcript)
     return {"ok": True}      # identical whether or not the email delivered
 
 
@@ -847,6 +864,7 @@ async def email_inbound(body: InboundEmail, request: Request):
         return {"status": "ignored", "reason": "self"}
     if await _run(lambda: _inbound_seen(mid)):
         return {"status": "ignored", "reason": "duplicate"}
+    await _run(lambda: _contact_upsert(frm, source="inbound"))
     if await _run(lambda: _inbound_sender_count(frm)) >= INBOUND_DAILY_CAP:
         await _run(lambda: _insert_inbound(
             mid, frm, subject, text, "review", False, None,
@@ -877,7 +895,10 @@ async def email_inbound(body: InboundEmail, request: Request):
         mid, frm, subject, text, status, True, primary, t["topic"],
         answer if ok else ""))
     await _run_email_log(frm, ok, detail or "inbound auto-reply",
-                         kind="gatekeeper-email-reply")
+                         kind="gatekeeper-email-reply",
+                         subject=f"Re: {subject}" if subject
+                         else "Your question — Gatelodge",
+                         body=answer)
     print(f"[gatekeeper] inbound {mid[:12]} from {frm}: "
           f"{'answered (' + primary + ')' if ok else 'QUEUED (send failed)'}")
     return {"status": status, "doc": primary,
@@ -886,23 +907,52 @@ async def email_inbound(body: InboundEmail, request: Request):
 
 
 def _log_email(to_addr: str, ok: bool, detail: str,
-               kind: str = "gatekeeper-escalation") -> None:
+               kind: str = "gatekeeper-escalation",
+               subject: str = "", body: str = "") -> None:
     if not DATABASE_URL:
         return
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             conn.execute(
-                "INSERT INTO email_log (kind, to_addr, serial, ok, detail) "
-                "VALUES (%s, %s, '', %s, %s)",
+                "INSERT INTO email_log (kind, to_addr, serial, ok, detail,"
+                " subject, body) VALUES (%s, %s, '', %s, %s, %s, %s)",
                 (kind, to_addr or "unknown", int(bool(ok)),
-                 str(detail)[:300]))
+                 str(detail)[:300], subject[:300], body[:20000]))
     except Exception as e:
         print(f"[gatekeeper] email_log write failed: {e!r}")
 
 
 async def _run_email_log(to_addr: str, ok: bool, detail: str,
-                         kind: str = "gatekeeper-escalation") -> None:
-    await _run(lambda: _log_email(to_addr, ok, detail, kind))
+                         kind: str = "gatekeeper-escalation",
+                         subject: str = "", body: str = "") -> None:
+    await _run(lambda: _log_email(to_addr, ok, detail, kind, subject, body))
+
+
+def _contact_upsert(email: str, name: str = "", company: str = "",
+                    source: str = "") -> None:
+    """Add/refresh an address-book contact (auto-capture)."""
+    import datetime
+    email = email.strip().lower()[:200]
+    if not email or "@" not in email:
+        return
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds")
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute(
+            "INSERT INTO contacts (email, name, company, source, first_seen,"
+            " last_seen, message_count) VALUES (%s, %s, %s, %s, %s, %s, 1) "
+            "ON CONFLICT (email) DO UPDATE SET "
+            "name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name "
+            "ELSE contacts.name END, "
+            "company = CASE WHEN EXCLUDED.company != '' THEN EXCLUDED.company"
+            " ELSE contacts.company END, "
+            "source = CASE WHEN contacts.source IN ('', 'manual') AND "
+            "EXCLUDED.source != '' THEN EXCLUDED.source "
+            "ELSE contacts.source END, "
+            "last_seen = EXCLUDED.last_seen, "
+            "message_count = contacts.message_count + 1",
+            (email, name.strip()[:120], company.strip()[:160], source,
+             now, now))
 
 
 def _require_review_key(request: Request) -> None:

@@ -90,11 +90,22 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
         doc TEXT, topic TEXT, reply TEXT,
         created_at TIMESTAMPTZ DEFAULT now(),
         handled_at TIMESTAMPTZ)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS contacts (
+        id BIGSERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+        name TEXT DEFAULT '', company TEXT DEFAULT '',
+        notes TEXT DEFAULT '', tags TEXT DEFAULT '',
+        source TEXT DEFAULT 'manual', first_seen TEXT DEFAULT '',
+        last_seen TEXT DEFAULT '', message_count INTEGER DEFAULT 0)""")
     c.execute("ALTER TABLE chat_sessions "
               "ADD COLUMN IF NOT EXISTS last_topic TEXT")
+    c.execute("ALTER TABLE email_log "
+              "ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT ''")
+    c.execute("ALTER TABLE email_log "
+              "ADD COLUMN IF NOT EXISTS body TEXT DEFAULT ''")
     # deterministic: own the tables for this run
     for t in ("chat_messages", "chat_sessions", "licenses", "leads",
-              "email_log", "admin_audit", "kb_overrides", "inbound_emails"):
+              "email_log", "admin_audit", "kb_overrides", "inbound_emails",
+              "contacts"):
         c.execute(f"TRUNCATE {t}")
     c.execute("INSERT INTO chat_sessions (id, email, needs_review, "
               "last_topic) VALUES ('testsess0001', 'cust@example.com', "
@@ -394,7 +405,97 @@ with TestClient(app.app) as client:
     r = client.get("/healthz")
     check("healthz", r.status_code == 200 and r.json()["ok"])
 
-    # 12. logout clears
+    # 14. mail room — contacts CRUD + compose + viewers
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        c.execute("INSERT INTO contacts (email, name, company, tags, "
+                  "source, first_seen, last_seen, message_count) VALUES "
+                  "('booked@example.com', 'Book Owner', 'Acme', "
+                  "'vip,partner', 'inbound', '2026-10-01', '2026-10-10', 3)"
+                  " ON CONFLICT (email) DO NOTHING")
+        c.execute("INSERT INTO contacts (email, source, first_seen, "
+                  "last_seen) VALUES ('trial@example.com', 'trial', "
+                  "'2026-10-02', '2026-10-02')")
+        c.execute("INSERT INTO email_log (kind, to_addr, serial, ok, "
+                  "detail, subject, body) VALUES ('trial', "
+                  "'booked@example.com', '', 1, 'ok', 'Your download', "
+                  "'thank you for downloading')")
+
+    r = client.get("/contacts")
+    check("contacts screen renders", r.status_code == 200
+          and "booked@example.com" in r.text
+          and "trial@example.com" in r.text
+          and "Acme" in r.text)
+    r = client.get("/contacts", params={"q": "acme"})
+    check("contacts search filters", "booked@example.com" in r.text
+          and "trial@example.com" not in r.text)
+
+    r = client.post("/contacts/save", data={
+        "id": "0", "email": "manual@example.com", "name": "Manual Add",
+        "company": "Newco", "tags": "prospect", "notes": "met at expo"},
+        follow_redirects=False)
+    check("contact create", r.status_code == 303)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT name, company, source FROM contacts "
+                      "WHERE email='manual@example.com'").fetchone()
+    check("created contact stored", v and v[0] == "Manual Add"
+          and v[1] == "Newco" and v[2] == "manual", str(v))
+
+    cid = None
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        cid = c.execute("SELECT id FROM contacts WHERE "
+                        "email='booked@example.com'").fetchone()[0]
+    r = client.get("/contacts/edit", params={"id": cid})
+    check("contact edit form", r.status_code == 200
+          and 'value="Book Owner"' in r.text
+          and 'value="vip,partner"' in r.text)
+    r = client.post("/contacts/save", data={
+        "id": str(cid), "email": "", "name": "Book Owner II",
+        "company": "Acme", "tags": "vip", "notes": "notes here"},
+        follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT name, notes FROM contacts WHERE id=%s",
+                      (cid,)).fetchone()
+    check("contact edit saves", v and v[0] == "Book Owner II"
+          and v[1] == "notes here", str(v))
+
+    r = client.get("/compose", params={"to": "booked@example.com",
+                                       "ref": "Question about trial"})
+    check("compose form prefills", r.status_code == 200
+          and 'value="booked@example.com"' in r.text
+          and 'value="Re: Question about trial"' in r.text)
+
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        eid = c.execute("SELECT id FROM email_log WHERE "
+                        "subject='Your download'").fetchone()[0]
+    r = client.get("/email/view", params={"id": eid})
+    check("sent email viewer", r.status_code == 200
+          and "Your download" in r.text
+          and "thank you for downloading" in r.text)
+    r = client.get("/inbox/view", params={"id": "inb-a"})
+    check("inbound email viewer", r.status_code == 200
+          and "How long is the trial?" in r.text
+          and "Compose follow-up" in r.text)
+
+    r = client.post("/contacts/bulk", data={
+        "ids": [str(cid)], "subject": "Bulk test",
+        "body": "Hello from the bulk sender"},
+        follow_redirects=False)
+    check("bulk send starts", r.status_code == 303
+          and "started" in r.headers.get("location", ""))
+    time.sleep(2.5)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT COUNT(*) FROM email_log WHERE kind="
+                      "'bulk' AND subject='Bulk test'").fetchone()[0]
+    check("bulk email logged with content", v == 1, str(v))
+
+    r = client.get("/contacts/delete", params={"id": cid},
+                   follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT COUNT(*) FROM contacts WHERE id=%s",
+                      (cid,)).fetchone()[0]
+    check("contact delete", r.status_code == 303 and v == 0)
+
+    # 15. logout clears
     client.get("/logout")
     r = client.get("/", follow_redirects=False)
     check("logout clears session", r.status_code == 303)
