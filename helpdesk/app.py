@@ -164,6 +164,54 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 ALTER TABLE email_log ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT '';
 ALTER TABLE email_log ADD COLUMN IF NOT EXISTS body TEXT DEFAULT '';
+CREATE TABLE IF NOT EXISTS tasks (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  goal TEXT NOT NULL DEFAULT '',
+  success_criteria TEXT DEFAULT '',
+  inputs TEXT DEFAULT '',
+  schedule TEXT DEFAULT 'manual',
+  notify BOOLEAN DEFAULT TRUE,
+  enabled BOOLEAN DEFAULT TRUE,
+  run_now BOOLEAN DEFAULT FALSE,
+  next_run_at TIMESTAMPTZ,
+  last_run_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS task_runs (
+  id BIGSERIAL PRIMARY KEY,
+  task_id BIGINT NOT NULL,
+  status TEXT DEFAULT 'running',
+  classification TEXT DEFAULT '',
+  summary TEXT DEFAULT '',
+  report TEXT DEFAULT '',
+  started_at TIMESTAMPTZ DEFAULT now(),
+  finished_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS task_steps (
+  id BIGSERIAL PRIMARY KEY,
+  run_id BIGINT NOT NULL,
+  seq INT DEFAULT 0,
+  tool TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  input TEXT DEFAULT '',
+  output TEXT DEFAULT '',
+  status TEXT DEFAULT 'ok',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS tools (
+  name TEXT PRIMARY KEY,
+  description TEXT DEFAULT '',
+  kind TEXT DEFAULT 'builtin',
+  enabled BOOLEAN DEFAULT TRUE
+);
+CREATE TABLE IF NOT EXISTS tool_proposals (
+  id BIGSERIAL PRIMARY KEY,
+  capability TEXT NOT NULL,
+  context TEXT DEFAULT '',
+  status TEXT DEFAULT 'open',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
 """
 
 
@@ -291,6 +339,227 @@ def _retrieve(query: str) -> tuple[list[dict], list[dict]]:
     chunks = _chunk_kb(kb)
     idf = _build_index(chunks)
     return chunks, _search(query, chunks, idf)
+
+
+# ── task tools (v3: the task engine's hands) ─────────────────────────────
+# Each tool is a small governed capability. Builtin tools run in-process;
+# MCP tools can be registered later through the same registry (the kind
+# column marks them). Every call is recorded in task_steps.
+
+TOOLS: dict[str, dict] = {}
+
+
+def tool(name: str, description: str):
+    def deco(fn):
+        TOOLS[name] = {"description": description, "fn": fn}
+        return fn
+    return deco
+
+
+@tool("db_query",
+      "Run a READ-ONLY SQL query against the shared Postgres — tables: "
+      "chat_sessions, chat_messages, inbound_emails, contacts, leads, "
+      "licenses, email_log, kb_overrides, tasks, task_runs. SELECT only; "
+      "results capped at 50 rows. Input: the SQL.")
+async def t_db_query(sql: str) -> str:
+    s = (sql or "").strip().rstrip(";")
+    if not s.lower().lstrip("(").startswith("select"):
+        return "ERROR: only SELECT queries are allowed."
+
+    def run():
+        with psycopg.connect(DATABASE_URL) as conn:
+            cur = conn.execute(s + " LIMIT 50")
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()[:50]
+        return cols, rows
+    try:
+        cols, rows = await _run(run)
+    except Exception as e:
+        return f"ERROR: {e!r}"
+    if not cols:
+        return "(no columns)"
+    out = [" | ".join(cols)]
+    out += [" | ".join(str(v) for v in r) for r in rows]
+    return "\n".join(out) or "(no rows)"
+
+
+@tool("kb_search",
+      "Search the Gatekeeper knowledge base with the hybrid retrieval "
+      "engine. Input: a question or keywords. Returns the best passages.")
+async def t_kb_search(query: str) -> str:
+    try:
+        _, cands = await _run(lambda: _retrieve(query or ""))
+    except Exception as e:
+        return f"ERROR: {e!r}"
+    if not cands:
+        return "(no passages found)"
+    return "\n\n".join(f'[{c["doc"]} · {c["section"]}]\n{c["text"][:900]}'
+                       for c in cands[:3])
+
+
+@tool("kb_write",
+      "Create or update a knowledge-base document (live for the agent on "
+      "the next question). Input JSON: "
+      '{"name": "doc-name", "title": "...", "description": "...", '
+      '"content": "markdown with ## sections"}.')
+async def t_kb_write(spec: str) -> str:
+    try:
+        d = json.loads(spec)
+        name = str(d.get("name", "")).strip().lower()
+        title = str(d.get("title", "")).strip()
+        desc = str(d.get("description", "")).strip()
+        content = str(d.get("content", "")).strip()
+    except Exception:
+        return "ERROR: input must be JSON with name/title/description/content"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", name) or not title \
+            or not desc or not content:
+        return "ERROR: name (slug), title, description and content required"
+    doc = (f"# {title}\ntitle: {title}\ndescription: {desc}\n\n"
+           + content + "\n")
+
+    def run():
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO kb_overrides (name, content) VALUES (%s, %s) "
+                "ON CONFLICT (name) DO UPDATE SET content=%s, "
+                "updated_at=now()", (name, doc, doc))
+    await _run(run)
+    return f"Document '{name}' saved — live on the next question."
+
+
+@tool("email_draft",
+      "Record an email DRAFT in the task report (never sends — the owner "
+      "reviews and sends from the Lodge Office). Input JSON: "
+      '{"to": "...", "subject": "...", "body": "..."}.')
+async def t_email_draft(spec: str) -> str:
+    try:
+        d = json.loads(spec)
+        to = str(d.get("to", "")).strip().lower()
+        subject = str(d.get("subject", "")).strip()
+        body = str(d.get("body", "")).strip()
+    except Exception:
+        return "ERROR: input must be JSON with to/subject/body"
+    if not to or "@" not in to or not subject or not body:
+        return "ERROR: to, subject and body required"
+    return ("DRAFT RECORDED (owner sends from the Lodge Office):\n"
+            f"To: {to}\nSubject: {subject}\n\n{body[:4000]}")
+
+
+@tool("email_send",
+      "Actually SEND an email from support@datagatelodge.com. Use ONLY "
+      "for internal notifications (to the owner/team) — customer-facing "
+      "mail must use email_draft. Input JSON: "
+      '{"to": "...", "subject": "...", "body": "..."}.')
+async def t_email_send(spec: str) -> str:
+    try:
+        d = json.loads(spec)
+        to = str(d.get("to", "")).strip().lower()
+        subject = str(d.get("subject", "")).strip()
+        body = str(d.get("body", "")).strip()
+    except Exception:
+        return "ERROR: input must be JSON with to/subject/body"
+    if not to or "@" not in to or not subject or not body:
+        return "ERROR: to, subject and body required"
+    ok, detail = await send_reply_email(to, subject, body, "task")
+    await _run_email_log(to, ok, detail, kind="task-email",
+                         subject=subject, body=body)
+    return f"{'SENT' if ok else 'SEND FAILED'}: {detail}"
+
+
+@tool("web_fetch",
+      "Fetch a URL over HTTPS and return the HTTP status plus a text "
+      "excerpt. Input: the URL.")
+async def t_web_fetch(url: str) -> str:
+    url = (url or "").strip()
+    if not url.startswith("https://") and not url.startswith("http://"):
+        return "ERROR: provide a full http(s) URL"
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            r = await c.get(url, headers={"user-agent": "gatekeeper-task"})
+        text = " ".join(r.text.split())[:1500]
+        return f"HTTP {r.status_code}\n{text}"
+    except Exception as e:
+        return f"ERROR: {e!r}"
+
+
+@tool("gap_cluster",
+      "Cluster the unanswered questions from the last 14 days (chats that "
+      "needed review or escalated, plus review-queued inbound email) into "
+      "knowledge-gap topics. No input needed.")
+async def t_gap_cluster(_: str = "") -> str:
+    def run():
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT m.content FROM chat_messages m JOIN chat_sessions s"
+                " ON s.id=m.session_id WHERE m.role='user' AND "
+                "(s.needs_review OR s.escalated) AND m.created_at > "
+                "now() - interval '14 days' LIMIT 200").fetchall()
+            rows += conn.execute(
+                "SELECT body FROM inbound_emails WHERE status='review' "
+                "AND created_at > now() - interval '14 days' "
+                "LIMIT 100").fetchall()
+        return [r[0][:300] for r in rows if r[0] and r[0].strip()]
+    qs = await _run(run)
+    if len(qs) < 2:
+        return "(not enough unanswered questions to cluster)"
+    tfs = []
+    for q in qs:
+        tf: dict[str, int] = {}
+        for t in _tok(q):
+            tf[t] = tf.get(t, 0) + 1
+        tfs.append(tf)
+    n = len(qs)
+    df: dict[str, int] = {}
+    for tf in tfs:
+        for t in tf:
+            df[t] = df.get(t, 0) + 1
+    idf = {t: math.log((n + 1) / (d + 1)) + 1.0 for t, d in df.items()}
+    vecs = []
+    for tf in tfs:
+        v = {t: (1.0 + math.log(c)) * idf.get(t, 1.0) for t, c in tf.items()}
+        vecs.append((v, math.sqrt(sum(w * w for w in v.values())) or 1.0))
+
+    def sim(i, j):
+        a, an = vecs[i]
+        b, bn = vecs[j]
+        return sum(w * b.get(t, 0.0) for t, w in a.items()) / (an * bn)
+
+    assigned = [False] * n
+    clusters = []
+    for i in range(n):
+        if assigned[i]:
+            continue
+        members = [i]
+        assigned[i] = True
+        for j in range(i + 1, n):
+            if not assigned[j] and sim(i, j) >= 0.22:
+                members.append(j)
+                assigned[j] = True
+        if len(members) >= 2:
+            counts: dict[str, int] = {}
+            for m in members:
+                for t in tfs[m]:
+                    counts[t] = counts.get(t, 0) + 1
+            shared = [t for t, c in counts.items()
+                      if c >= (len(members) + 1) // 2]
+            shared.sort(key=lambda t: -idf.get(t, 1.0))
+            clusters.append((len(members), shared[:5],
+                             [qs[m] for m in members[:3]]))
+    clusters.sort(key=lambda c: -c[0])
+    if not clusters:
+        return "(no clusters — unanswered questions are all distinct)"
+    out = []
+    for count, terms, examples in clusters[:6]:
+        out.append(f"{count} questions — topics: {', '.join(terms)}\n"
+                   + "\n".join(f"  - {e[:100]}" for e in examples))
+    return "\n\n".join(out)
+
+
+@tool("report",
+      "Record the final report for this task run (markdown). Use when the "
+      "task is complete. Input: the report text.")
+async def t_report(text: str) -> str:
+    return f"REPORT RECORDED:\n{text[:8000]}"
 
 
 def _init_schema() -> None:
@@ -961,6 +1230,354 @@ def _require_review_key(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     if auth != f"Bearer {REVIEW_KEY}":
         raise HTTPException(401, "invalid review key")
+
+
+# ── task engine (v3): goal → plan → execute → review → report ────────────
+
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "sales@xs.technology")
+MAX_TASK_STEPS = 8
+
+TASK_SYSTEM = """You are the Gatekeeper task agent. Complete the user's \
+task by calling the provided function capabilities, one at a time.
+
+When the task is complete, reply as plain text content (NOT a tool \
+call) with ONLY a JSON object:
+{{"done": true, "report": "<final report in markdown>"}}
+
+Rules:
+- At most {max_steps} capability calls; make them count.
+- Chain results: use earlier outputs to build later inputs.
+- Use email_draft for customer-facing mail (never email_send).
+- If no capability can achieve part of the goal, say so in the report."""
+
+REVIEW_SYSTEM = """You review a completed agent task. Given the GOAL, the \
+SUCCESS CRITERIA, and the TRANSCRIPT of tool calls, judge the outcome.
+
+Reply with ONLY a JSON object:
+{{"classification": "achieved" | "partial" | "failed" | "review", \
+"summary": "<2-3 sentences for the owner>"}}
+
+- achieved: the goal was met and the criteria satisfied
+- partial: some of the goal was met; say what is missing
+- failed: the goal was not met
+- review: the result needs a human decision before it counts"""
+
+
+async def _llm_json(system: str, messages: list[dict],
+                     model: str) -> str:
+    """One non-streaming completion; returns raw content."""
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+            json={"model": model,
+                  "messages": [{"role": "system", "content": system}]
+                  + messages,
+                  "max_tokens": 1200, "temperature": 0.1})
+        data = r.json()
+        if "choices" not in data:
+            raise RuntimeError(f"gateway {r.status_code}: "
+                               f"{str(data)[:300]}")
+        return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+def _tools_spec() -> list[dict]:
+    """The registry as native function-tool declarations (groq-safe:
+    with tools declared, the model's native tool calls are legal)."""
+    return [{"type": "function", "function": {
+        "name": name,
+        "description": d["description"][:600],
+        "parameters": {"type": "object",
+                       "properties": {"input": {
+                           "type": "string",
+                           "description": "text input for this capability"}},
+                       "required": ["input"]}}}
+        for name, d in sorted(TOOLS.items())]
+
+
+async def _plan_step(messages: list[dict]) -> dict:
+    """One planning turn with native function tools declared.
+    Returns {"tool": ..., "input": ..., "call": <raw assistant msg>}
+    or {"done": true, "report": ...} or raises."""
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+            json={"model": TRIAGE_MODEL,
+                  "messages": [{"role": "system", "content":
+                                TASK_SYSTEM.format(
+                                    max_steps=MAX_TASK_STEPS)}]
+                  + messages,
+                  "tools": _tools_spec(), "tool_choice": "auto",
+                  "max_tokens": 1200, "temperature": 0.1})
+        data = r.json()
+        if "choices" not in data:
+            raise RuntimeError(f"gateway {r.status_code}: "
+                               f"{str(data)[:300]}")
+    msg = data["choices"][0]["message"]
+    # native tool call path
+    for tc in (msg.get("tool_calls") or []):
+        fn = tc.get("function", {})
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {}
+        inp = args.get("input") or args.get("url") or \
+            args.get("query") or ""
+        # sanitize the assistant message for the next round — groq
+        # rejects unknown fields (reasoning) and null content
+        clean = {"role": "assistant", "content": msg.get("content") or "",
+                 "tool_calls": [
+                     {"id": tc.get("id", ""),
+                      "type": "function",
+                      "function": {"name": fn.get("name", ""),
+                                   "arguments": fn.get("arguments")
+                                   or "{}"}}]}
+        return {"tool": fn.get("name", ""), "input": str(inp),
+                "call_id": tc.get("id", ""), "assistant": clean}
+    # text path — JSON in content (done/report, or a text tool call)
+    content = (msg.get("content") or "").strip()
+    m = re.search(r"\{.*\}", content, re.S)
+    if not m:
+        raise RuntimeError(f"unparseable agent response: {content[:200]}")
+    d = json.loads(m.group(0))
+    if d.get("done"):
+        return {"done": True, "report": str(d.get("report", "")).strip(),
+                "assistant": {"role": "assistant", "content": content}}
+    return {"tool": str(d.get("tool", "")).strip(),
+            "input": str(d.get("input", "")).strip(),
+            "call_id": "", "assistant": {"role": "assistant",
+                                         "content": content}}
+
+
+def _tools_block() -> str:
+    return "\n".join(f"- {name}: {d['description']}"
+                     for name, d in sorted(TOOLS.items()))
+
+
+def _propose_tool(capability: str, context: str) -> None:
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO tool_proposals (capability, context) "
+                "VALUES (%s, %s)", (capability[:200], context[:2000]))
+    except Exception as e:
+        print(f"[tasks] proposal write failed: {e!r}")
+
+
+async def execute_task(task_id: int) -> None:
+    """Run one task end-to-end: ReAct loop, review, report, notify."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        row = conn.execute(
+            "SELECT name, goal, success_criteria, inputs, notify "
+            "FROM tasks WHERE id = %s", (task_id,)).fetchone()
+    if not row:
+        return
+    name, goal, criteria, inputs, notify = row
+
+    def start_run():
+        with psycopg.connect(DATABASE_URL) as conn:
+            return conn.execute(
+                "INSERT INTO task_runs (task_id) VALUES (%s) "
+                "RETURNING id", (task_id,)).fetchone()[0]
+    run_id = await _run(start_run)
+    print(f"[tasks] starting '{name}' (run {run_id})")
+
+    def user_prompt():
+        p = f"TASK: {goal}"
+        if criteria:
+            p += f"\n\nSUCCESS CRITERIA: {criteria}"
+        if inputs:
+            p += f"\n\nINPUTS / CONTEXT: {inputs}"
+        return p
+
+    messages: list[dict] = [{"role": "user", "content": user_prompt()}]
+    transcript: list[str] = []
+    report = ""
+    drafts: list[str] = []
+
+    for step_no in range(MAX_TASK_STEPS):
+        try:
+            d = await _plan_step(messages)
+        except Exception as e:
+            print(f"[tasks] plan error: {e!r}")
+            report = f"Agent error during planning: {e!r}"
+            break
+        if d.get("done"):
+            report = d["report"]
+            break
+        tool_name = d["tool"]
+        tool_input = d["input"]
+        call_id = d.get("call_id", "")
+
+        # thread the assistant turn (native call or text JSON)
+        messages.append(d["assistant"])
+
+        if tool_name not in TOOLS:
+            output = (f"ERROR: no capability named '{tool_name}'. "
+                      f"Available: {', '.join(sorted(TOOLS))}")
+            status = "blocked"
+            await _run(lambda: _propose_tool(
+                tool_name, f"wanted during task '{name}': "
+                f"{tool_input[:300]}"))
+        else:
+            try:
+                output = str(await TOOLS[tool_name]["fn"](tool_input))[:6000]
+                status = "ok"
+            except Exception as e:
+                output = f"ERROR: {e!r}"
+                status = "error"
+        if tool_name == "report":
+            report = tool_input
+        if tool_name == "email_draft" and output.startswith("DRAFT"):
+            drafts.append(output)
+
+        transcript.append(f"TOOL {tool_name} ({status}) — input: "
+                          f"{tool_input[:200]}\noutput: {output[:600]}")
+        if call_id:
+            messages.append({"role": "tool", "tool_call_id": call_id,
+                             "content": output[:4000]})
+        else:
+            messages.append({"role": "user",
+                             "content": f"TOOL OUTPUT ({tool_name}):\n"
+                                        f"{output}"})
+
+        def save_step(sn=step_no, tn=tool_name,
+                      ti=tool_input, ou=output, st=status):
+            with psycopg.connect(DATABASE_URL) as conn:
+                conn.execute(
+                    "INSERT INTO task_steps (run_id, seq, tool, "
+                    "description, input, output, status) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (run_id, sn, tn, "", ti[:4000], ou[:6000], st))
+        await _run(save_step)
+
+    if not report:
+        report = "(no final report produced)"
+
+    # review pass — a separate judgment against the success criteria
+    classification, summary = "review", ""
+    try:
+        rv = await _llm_json(
+            REVIEW_SYSTEM,
+            [{"role": "user",
+              "content": f"GOAL: {goal}\n\nSUCCESS CRITERIA: "
+                         f"{criteria or '(none specified)'}\n\n"
+                         f"TRANSCRIPT:\n" + "\n\n".join(transcript)
+                         + f"\n\nFINAL REPORT:\n{report}"}],
+            ANSWER_MODEL)
+        m = re.search(r"\{.*\}", rv, re.S)
+        if m:
+            rd = json.loads(m.group(0))
+            classification = str(rd.get("classification", "review"))
+            summary = str(rd.get("summary", ""))[:1000]
+            if classification not in ("achieved", "partial", "failed",
+                                      "review"):
+                classification = "review"
+    except Exception as e:
+        print(f"[tasks] review error: {e!r}")
+        summary = f"Review error: {e!r}"
+
+    # notify the owner
+    if notify:
+        body = (f"Task: {name}\nOutcome: {classification}\n\n{summary}\n\n"
+                f"--- report ---\n{report}\n\n--- transcript ---\n"
+                + "\n\n".join(transcript)[:4000]
+                + "\n\n(Lodge Office → Tasks for full detail)")
+        ok, _ = await send_reply_email(
+            OWNER_EMAIL, f"[task] {name} — {classification}", body,
+            f"task-run-{run_id}")
+        await _run_email_log(OWNER_EMAIL, ok, "task report",
+                             kind="task-report",
+                             subject=f"[task] {name} — {classification}",
+                             body=body)
+
+    def finish():
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "UPDATE task_runs SET status=%s, classification=%s, "
+                "summary=%s, report=%s, finished_at=now() WHERE id=%s",
+                (classification, classification, summary, report, run_id))
+            interval = {"hourly": "1 hour", "daily": "1 day",
+                        "weekly": "7 days"}.get(
+                _task_schedule(task_id), None)
+            conn.execute(
+                "UPDATE tasks SET run_now=FALSE, last_run_at=now(), "
+                "next_run_at=" + ("now() + interval '" + interval + "'"
+                                  if interval else "NULL") +
+                " WHERE id=%s", (task_id,))
+    await _run(finish)
+    print(f"[tasks] '{name}' run {run_id}: {classification}")
+
+
+def _task_schedule(task_id: int) -> str:
+    with psycopg.connect(DATABASE_URL) as conn:
+        row = conn.execute("SELECT schedule FROM tasks WHERE id=%s",
+                           (task_id,)).fetchone()
+    return row[0] if row else "manual"
+
+
+async def run_due_tasks() -> None:
+    if not DATABASE_URL:
+        return
+
+    def due():
+        with psycopg.connect(DATABASE_URL) as conn:
+            return [r[0] for r in conn.execute(
+                "SELECT id FROM tasks WHERE enabled AND (run_now OR "
+                "(next_run_at IS NOT NULL AND next_run_at <= now())) "
+                "ORDER BY id").fetchall()]
+    for tid in await _run(due):
+        try:
+            await execute_task(tid)
+        except Exception as e:
+            print(f"[tasks] task {tid} crashed: {e!r}")
+            try:
+
+                def mark(tid=tid):
+                    with psycopg.connect(DATABASE_URL) as conn:
+                        conn.execute(
+                            "UPDATE tasks SET run_now=FALSE, last_run_at="
+                            "now() WHERE id=%s", (tid,))
+                await _run(mark)
+            except Exception:
+                pass
+
+
+async def _task_loop() -> None:
+    while True:
+        try:
+            await run_due_tasks()
+        except Exception as e:
+            print(f"[tasks] loop error: {e!r}")
+        await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def start_task_runner() -> None:
+    if not DATABASE_URL or os.environ.get("RUN_TASKS") == "0":
+        return
+    # keep the tools registry visible to the Lodge Office
+    def sync_tools():
+        with psycopg.connect(DATABASE_URL) as conn:
+            for name, d in TOOLS.items():
+                conn.execute(
+                    "INSERT INTO tools (name, description, kind) "
+                    "VALUES (%s, %s, 'builtin') "
+                    "ON CONFLICT (name) DO UPDATE SET description=%s",
+                    (name, d["description"], d["description"]))
+    try:
+        await _run(sync_tools)
+    except Exception as e:
+        print(f"[tasks] tool sync failed: {e!r}")
+    asyncio.create_task(_task_loop())
+
+
+@app.get("/api/admin/tasks/run")
+async def admin_run_tasks(request: Request):
+    _require_review_key(request)
+    await run_due_tasks()
+    return {"ok": True}
 
 
 @app.get("/api/admin/reviews")

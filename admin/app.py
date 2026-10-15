@@ -129,6 +129,54 @@ async def _init() -> None:
                          "ADD COLUMN IF NOT EXISTS body TEXT DEFAULT ''")
             conn.execute("ALTER TABLE chat_sessions "
                          "ADD COLUMN IF NOT EXISTS last_topic TEXT")
+            conn.execute("""CREATE TABLE IF NOT EXISTS tasks (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                goal TEXT NOT NULL DEFAULT '',
+                success_criteria TEXT DEFAULT '',
+                inputs TEXT DEFAULT '',
+                schedule TEXT DEFAULT 'manual',
+                notify BOOLEAN DEFAULT TRUE,
+                enabled BOOLEAN DEFAULT TRUE,
+                run_now BOOLEAN DEFAULT FALSE,
+                next_run_at TIMESTAMPTZ,
+                last_run_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS task_runs (
+                id BIGSERIAL PRIMARY KEY,
+                task_id BIGINT NOT NULL,
+                status TEXT DEFAULT 'running',
+                classification TEXT DEFAULT '',
+                summary TEXT DEFAULT '',
+                report TEXT DEFAULT '',
+                started_at TIMESTAMPTZ DEFAULT now(),
+                finished_at TIMESTAMPTZ
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS task_steps (
+                id BIGSERIAL PRIMARY KEY,
+                run_id BIGINT NOT NULL,
+                seq INT DEFAULT 0,
+                tool TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                input TEXT DEFAULT '',
+                output TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS tools (
+                name TEXT PRIMARY KEY,
+                description TEXT DEFAULT '',
+                kind TEXT DEFAULT 'builtin',
+                enabled BOOLEAN DEFAULT TRUE
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS tool_proposals (
+                id BIGSERIAL PRIMARY KEY,
+                capability TEXT NOT NULL,
+                context TEXT DEFAULT '',
+                status TEXT DEFAULT 'open',
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
     await _run(run)
 
 
@@ -156,8 +204,8 @@ NAV = [("/", "Dashboard"), ("/conversations", "Conversations"),
        ("/reviews", "Reviews"), ("/inbox", "Inbox"), ("/leads", "Leads"),
        ("/licenses", "Licenses"), ("/kb", "Knowledge"),
        ("/analytics", "Analytics"), ("/contacts", "Contacts"),
-       ("/compose", "Compose"), ("/emails", "Emails"),
-       ("/gateway", "Gateway")]
+       ("/compose", "Compose"), ("/emails", "Emails"), ("/tasks", "Tasks"),
+       ("/tools", "Tools"), ("/gateway", "Gateway")]
 
 CSS = """
 :root { --ink:#0e1411; --ink2:#121a15; --surface:#1a241d; --line:#2c3a30;
@@ -1644,6 +1692,289 @@ async def email_view(request: Request, id: int = 0):
 <a class="btn" href="/compose?to={_e(to)}&ref={_e(subject)}">Compose follow-up</a>
 <a class="btn ghost" href="/emails">back to log</a></div>"""
     return page(request, "Email · sent", body)
+
+
+# ── tasks (the agent's jobs) ───────────────────────────────────────────────
+
+
+@app.get("/tasks", response_class=HTMLResponse)
+async def tasks(request: Request, flash: str = ""):
+    if (r := _guard(request)):
+        return r
+    rows = await _q(
+        "SELECT t.id, t.name, t.schedule, t.enabled, t.run_now, "
+        "t.last_run_at, t.next_run_at, "
+        "(SELECT classification FROM task_runs r WHERE r.task_id=t.id "
+        "ORDER BY r.id DESC LIMIT 1) AS last_class "
+        "FROM tasks t ORDER BY t.id")
+    tagmap = {"achieved": "ok", "partial": "warn", "failed": "bad",
+              "review": "", "running": "warn"}
+    trs = "".join(
+        f"<tr><td>{_e(n)}</td><td><span class='tag'>{_e(s)}</span></td>"
+        f"<td>{'<span class=tag ok>on</span>' if en else '<span class=tag>off</span>'}</td>"
+        f"<td>{'<span class=tag warn>queued</span>' if rn else ''}</td>"
+        f"<td>{'<span class=tag ' + tagmap.get(lc or '', '') + '>' + _e(lc or '—') + '</span>' if lc else '—'}</td>"
+        f"<td class='note'>{str(la)[:16] if la else '—'}</td>"
+        f"<td class='note'>{str(nr)[:16] if nr else '—'}</td>"
+        f"<td><a class='btn ghost' style='padding:.15rem .5rem;font-size:.7rem'"
+        f" href='/tasks/run?id={i}'>runs</a> "
+        f"<a class='btn ghost' style='padding:.15rem .5rem;font-size:.7rem'"
+        f" href='/tasks/edit?id={i}'>edit</a> "
+        f"<a class='btn' style='padding:.15rem .5rem;font-size:.7rem'"
+        f" href='/tasks/now?id={i}'>run now</a></td></tr>"
+        for i, n, s, en, rn, la, nr, lc in rows)
+
+    proposals = await _q(
+        "SELECT id, capability, context, status, created_at "
+        "FROM tool_proposals ORDER BY status='open' DESC, id DESC LIMIT 20")
+    props = "".join(
+        f"<tr><td class='pill'>{_e(cap)}</td>"
+        f"<td class='note' style='max-width:360px'>{_e(ctx[:140])}</td>"
+        f"<td>{'<span class=tag warn>' + _e(st) + '</span>' if st == 'open' else '<span class=tag>' + _e(st) + '</span>'}</td>"
+        f"<td class='note'>{str(at)[:16]}</td>"
+        + (f"<td><a class='btn ghost' style='padding:.15rem .5rem;"
+           f"font-size:.7rem' href='/tools/approve?id={pid}'>approve</a> "
+           f"<a class='btn ghost' style='padding:.15rem .5rem;"
+           f"font-size:.7rem' href='/tools/dismiss?id={pid}'>dismiss</a>"
+           f"</td>" if st == "open" else "<td></td>")
+        + "</tr>"
+        for pid, cap, ctx, st, at in proposals)
+
+    body = f"""
+<p class="note" style="margin-bottom:1.2rem">Tasks the Gatekeeper runs on
+its own: set a goal and success criteria, pick a schedule — the agent
+plans, uses tools, and a separate review pass grades the outcome.</p>
+<div class="inline" style="margin-bottom:1rem">
+<a class="btn" href="/tasks/edit">New task</a>
+<a class="btn ghost" href="/tools">Tool registry</a></div>
+<table><tr><th>task</th><th>schedule</th><th>on</th><th>queued</th>
+<th>last outcome</th><th>last run</th><th>next run</th><th></th></tr>
+{trs or '<tr><td colspan=8 class=note>no tasks yet</td></tr>'}</table>
+<h1 style="font-size:1.2rem">Tool proposals
+<span class="note">— capabilities the agent wanted but doesn't have</span></h1>
+<table><tr><th>capability</th><th>context</th><th>status</th><th>at</th>
+<th></th></tr>
+{props or '<tr><td colspan=5 class=note>none — the agent has not asked '
+'for new tools yet</td></tr>'}</table>"""
+    return page(request, "Tasks", body, flash=flash)
+
+
+@app.get("/tasks/edit", response_class=HTMLResponse)
+async def tasks_edit(request: Request, id: int = 0):
+    if (r := _guard(request)):
+        return r
+    row = None
+    if id:
+        row = await _q("SELECT name, goal, success_criteria, inputs, "
+                       "schedule, notify, enabled FROM tasks WHERE id=%s",
+                       (id,), fetch="one")
+    n, g, sc, inp, sch, nt, en = row if row else (
+        "", "", "", "", "manual", True, True)
+    opts = "".join(
+        f'<option value="{v}"{" selected" if v == sch else ""}>{v}</option>'
+        for v in ("manual", "hourly", "daily", "weekly"))
+    body = f"""
+<form method="post" action="/tasks/save">
+<input type="hidden" name="id" value="{id}">
+<div class="grid2">
+<div>
+<p class="note">name</p>
+<input type="text" name="name" value="{_e(n)}" required style="width:100%">
+<p class="note" style="margin-top:.6rem">schedule</p>
+<select name="schedule" style="width:100%">{opts}</select>
+<p class="note" style="margin-top:.6rem">
+<label><input type="checkbox" name="notify" value="1"
+{'checked' if nt else ''}> email me the report after each run</label></p>
+<p class="note" style="margin-top:.4rem">
+<label><input type="checkbox" name="enabled" value="1"
+{'checked' if en else ''}> enabled</label></p>
+</div>
+<div>
+<p class="note">goal / objective / outcome</p>
+<textarea name="goal" style="min-height:90px" required>{_e(g)}</textarea>
+<p class="note" style="margin-top:.6rem">success criteria
+<span class="mono">(how the review judges it)</span></p>
+<textarea name="success_criteria"
+style="min-height:70px">{_e(sc)}</textarea>
+<p class="note" style="margin-top:.6rem">inputs / context / sources</p>
+<textarea name="inputs" style="min-height:70px">{_e(inp)}</textarea>
+</div></div>
+<div class="inline" style="margin-top:.8rem">
+<button class="btn">Save</button>
+<a class="btn ghost" href="/tasks">back</a>
+{f'<a class="btn ghost" href="/tasks/delete?id={id}" onclick="return confirm(\'delete task?\')">delete</a>' if id else ''}
+</div></form>"""
+    return page(request, "Tasks · " + ("edit" if row else "new"), body)
+
+
+@app.post("/tasks/save")
+async def tasks_save(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    tid = int(form.get("id", 0) or 0)
+    vals = (str(form.get("name", "")).strip()[:120],
+            str(form.get("goal", "")).strip()[:4000],
+            str(form.get("success_criteria", "")).strip()[:2000],
+            str(form.get("inputs", "")).strip()[:2000],
+            str(form.get("schedule", "manual")),
+            form.get("notify") == "1", form.get("enabled") == "1")
+    if tid:
+        await _x("UPDATE tasks SET name=%s, goal=%s, success_criteria=%s, "
+                 "inputs=%s, schedule=%s, notify=%s, enabled=%s WHERE id=%s",
+                 vals + (tid,))
+        await _audit("task-save", f"#{tid} {vals[0]}")
+    else:
+        await _x("INSERT INTO tasks (name, goal, success_criteria, inputs,"
+                 " schedule, notify, enabled) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                 vals)
+        await _audit("task-new", vals[0])
+    return RedirectResponse("/tasks?flash=saved", status_code=303)
+
+
+@app.get("/tasks/delete")
+async def tasks_delete(request: Request, id: int = 0):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    await _x("DELETE FROM tasks WHERE id=%s", (id,))
+    await _audit("task-delete", f"#{id}")
+    return RedirectResponse("/tasks?flash=deleted", status_code=303)
+
+
+@app.get("/tasks/now")
+async def tasks_now(request: Request, id: int = 0):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    await _x("UPDATE tasks SET run_now=TRUE WHERE id=%s", (id,))
+    await _audit("task-run-now", f"#{id}")
+    return RedirectResponse(
+        "/tasks?flash=queued+—+the+agent+picks+it+up+within+30+seconds",
+        status_code=303)
+
+
+@app.get("/tasks/run", response_class=HTMLResponse)
+async def tasks_runs(request: Request, id: int = 0):
+    if (r := _guard(request)):
+        return r
+    t = await _q("SELECT name FROM tasks WHERE id=%s", (id,), fetch="one")
+    rows = await _q(
+        "SELECT id, status, classification, summary, started_at, "
+        "finished_at FROM task_runs WHERE task_id=%s ORDER BY id DESC "
+        "LIMIT 50", (id,))
+    tagmap = {"achieved": "ok", "partial": "warn", "failed": "bad",
+              "running": "warn"}
+    trs = "".join(
+        f"<tr><td class='pill'>#{i}</td>"
+        f"<td>{'<span class=tag ' + tagmap.get(cl or '', '') + '>' + _e(cl or st) + '</span>'}</td>"
+        f"<td style='max-width:420px'>{_e(su[:180])}</td>"
+        f"<td class='note'>{str(sa)[:16]}</td>"
+        f"<td><a class='btn ghost' style='padding:.15rem .5rem;"
+        f"font-size:.7rem' href='/tasks/runview?id={i}'>view</a></td></tr>"
+        for i, st, cl, su, sa, fi in rows)
+    body = f"""
+<p class="note" style="margin-bottom:1rem">Task: <b>{_e(t[0] if t else '?')}</b></p>
+<table><tr><th>run</th><th>outcome</th><th>summary</th><th>started</th>
+<th></th></tr>
+{trs or '<tr><td colspan=5 class=note>no runs yet</td></tr>'}</table>"""
+    return page(request, "Task runs", body)
+
+
+@app.get("/tasks/runview", response_class=HTMLResponse)
+async def tasks_runview(request: Request, id: int = 0):
+    if (r := _guard(request)):
+        return r
+    run = await _q(
+        "SELECT r.task_id, t.name, r.status, r.classification, r.summary, "
+        "r.report, r.started_at, r.finished_at FROM task_runs r "
+        "JOIN tasks t ON t.id=r.task_id WHERE r.id=%s", (id,), fetch="one")
+    if not run:
+        return RedirectResponse("/tasks?flash=run+not+found",
+                                status_code=303)
+    tid, tname, st, cl, su, report, sa, fi = run
+    steps = await _q(
+        "SELECT seq, tool, description, input, output, status "
+        "FROM task_steps WHERE run_id=%s ORDER BY seq", (id,))
+    step_html = ""
+    for seq, tool, de, inp, out, stat in steps:
+        # drafts → one-click compose
+        if tool == "email_draft" and out.startswith("DRAFT"):
+            lines = out.split("\n")
+            to = lines[1].replace("To: ", "") if len(lines) > 1 else ""
+            subj = (lines[2].replace("Subject: ", "")
+                    if len(lines) > 2 else "")
+            out += (f'\n<p><a class="btn" style="padding:.15rem .5rem;'
+                    f'font-size:.7rem" href="/compose?to={_e(to)}'
+                    f'&ref={_e(subj)}">Send this draft →</a></p>')
+        stat_tag = ("<span class=tag ok>ok</span>" if stat == "ok" else
+                    f"<span class=tag bad>{_e(stat)}</span>")
+        step_html += f"""
+<div class="box">
+<p><b>Step {seq + 1}</b> — <span class="pill">{_e(tool)}</span> {stat_tag}
+<span class="note">{_e(de)}</span></p>
+<p class="note" style="white-space:pre-wrap">{_e(inp[:400])}</p>
+<div class="view-body" style="font-size:.8rem">{_e(out[:2500])}</div>
+</div>"""
+    body = f"""
+<div class="inline" style="margin-bottom:1rem">
+<span class="tag">{_e(cl or st)}</span>
+<span class="mono note">{_e(tname)} · run #{id} · {str(sa)[:16]}</span></div>
+<h1 style="font-size:1.2rem">Review</h1>
+<div class="view-body">{_e(su or '(no summary)')}</div>
+<h1 style="font-size:1.2rem;margin-top:1.2rem">Report</h1>
+<div class="view-body">{_e(report or '(no report)')}</div>
+<h1 style="font-size:1.2rem;margin-top:1.2rem">Steps</h1>
+{step_html or '<p class="note">no steps recorded</p>'}
+<div class="inline" style="margin-top:1rem">
+<a class="btn ghost" href="/tasks/run?id={tid}">back to runs</a></div>"""
+    return page(request, "Task run", body)
+
+
+# ── tools (the agent's hands) ──────────────────────────────────────────────
+
+
+@app.get("/tools", response_class=HTMLResponse)
+async def tools(request: Request, flash: str = ""):
+    if (r := _guard(request)):
+        return r
+    rows = await _q("SELECT name, description, kind, enabled FROM tools "
+                    "ORDER BY kind, name")
+    trs = "".join(
+        f"<tr><td class='pill'>{_e(n)}</td>"
+        f"<td style='max-width:460px'>{_e(d)}</td>"
+        f"<td><span class='tag'>{_e(k)}</span></td>"
+        f"<td>{'<span class=tag ok>on</span>' if en else '<span class=tag>off</span>'}</td></tr>"
+        for n, d, k, en in rows)
+    body = f"""
+<p class="note" style="margin-bottom:1.2rem">The capabilities the task
+agent can call. Builtin tools ship with the Gatekeeper; MCP tools can be
+registered through the gateway. When the agent needs something missing,
+it files a proposal on the Tasks screen.</p>
+<table><tr><th>tool</th><th>description</th><th>kind</th><th>state</th>
+</tr>
+{trs or '<tr><td colspan=4 class=note>registry empty — the gatekeeper '
+'syncs its builtin tools at startup</td></tr>'}</table>"""
+    return page(request, "Tools", body, flash=flash)
+
+
+@app.get("/tools/approve")
+async def tools_approve(request: Request, id: int = 0):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    await _x("UPDATE tool_proposals SET status='approved' WHERE id=%s",
+             (id,))
+    await _audit("tool-approve", f"#{id}")
+    return RedirectResponse("/tasks?flash=approved+—+backlog+for+the"
+                            "+next+build", status_code=303)
+
+
+@app.get("/tools/dismiss")
+async def tools_dismiss(request: Request, id: int = 0):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    await _x("UPDATE tool_proposals SET status='dismissed' WHERE id=%s",
+             (id,))
+    await _audit("tool-dismiss", f"#{id}")
+    return RedirectResponse("/tasks", status_code=303)
 
 
 @app.get("/gateway", response_class=HTMLResponse)

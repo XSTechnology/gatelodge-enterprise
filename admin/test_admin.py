@@ -495,7 +495,60 @@ with TestClient(app.app) as client:
                       (cid,)).fetchone()[0]
     check("contact delete", r.status_code == 303 and v == 0)
 
-    # 15. logout clears
+    # 15. tasks + tools screens
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        c.execute("TRUNCATE tasks, task_runs, task_steps, tools, "
+                  "tool_proposals RESTART IDENTITY")
+        c.execute("INSERT INTO tasks (name, goal, success_criteria, "
+                  "inputs, schedule) VALUES ('sweep', 'find gaps', "
+                  "'draft or report', 'gap_cluster', 'daily')")
+        c.execute("INSERT INTO task_runs (task_id, status, "
+                  "classification, summary, report) VALUES "
+                  "(1, 'achieved', 'achieved', 'did it', 'report text')")
+        c.execute("INSERT INTO task_steps (run_id, seq, tool, "
+                  "description, input, output, status) VALUES "
+                  "(1, 0, 'db_query', 'count', 'SELECT 1', "
+                  "'DRAFT RECORDED fake', 'ok')")
+        c.execute("INSERT INTO tools (name, description, kind) VALUES "
+                  "('db_query', 'read-only sql', 'builtin')")
+        c.execute("INSERT INTO tool_proposals (capability, context) "
+                  "VALUES ('send_sms', 'wanted during sweep')")
+    r = client.get("/tasks")
+    check("tasks screen renders", r.status_code == 200
+          and "sweep" in r.text and "daily" in r.text
+          and "send_sms" in r.text)
+    r = client.get("/tasks/edit", params={"id": 1})
+    check("task edit form", r.status_code == 200
+          and "find gaps" in r.text and "draft or report" in r.text)
+    r = client.post("/tasks/save", data={
+        "id": "1", "name": "sweep2", "goal": "find gaps faster",
+        "success_criteria": "x", "inputs": "y", "schedule": "weekly",
+        "notify": "1", "enabled": "1"}, follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT name, schedule FROM tasks WHERE id=1"
+                      ).fetchone()
+    check("task edit saves", r.status_code == 303
+          and v == ("sweep2", "weekly"), str(v))
+    r = client.get("/tasks/now", params={"id": 1}, follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT run_now FROM tasks WHERE id=1").fetchone()
+    check("run-now queues", r.status_code == 303 and v[0] is True)
+    r = client.get("/tasks/run", params={"id": 1})
+    check("task runs list", r.status_code == 200 and "did it" in r.text)
+    r = client.get("/tasks/runview", params={"id": 1})
+    check("run viewer with steps", r.status_code == 200
+          and "report text" in r.text and "db_query" in r.text)
+    r = client.get("/tools")
+    check("tools registry renders", r.status_code == 200
+          and "db_query" in r.text and "builtin" in r.text)
+    r = client.get("/tools/approve", params={"id": 1},
+                   follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT status FROM tool_proposals WHERE id=1"
+                      ).fetchone()
+    check("proposal approve", r.status_code == 303 and v[0] == "approved")
+
+    # 16. logout clears
     client.get("/logout")
     r = client.get("/", follow_redirects=False)
     check("logout clears session", r.status_code == 303)

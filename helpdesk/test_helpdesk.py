@@ -33,6 +33,12 @@ from fastapi.responses import StreamingResponse           # noqa: E402
 mock = FastAPI()
 MODE = {"triage": "confident"}
 CAPTURE = []          # answer-model request bodies (prompt assertions)
+TASKSCRIPT = []       # queued task-agent turns (plan/execute/review)
+
+
+@mock.get("/healthz")
+async def mock_healthz():
+    return {"ok": True}
 
 
 @mock.post("/v1/chat/completions")
@@ -42,6 +48,13 @@ async def completions(request: Request):
     if model == "answer":
         CAPTURE.append(body)
     if model == "triage":
+        # task-agent turns come from a scripted queue
+        if "task agent" in body["messages"][0]["content"]:
+            if TASKSCRIPT:
+                d = TASKSCRIPT.pop(0)
+            else:
+                d = {"done": True, "report": "(script exhausted)"}
+            return {"choices": [{"message": {"content": json.dumps(d)}}]}
         # pick the first candidates the retrieval stage actually offered
         ids = re.findall(r"\[(\d+)\] doc=",
                          body["messages"][0]["content"])
@@ -57,7 +70,12 @@ async def completions(request: Request):
         return {"choices": [{"message": {"content": json.dumps(d)}}]}
 
     if not body.get("stream"):
-        # non-streaming answer (inbound email path)
+        # non-streaming answer (inbound email path) / task review pass
+        sys = body["messages"][0]["content"]
+        if "review a completed agent task" in sys:
+            return {"choices": [{"message": {"content": json.dumps(
+                {"classification": "achieved",
+                 "summary": "All steps ran; goal met."})}}]}
         return {"choices": [{"message": {
             "content": "Gatelodge is a self-hosted AI gateway."}}]}
 
@@ -89,9 +107,40 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
         handled_at TIMESTAMPTZ)""")
     c.execute("ALTER TABLE chat_sessions "
               "ADD COLUMN IF NOT EXISTS last_topic TEXT")
+    c.execute("""CREATE TABLE IF NOT EXISTS tasks (
+        id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL,
+        goal TEXT NOT NULL DEFAULT '', success_criteria TEXT DEFAULT '',
+        inputs TEXT DEFAULT '', schedule TEXT DEFAULT 'manual',
+        notify BOOLEAN DEFAULT TRUE, enabled BOOLEAN DEFAULT TRUE,
+        run_now BOOLEAN DEFAULT FALSE, next_run_at TIMESTAMPTZ,
+        last_run_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS task_runs (
+        id BIGSERIAL PRIMARY KEY, task_id BIGINT NOT NULL,
+        status TEXT DEFAULT 'running', classification TEXT DEFAULT '',
+        summary TEXT DEFAULT '', report TEXT DEFAULT '',
+        started_at TIMESTAMPTZ DEFAULT now(), finished_at TIMESTAMPTZ)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS task_steps (
+        id BIGSERIAL PRIMARY KEY, run_id BIGINT NOT NULL,
+        seq INT DEFAULT 0, tool TEXT DEFAULT '',
+        description TEXT DEFAULT '', input TEXT DEFAULT '',
+        output TEXT DEFAULT '', status TEXT DEFAULT 'ok',
+        created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS tools (
+        name TEXT PRIMARY KEY, description TEXT DEFAULT '',
+        kind TEXT DEFAULT 'builtin', enabled BOOLEAN DEFAULT TRUE)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS tool_proposals (
+        id BIGSERIAL PRIMARY KEY, capability TEXT NOT NULL,
+        context TEXT DEFAULT '', status TEXT DEFAULT 'open',
+        created_at TIMESTAMPTZ DEFAULT now())""")
     c.execute("TRUNCATE inbound_emails")
+    c.execute("TRUNCATE tasks, task_runs, task_steps, tool_proposals "
+              "RESTART IDENTITY")
+    c.execute("INSERT INTO tasks (name, goal, success_criteria, inputs) "
+              "VALUES ('test task', 'Count the inbound emails', "
+              "'A number is reported.', 'inbound_emails table')")
 
 os.environ.setdefault("INBOUND_KEY", "inbound-test-key")
+os.environ.setdefault("RUN_TASKS", "0")     # engine tested explicitly
 
 import app                                                 # noqa: E402
 from fastapi.testclient import TestClient                  # noqa: E402
@@ -401,6 +450,83 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
 check("inbound contact captured", ct and ct[0] == "inbound"
       and ct[1] >= 2, str(ct))
 check("raw-MIME contact captured", cr and cr[0] == "inbound", str(cr))
+
+# 16. task engine — tools + full run (scripted agent turns)
+check("tools registered", set(app.TOOLS) >= {
+    "db_query", "kb_search", "kb_write", "email_draft", "email_send",
+    "web_fetch", "gap_cluster", "report"}, str(sorted(app.TOOLS)))
+
+import asyncio as _a
+
+
+async def _tool(name, inp):
+    return await app.TOOLS[name]["fn"](inp)
+
+q = _a.run(_tool("db_query", "SELECT COUNT(*) AS n FROM inbound_emails"))
+check("db_query works", "n" in q and any(ch.isdigit() for ch in q), q[:80])
+q = _a.run(_tool("db_query", "DELETE FROM inbound_emails"))
+check("db_query blocks non-SELECT", "only SELECT" in q, q[:80])
+q = _a.run(_tool("kb_search", "what happens when the trial ends"))
+check("kb_search finds faq", "faq" in q.lower(), q[:80])
+q = _a.run(_tool("kb_write", json.dumps({
+    "name": "task-test-doc", "title": "Task Test",
+    "description": "written by the task engine test",
+    "content": "## Section\n\nSome content."})))
+check("kb_write saves", "saved" in q.lower(), q[:80])
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    v = c.execute("SELECT content FROM kb_overrides WHERE "
+                  "name='task-test-doc'").fetchone()
+check("kb_write doc live", v is not None and "Task Test" in v[0])
+q = _a.run(_tool("email_draft", json.dumps({
+    "to": "x@y.co", "subject": "s", "body": "b"})))
+check("email_draft records (no send)", "DRAFT RECORDED" in q, q[:80])
+q = _a.run(_tool("web_fetch", "http://127.0.0.1:8435/healthz"))
+check("web_fetch works", "200" in q, q[:80])
+
+# full engine run: 2 tool turns then done; review classifies achieved
+TASKSCRIPT[:] = [
+    {"tool": "db_query",
+     "input": "SELECT COUNT(*) AS n FROM inbound_emails",
+     "description": "count inbound"},
+    {"tool": "report",
+     "input": "There are inbound emails; task complete.",
+     "description": "report"},
+    {"done": True, "report": "Counted the inbound emails."},
+]
+_a.run(app.execute_task(1))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    run = c.execute("SELECT status, classification, summary, report FROM "
+                    "task_runs ORDER BY id DESC LIMIT 1").fetchone()
+    steps = c.execute("SELECT tool, status FROM task_steps ORDER BY "
+                      "seq").fetchall()
+    task = c.execute("SELECT run_now, last_run_at FROM tasks WHERE "
+                     "id=1").fetchone()
+check("engine run recorded", run is not None
+      and run[0] == "achieved" and run[1] == "achieved"
+      and "All steps ran" in run[2] and "Counted" in run[3], str(run))
+check("engine steps recorded", steps and steps[0][0] == "db_query"
+      and steps[0][1] == "ok" and steps[1][0] == "report", str(steps))
+check("engine clears run flag", task and task[0] is False
+      and task[1] is not None, str(task))
+
+# blocked tool -> proposal
+TASKSCRIPT[:] = [{"tool": "send_sms",
+                  "input": "text the owner",
+                  "description": "notify by sms"},
+                 {"done": True, "report": "Could not send SMS."}]
+_a.run(app.execute_task(1))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    prop = c.execute("SELECT capability, status FROM tool_proposals "
+                     "ORDER BY id DESC LIMIT 1").fetchone()
+    blk = c.execute("SELECT status FROM task_steps WHERE tool='send_sms'"
+                    " ORDER BY id DESC LIMIT 1").fetchone()
+check("missing tool files a proposal",
+      prop and prop[0] == "send_sms" and prop[1] == "open", str(prop))
+check("missing tool step marked blocked",
+      blk and blk[0] == "blocked", str(blk))
+
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM kb_overrides WHERE name='task-test-doc'")
 
 print()
 if fails:
