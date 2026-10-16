@@ -216,12 +216,13 @@ with TestClient(app.app) as client:
     check("token events", len(toks) == 4, str(toks))
     check("answer text", "".join(toks) ==
           "Gatelodge is a self-hosted AI gateway.", str(toks))
-    check("done event", "done" in kinds and done.get("doc") == "presales",
+    check("done event", "done" in kinds
+          and done.get("doc") in ("presales", "comparison"),
           str(evs))
     check("done carries sources",
           isinstance(done.get("sources"), list)
           and done["sources"]
-          and done["sources"][0]["doc"] == "presales"
+          and done["sources"][0]["doc"] in ("presales", "comparison")
           and done["sources"][0].get("section"), str(done))
     check("no escalate", "escalate" not in kinds)
     ans_req = next((b for b in CAPTURE if b.get("model") == "answer"), None)
@@ -350,7 +351,8 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
                      (sid,)).fetchall()
 check("user+assistant stored",
       any(r[0] == "user" for r in rows)
-      and any(r[0] == "assistant" and r[1] and r[2] == "presales"
+      and any(r[0] == "assistant" and r[1]
+              and r[2] in ("presales", "comparison")
               for r in rows), str(rows))
 
 # 11. KB override merge: existing names patched, NEW names ADDED to the
@@ -395,8 +397,9 @@ check("chunks carry doc+section",
       all("doc" in c and "section" in c and "text" in c for c in chunks))
 idf = app._build_index(chunks)
 top = app._search("what is gatelodge", chunks, idf)
-check("retrieval: what-is -> presales",
-      bool(top) and top[0]["doc"] == "presales",
+check("retrieval: what-is -> presales/comparison",
+      bool(top) and any(c["doc"] in ("presales", "comparison")
+                        for c in top[:2]),
       str([(c["doc"], c["section"]) for c in top[:3]]))
 top = app._search("what happens when the trial ends", chunks, idf)
 check("retrieval: trial-end -> faq chunk",
@@ -454,9 +457,36 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
     c.execute("DELETE FROM kb_intent")
 _, cands2 = app._retrieve("what is gatelodge")
 check("fallback: content matching without intent map",
-      bool(cands2) and cands2[0]["doc"] == "presales"
+      bool(cands2) and any(c["doc"] == "presales" for c in cands2[:3])
       and not cands2[0].get("intent"),
       str([(c["doc"], c["section"]) for c in cands2[:3]]))
+
+# 12d. internal docs never reach retrieval (competitive/support playbooks)
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute(
+        "INSERT INTO kb_overrides (name, content) VALUES "
+        "('playbook-internal', %s) ON CONFLICT (name) DO UPDATE SET"
+        " content=%s",
+        ("# Playbook\ntitle: Playbook\ndescription: secrets of the "
+         "kingdom\ninternal: true\n\n## Pricing floor\n\nNever go below "
+         "$79.\n",) * 2)
+docs_internal = app._load_kb_overrides()
+check("internal doc excluded from catalog",
+      "playbook-internal" not in docs_internal, str(sorted(docs_internal))[:200])
+_, cands3 = app._retrieve("pricing floor secrets of the kingdom")
+check("internal content never retrieved",
+      not any(c["doc"] == "playbook-internal" for c in cands3),
+      str([(c["doc"], c["section"]) for c in cands3[:3]]))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM kb_overrides WHERE name='playbook-internal'")
+# built-in internal docs (competitive-internal, support-internal) also filtered
+check("built-in internal docs filtered",
+      "competitive-internal" not in docs_internal
+      and "support-internal" not in docs_internal,
+      str([n for n in docs_internal if "internal" in n]))
+check("public new docs present",
+      "evaluation" in docs_internal and "comparison" in docs_internal,
+      str(sorted(docs_internal)))
 
 # 13. inbound email agent
 IH = {"Authorization": "Bearer inbound-test-key"}

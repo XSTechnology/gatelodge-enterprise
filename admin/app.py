@@ -731,6 +731,10 @@ def _kb_dir():
     return pathlib.Path(__file__).resolve().parent / "kb"
 
 
+def _kb_is_internal(content: str) -> bool:
+    return bool(re.search(r"^internal:\s*true\s*$", content, re.M | re.I))
+
+
 def _parse_doc(content: str) -> tuple[str, str, str]:
     """Split a KB doc into (title, description, body).
 
@@ -738,6 +742,7 @@ def _parse_doc(content: str) -> tuple[str, str, str]:
         # Title
         title: …
         description: …
+        [internal: true]      <- staff-only, never served to customers
         <markdown body>
     Tolerant: if the header lines are missing, everything is body.
     """
@@ -752,6 +757,9 @@ def _parse_doc(content: str) -> tuple[str, str, str]:
         m = re.match(r"^description:\s*(.+)$", s)
         if m and not desc:
             desc, last = m.group(1).strip(), i
+            continue
+        if re.match(r"^internal:\s*true\s*$", s, re.I):
+            last = i
     if last < 0:
         return "", "", content.strip("\n")
     body = "\n".join(lines[last + 1:]).strip("\n")
@@ -760,9 +768,11 @@ def _parse_doc(content: str) -> tuple[str, str, str]:
     return title, desc, body
 
 
-def _assemble_doc(title: str, description: str, body: str) -> str:
-    return (f"# {title}\ntitle: {title}\ndescription: {description}\n\n"
-            + body.strip("\n") + "\n")
+def _assemble_doc(title: str, description: str, body: str,
+                  internal: bool = False) -> str:
+    return (f"# {title}\ntitle: {title}\ndescription: {description}\n"
+            + ("internal: true\n" if internal else "")
+            + "\n" + body.strip("\n") + "\n")
 
 
 # ── knowledge gaps (v2): cluster the questions that went to the team ─────
@@ -871,6 +881,11 @@ async def kb_index(request: Request, flash: str = ""):
     for n in base:
         state = ('<span class="tag warn">live-edited</span>' if n in over
                  else '<span class="tag ok">built-in</span>')
+        iv = _kb_is_internal((_kb_dir() / f"{n}.md").read_text(
+            encoding="utf-8"))
+        if iv:
+            state += ' <span class="tag bad" title="staff-only — the ' \
+                     'Gatekeeper never serves this">internal</span>'
         nq = iq.get(n)
         intent = (f"<span class='tag' title='pre-analyzed questions'>"
                   f"answers {nq} questions</span>" if nq
@@ -1065,6 +1080,11 @@ async def kb_edit(request: Request, name: str = "", flash: str = ""):
         content = p.read_text(encoding="utf-8")
     title, desc, body = _parse_doc(content)
     builtin = (_kb_dir() / f"{name}.md").exists()
+    internal = _kb_is_internal(content)
+    internal_badge = ('<p style="margin:.2rem 0 .6rem"><span class="tag bad"'
+                      ' title="staff-only — the Gatekeeper never serves '
+                      'this to customers">internal — staff only, never '
+                      'served to customers</span></p>') if internal else ""
     # pre-analyzed intent map: what the Gatekeeper believes this doc
     # answers — reviewable, refreshable
     imap = await _q("SELECT section, questions, summary FROM kb_intent "
@@ -1100,6 +1120,7 @@ re-analyze to refresh it</span></div>"""
               f" onclick=\"return confirm('remove {name}?')\""
               f">remove document</a>")
     body_form = f"""
+{internal_badge}
 <form method="post" action="/kb/save">
 <input type="hidden" name="name" value="{_e(name)}">
 <div class="grid2">
@@ -1153,11 +1174,20 @@ async def kb_save(request: Request):
         return RedirectResponse(
             f"/kb/edit?name={_e(name)}&flash=title,+description+and"
             f"+content+are+all+required", status_code=303)
-    doc = _assemble_doc(title, description, content)
+    # internal docs stay internal across edits — publishing one is a
+    # deliberate git-level change, never a form slip
+    cur = await _q("SELECT content FROM kb_overrides WHERE name=%s",
+                  (name,), fetch="one")
+    if not cur:
+        p = _kb_dir() / f"{name}.md"
+        cur = (p.read_text(encoding="utf-8"),) if p.exists() else None
+    internal = bool(cur and _kb_is_internal(cur[0]))
+    doc = _assemble_doc(title, description, content, internal=internal)
     await _x("INSERT INTO kb_overrides (name, content) VALUES (%s, %s) "
              "ON CONFLICT (name) DO UPDATE SET content=%s, "
              "updated_at=now()", (name, doc, doc))
-    await _audit("kb-save", f"{name} ({len(doc)} chars)")
+    await _audit("kb-save", f"{name} ({len(doc)} chars)"
+                 + (" [internal]" if internal else ""))
     # the Gatekeeper re-analyzes what this doc answers (background)
     asyncio.create_task(_request_reanalyze(name))
     return RedirectResponse(

@@ -88,10 +88,20 @@ app.add_middleware(
 KB_DIR = Path(__file__).resolve().parent / "kb"
 
 
+def _is_internal(content: str) -> bool:
+    """Docs marked `internal: true` are staff-only (competitive and
+    support playbooks). They never join the retrieval catalog, never
+    get intent-analyzed, and are never served to customers — the Lodge
+    Office shows them with a badge instead."""
+    return bool(re.search(r"^internal:\s*true\s*$", content, re.M | re.I))
+
+
 def _load_kb() -> dict[str, dict]:
     docs = {}
     for p in sorted(KB_DIR.glob("*.md")):
         text = p.read_text(encoding="utf-8")
+        if _is_internal(text):
+            continue
         title = re.search(r"^title:\s*(.+)$", text, re.M)
         desc = re.search(r"^description:\s*(.+)$", text, re.M)
         docs[p.stem] = {
@@ -251,6 +261,9 @@ def _load_kb_overrides() -> dict:
     except Exception:
         return docs
     for name, content in rows:
+        if _is_internal(content):
+            # a saved edit that keeps the internal flag stays internal
+            continue
         title = re.search(r"^title:\s*(.+)$", content, re.M)
         desc = re.search(r"^description:\s*(.+)$", content, re.M)
         base = docs.get(name)
@@ -886,6 +899,9 @@ to earlier turns — judge them in conversation context). Calibrate:
 - confident=true ONLY when a passage clearly and fully answers it
 - vague, borderline, or partially-covered questions: confident=false
 - legal=true for requests to interpret the EULA/contract — always escalate
+- legal=true also for certification or compliance-status questions \
+(SOC 2, ISO, audit certifications), pricing negotiations or discounts, \
+and security incident reports — these always go to the team, never the AI
 - decision=true when the visitor asks for a RULING or eligibility — a \
 refund, approval, discount, exception, entitlement — rather than \
 information. Questions about what the policy IS are information \

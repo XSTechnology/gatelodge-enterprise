@@ -52,3 +52,54 @@ to an unknown model. The gateway cannot leak what it will not name.
 - Gateway keys: instant, from the console
 - Licenses: a certificate revocation list (CRL) ships with updates;
   revoked serials stop validating (hot-reloaded, no restart needed)
+
+## Shadow AI and the approved path
+
+Shadow AI — employees using unapproved AI services outside governance
+controls — is one of the fastest-growing enterprise risks: data leakage,
+compliance exposure, and spend nobody can see. You cannot audit what you
+do not control.
+
+Gatelodge creates the approved path: one governed endpoint with the
+models your organization has vetted, behind your identity provider, with
+budgets per team. When the approved path is easy, fast, and covers what
+people actually need, shadow usage stops being the path of least
+resistance. And because every request through the gateway is attributed
+to a user, a team, and a model, "who used which AI system with what
+data" becomes a query, not an investigation.
+
+## Credential centralization
+
+Without a gateway, every application and script carries its own provider
+API keys — distributed across environments, committed to repos, pasted
+into notebooks. Each copy is an exposure and a rotation chore.
+
+With Gatelodge, applications never hold provider credentials. They
+authenticate to the gateway with their own keys; the gateway holds the
+provider credentials centrally and applies them per policy. One place to
+rotate, one place to audit who could reach which provider, zero provider
+keys in your codebase.
+
+## The governance maturity model
+
+Organizations evolve through recognizable stages on the way to governed
+AI:
+
+- **Level 1 — Unmanaged:** direct provider usage by whoever signs up. No
+  oversight, no visibility.
+- **Level 2 — Inventory:** someone starts tracking which teams use which
+  AI services, usually in a spreadsheet.
+- **Level 3 — Controlled:** access controls, budgets, and an approved
+  provider list emerge — often unevenly enforced.
+- **Level 4 — Governed:** a central enforcement point manages AI
+  operations: identity, policy, budgets, and audit applied consistently
+  to every request.
+- **Level 5 — Optimized:** governance is measurable and continuously
+  improved — cost per workload, policy coverage, audit readiness on
+  demand.
+
+Most organizations today sit between Levels 1 and 3. Gatelodge is built
+to take an organization to Levels 4 and 5: the gateway is the
+enforcement point where identity, budget, provider policy, and audit
+intersect on every request — not as an afterthought bolted onto
+adoption, but as the front door it came through.
