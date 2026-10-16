@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[te-1] helpdesk: tasks/runs/steps/tools/proposals tables + tool registry (db_query, kb_search, kb_write, email_draft, email_send, web_fetch, gap_cluster, report)",
+    "id": "te-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[te-2] helpdesk: task engine — ReAct loop (plan/execute), review classifier, report + owner notify, background runner",
+    "id": "te-2",
+    "status": "pending"
+  },
+  {
+    "content": "[te-3] admin: Tasks screens (CRUD, run-now, run history, step viewer, drafts→Compose) + Tools registry + proposals",
+    "id": "te-3",
+    "status": "pending"
+  },
+  {
+    "content": "[te-4] Seed 4 starter tasks + tool registry",
+    "id": "te-4",
+    "status": "pending"
+  },
+  {
+    "content": "[te-5] Tests: helpdesk engine (mock script), admin screens",
+    "id": "te-5",
+    "status": "pending"
+  },
+  {
+    "content": "[te-6] Deploy gatekeeper:10 + lodge-office:7 + live verify",
+    "id": "te-6",
+    "status": "pending"
+  },
+  {
+    "content": "[te-7] Commit + context",
+    "id": "te-7",
+    "status": "pending"
+  }
+]

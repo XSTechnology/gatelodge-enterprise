@@ -1,0 +1,37 @@
+[
+  {
+    "content": "[mr-1] Read licensing schema/email paths + phase3 deploy recipe",
+    "id": "mr-1",
+    "status": "completed"
+  },
+  {
+    "content": "[mr-2] admin: contacts table+CRUD screen, email_log subject/body, email content viewer (sent+received), compose single+bulk, inbox full-view",
+    "id": "mr-2",
+    "status": "completed"
+  },
+  {
+    "content": "[mr-3] helpdesk: contact upsert on inbound + content logging",
+    "id": "mr-3",
+    "status": "completed"
+  },
+  {
+    "content": "[mr-4] licensing: contact upsert (trial/purchase) + content logging (sqlite+pg migration)",
+    "id": "mr-4",
+    "status": "completed"
+  },
+  {
+    "content": "[mr-5] Test suites — admin 61, helpdesk 55, licensing 48, all pass",
+    "id": "mr-5",
+    "status": "completed"
+  },
+  {
+    "content": "[mr-6] Deploy lodge-office:6 + gatekeeper:9 + gatelodge-licensing:5 + backfill",
+    "id": "mr-6",
+    "status": "completed"
+  },
+  {
+    "content": "[mr-7] Live verify (6/6 checks) + commit 054e1b8",
+    "id": "mr-7",
+    "status": "completed"
+  }
+]

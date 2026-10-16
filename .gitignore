@@ -15,9 +15,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Workshop workspace + session task files
+# Workshop workspace + session task files (root-level only — plan
+# bundles keep their tasks)
 .workshop/
-tasks.json
+/tasks.json
 
 # Owner documents kept locally, not versioned
-tuning.docx
+/tuning.docx
