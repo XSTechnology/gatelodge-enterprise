@@ -1,0 +1,4 @@
+index: CLEAN
+gatelodge.html CLEAN
+services.html CLEAN
+eula.html CLEAN

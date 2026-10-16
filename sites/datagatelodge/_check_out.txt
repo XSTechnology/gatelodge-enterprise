@@ -1,0 +1,11 @@
+note-tags: ['◆ How the audit chain verifies', '◆ And the agents that walk through it']
+lede: Not mockups. These are our own estate's tools, running in
+    production today — the same software y
+note: ◆ How the audit chain verifies
+note: Every request appends a record to a local, append-only ledger — each record
+        carrie
+note: ◆ And the agents that walk through it
+note: The same governance governs what agents do: tool calls pass policy
+        gates, decision
+link: See agent services →
+mojibake found: False

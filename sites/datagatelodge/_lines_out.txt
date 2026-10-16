@@ -1,0 +1,3 @@
+HERO LEDE: 'Gatelodge sits in front of every LLM your teams use — cloud or on-prem —\n        behind a single OpenAI-compatible endpoint, with the keys, budgets, and\n        tamper-evident audit trail your securit'
+KICKER: 'Self-hosted AI gateway · security, compliance, cost control, multi-model routing'
+INDEX LEDE: 'Every AI deployment needs two things: infrastructure that governs it, and\n          agents that earn their keep. We build both — and we run them\n          on our own estate, so you can see them workin'

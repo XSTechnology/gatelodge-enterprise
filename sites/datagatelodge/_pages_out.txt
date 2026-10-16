@@ -1,0 +1,67 @@
+PASS index: 3 section links
+PASS index: overview current
+PASS index: 4 pages
+PASS index: two-doors default
+PASS index: division kicker removed
+PASS index: console on two-doors
+PASS index: Two Doors fits screen
+PASS index: knock page shows
+PASS index: phone card dropped
+PASS index: aria-selected sync
+PASS index: Knock fits screen
+PASS index: back → landing
+PASS index: why fits screen
+PASS index: proof fits screen
+PASS gate: 11 pages
+PASS gate: gateway section current
+PASS gate: no CTA
+PASS gate: intro landing default
+PASS gate: console NOT in capabilities
+PASS gate: One Gateway fits screen
+PASS gate: how fits screen
+PASS gate: how has lifecycle diagram
+PASS gate: how has run strip
+PASS gate: how lists 10 backend types
+PASS gate: product fits screen
+PASS gate: product shows real screens
+PASS gate: product audit block
+PASS gate: problem fits screen
+PASS gate: capabilities fits screen
+PASS gate: label aligns with content (alt band)
+PASS gate: roi fits screen
+PASS gate: editions fits screen
+PASS gate: partners fits screen
+PASS gate: download fits screen
+PASS gate: faq fits screen
+PASS gate: faq has 7 items
+PASS gate: contact fits screen
+PASS gate: compare modal opens
+PASS gate: matrix has 12 rows
+PASS gate: compare modal closes
+PASS gate: deep link opens download
+PASS gate: hero button → download page
+PASS gate: eula modal loads
+PASS services: 9 pages
+PASS services: What We Build fits
+PASS services: method map on landing
+PASS services: loop-back line present
+PASS services: expertise fits screen
+PASS services: survey fits screen
+PASS services: map fits screen
+PASS services: design fits screen
+PASS services: post fits screen
+PASS services: walk fits screen
+PASS services: proof fits screen
+PASS services: what-we-need fits screen
+PASS services: survey marks itself on the map
+PASS services: map marks itself on the map
+PASS services: design marks itself on the map
+PASS services: post marks itself on the map
+PASS services: walk marks itself on the map
+PASS services: step-nav → map
+PASS mobile: no horizontal overflow
+PASS mobile: page list wraps to second row
+
+console errors (filtered): 0
+
+63/63 checks passed
