@@ -209,11 +209,26 @@
       } else if (ev === "done") {
         if (!bubble2.textContent) bubble2.textContent = "(no answer)";
         renderSources(bubble2, d.sources || []);
+        renderDecision(bubble2, d);
       } else if (ev === "escalate") {
         bubble2.textContent = d.message ||
           "I want to get this exactly right — can I take your email?";
         askEmail();
       }
+    }
+
+    /* deterministic decisions — the rules engine outcome line */
+    function renderDecision(bubble2, d) {
+      if (!d || !d.decision) return;
+      var line = el("div", "gk-src");
+      var v = String(d.decision).replace(/_/g, " ");
+      var t = el("span", "gk-dec");
+      t.textContent = "refund decision: " + v +
+        (d.rule ? " · rule " + d.rule : "") +
+        " — deterministic policy, not the AI's judgment";
+      line.appendChild(t);
+      bubble2.appendChild(line);
+      dom.msgs.scrollTop = dom.msgs.scrollHeight;
     }
 
     /* citations — the passages the answer was built from */

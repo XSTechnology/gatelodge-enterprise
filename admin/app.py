@@ -206,6 +206,7 @@ NAV = [("/", "Dashboard"), ("/conversations", "Conversations"),
        ("/reviews", "Reviews"), ("/inbox", "Inbox"), ("/leads", "Leads"),
        ("/licenses", "Licenses"), ("/kb", "Knowledge"),
        ("/analytics", "Analytics"), ("/contacts", "Contacts"),
+       ("/clients", "Clients"),
        ("/compose", "Compose"), ("/emails", "Emails"), ("/tasks", "Tasks"),
        ("/tools", "Tools"), ("/gateway", "Gateway")]
 
@@ -1199,6 +1200,142 @@ async def kb_reset(request: Request, name: str = ""):
     await _x("DELETE FROM kb_overrides WHERE name=%s", (name,))
     await _audit("kb-reset", name)
     return RedirectResponse("/kb", status_code=303)
+
+
+# ── portal clients: provisioning for the client task portal ──────────────
+
+def _new_portal_key() -> str:
+    import secrets as _secrets
+    return "portal-" + _secrets.token_urlsafe(18)
+
+
+@app.get("/clients", response_class=HTMLResponse)
+async def clients(request: Request, flash: str = ""):
+    if (r := _guard(request)):
+        return r
+    rows = await _q(
+        "SELECT c.id, c.name, c.company, c.email, c.brand_name, c.enabled,"
+        " (SELECT count(*) FROM portal_tasks t WHERE t.client_id=c.id)"
+        " FROM portal_clients c ORDER BY c.id")
+    trs = ""
+    for cid, name, company, email, brand, en, ntasks in rows:
+        state = ('<span class="tag ok">active</span>' if en
+                 else '<span class="tag">paused</span>')
+        act = (f'<form method="post" action="/clients/toggle" '
+               f'class="inline"><input type="hidden" name="id" '
+               f'value="{cid}"><button class="btn ghost" style="padding:'
+               f'.2rem .7rem;font-size:.72rem">'
+               f'{"pause" if en else "activate"}</button></form> '
+               f'<form method="post" action="/clients/regen" class="inline"'
+               f' onsubmit="return confirm(\'regenerate the access key? '
+               f'the old one stops working immediately\')">'
+               f'<input type="hidden" name="id" value="{cid}">'
+               f'<button class="btn ghost" style="padding:.2rem .7rem;'
+               f'font-size:.72rem">new key</button></form>')
+        trs += (f"<tr><td>{_e(name)}</td><td class='note'>{_e(company)}"
+                f"</td><td class='note'>{_e(email)}</td>"
+                f"<td>{_e(brand or company or name)}</td><td>{state}</td>"
+                f"<td class='mono note'>{ntasks}</td><td>{act}</td></tr>")
+
+    body = f"""
+<p class="note" style="margin-bottom:1.2rem">Clients of the task portal
+(portal.datagatelodge.com): each signs in with an access key and sees
+only their own tasks, policies and runs. The key is shown once when
+created or regenerated.</p>
+<form method="post" action="/clients/new" class="box">
+<div class="grid2">
+<div>
+<p class="note">name</p>
+<input type="text" name="name" required style="width:100%">
+<p class="note" style="margin-top:.6rem">email (key delivery)</p>
+<input type="email" name="email" required style="width:100%">
+</div>
+<div>
+<p class="note">company</p>
+<input type="text" name="company" required style="width:100%">
+<p class="note" style="margin-top:.6rem">brand shown in their portal</p>
+<input type="text" name="brand" style="width:100%"
+ placeholder="defaults to company">
+</div></div>
+<div class="inline" style="margin-top:.8rem">
+<button class="btn">Create client + key</button>
+<label style="display:flex;gap:.4rem;align-items:center;margin:0">
+<input type="checkbox" name="email_key" checked
+ style="width:auto">email the key</label>
+</div></form>
+<table><tr><th>client</th><th>company</th><th>email</th><th>brand</th>
+<th>state</th><th>tasks</th><th></th></tr>
+{trs or '<tr><td colspan=7 class=note>No clients yet</td></tr>'}</table>"""
+    return page(request, "Portal clients", body, flash=flash)
+
+
+@app.post("/clients/new")
+async def client_new(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    name = str(form.get("name", "")).strip()[:120]
+    company = str(form.get("company", "")).strip()[:120]
+    email = str(form.get("email", "")).strip().lower()[:200]
+    brand = str(form.get("brand", "")).strip()[:120] or company or name
+    if not (name and company and email and "@" in email):
+        return RedirectResponse("/clients?flash=name,+company+and+a+valid"
+                                "+email+are+required", status_code=303)
+    key = _new_portal_key()
+    await _x(
+        "INSERT INTO portal_clients (name, company, email, access_key,"
+        " brand_name) VALUES (%s, %s, %s, %s, %s)",
+        (name, company, email, key, brand))
+    await _audit("client-new", f"{name} <{email}>")
+    mailed = ""
+    if form.get("email_key"):
+        ok, _ = await _send_mail(
+            email, "Your Gatelodge Task Portal access",
+            f"Hello {name},\n\nYour task portal is ready.\n\n"
+            f"Sign in at: https://portal.datagatelodge.com\n"
+            f"Your access key: {key}\n\nThe key is personal — keep it to "
+            f"your team. You can define tasks, decision policies and see "
+            f"every governed run from your portal.",
+            kind="portal-key")
+        mailed = "+key+emailed" if ok else "+(email+failed+—+key+below)"
+    return RedirectResponse(f"/clients?flash=client+created+{mailed}"
+                            f"+—+key:+{key}", status_code=303)
+
+
+@app.post("/clients/toggle")
+async def client_toggle(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    cid = str(form.get("id", "")).strip()
+    await _x("UPDATE portal_clients SET enabled = NOT enabled WHERE id=%s",
+             (cid,))
+    await _audit("client-toggle", cid)
+    return RedirectResponse("/clients?flash=state+updated", status_code=303)
+
+
+@app.post("/clients/regen")
+async def client_regen(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    cid = str(form.get("id", "")).strip()
+    key = _new_portal_key()
+    row = await _q("SELECT email FROM portal_clients WHERE id=%s",
+                   (cid,), fetch="one")
+    updated = await _q(
+        "UPDATE portal_clients SET access_key=%s, enabled=TRUE "
+        "WHERE id=%s RETURNING id", (key, cid), fetch="one")
+    if not updated:
+        return RedirectResponse("/clients?flash=client+not+found",
+                                status_code=303)
+    await _audit("client-regen", cid)
+    ok, _ = await _send_mail(
+        row[0], "Your new Gatelodge Task Portal key",
+        f"Your access key was regenerated.\n\nNew key: {key}\n\n"
+        f"Sign in at: https://portal.datagatelodge.com — the previous "
+        f"key no longer works.", kind="portal-key") if row else (False, "")
+    return RedirectResponse(f"/clients?flash=new+key+{key}", status_code=303)
 
 
 # ── mail room: contacts, compose, email viewing ──────────────────────────

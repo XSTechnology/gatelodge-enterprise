@@ -886,10 +886,14 @@ to earlier turns — judge them in conversation context). Calibrate:
 - confident=true ONLY when a passage clearly and fully answers it
 - vague, borderline, or partially-covered questions: confident=false
 - legal=true for requests to interpret the EULA/contract — always escalate
+- decision=true when the visitor asks for a RULING or eligibility — a \
+refund, approval, discount, exception, entitlement — rather than \
+information. Questions about what the policy IS are information \
+(decision=false); asking to HAVE one applied to their case is a decision.
 
 Reply with ONLY a JSON object, no other text:
 {{"ids": [candidate ids], "confident": true|false, "legal": true|false, \
-"topic": "<short topic>"}}
+"decision": true|false, "topic": "<short topic>"}}
 
 CANDIDATES:
 {candidates}"""
@@ -939,7 +943,8 @@ async def triage(question: str, history: list[dict]) -> dict:
     """Stage 1 — hybrid retrieval (TF-IDF) + LLM rerank (semantic pick,
     calibrated confidence, follow-up aware). Fail-safe to escalate on
     any error."""
-    empty = {"chunks": [], "confident": False, "legal": False, "topic": ""}
+    empty = {"chunks": [], "confident": False, "legal": False,
+             "decision": False, "topic": ""}
     if not GATEWAY_URL or not GATEWAY_KEY:
         return {**empty, "topic": "gateway-unconfigured"}
 
@@ -986,6 +991,7 @@ async def triage(question: str, history: list[dict]) -> dict:
         picked = [by_id[int(i)] for i in ids]
         return {"chunks": picked, "confident": bool(d.get("confident")),
                 "legal": bool(d.get("legal")),
+                "decision": bool(d.get("decision")),
                 "topic": str(d.get("topic", ""))[:60]}
     except Exception:
         return {**empty, "topic": "rerank-unparseable"}
@@ -993,6 +999,134 @@ async def triage(question: str, history: list[dict]) -> dict:
 
 async def load_history(session_id: str) -> list[dict]:
     return await _run(lambda: _load_history(session_id))
+
+
+# ── decision-capable chat: the agent decides, conversationally ────────────
+# When triage detects a RULING request (refund, eligibility, exception),
+# the agent extracts the policy's facts from the conversation, asks a
+# natural follow-up for whatever is missing, and — only when the fact
+# set is complete — a deterministic JDM policy decides. The LLM phrases
+# the outcome; it never makes the call.
+
+DECISION_FACT_HINTS = {
+    "customer_tier": 'one of "standard", "premium", "enterprise"',
+    "days_since_purchase": "days since the order was placed (number)",
+    "order_amount_usd": "order amount in USD (number)",
+    "reason": ('one of "defective", "late_delivery", "changed_mind", '
+               '"duplicate_charge"'),
+    "prior_refunds_90d": "refunds in the last 90 days (number, 0 if none)",
+}
+
+DECISION_EXTRACT_SYSTEM = """You extract structured facts for a \
+deterministic decision policy from a support conversation. The FACTS the \
+policy needs are listed below with hints. Read the ENTIRE conversation — \
+facts may have been given in earlier turns.
+
+Output ONLY JSON:
+{{"facts": {{"<field>": <value>, ...}},
+  "missing": ["<field>", ...],
+  "ask": "<one warm follow-up question for the most important missing \
+fact — empty string when nothing is missing>"}}
+
+Rules:
+- Include only values the visitor stated (or that follow directly, e.g.
+  "never refunded before" → 0 for a refund-count fact).
+- Correct JSON types: numbers unquoted, category values quoted.
+- missing = policy facts with no value yet (empty list when complete).
+- When missing is non-empty, write ONE natural question for the first
+  missing fact. No lists, no preamble.
+
+FACTS:
+{schema}"""
+
+DECISION_ANSWER_SYSTEM = """You are the Gatekeeper for Gatelodge. A \
+deterministic refund policy (a rules engine, not your judgment) has \
+evaluated the visitor's request against their details:
+
+DECISION: {decision}
+RULE FIRED: {rule}
+POLICY: {policy}
+
+Tell the visitor the outcome plainly and warmly in 2-4 sentences:
+- State the decision clearly (approved / denied / needs human review).
+- Attribute it to the refund policy applied to their details — do not
+  add conditions, exceptions, or personal judgment.
+- If it is a review or a denial, invite them to email {support} and the
+  team will look at it personally.
+- No headings, no markdown lists."""
+
+
+def _decision_schema(kind: str) -> list[tuple[str, str]]:
+    """(field, hint) pairs for a decision ruleset's input columns."""
+    rs = _load_ruleset(kind)
+    if not rs:
+        return []
+    try:
+        g = json.loads(rs[2])
+        fields = [i.get("field", "") for n in g.get("nodes", [])
+                  if n.get("type") == "decisionTableNode"
+                  for i in n.get("content", {}).get("inputs", [])]
+        return [(f, DECISION_FACT_HINTS.get(f, "the value"))
+                for f in fields if f]
+    except Exception:
+        return []
+
+
+async def _extract_decision_facts(history: list[dict]) -> dict:
+    """Accumulate the policy's facts from the whole conversation.
+    Returns {facts, missing, ask}. Raises on unparseable output."""
+    schema = "\n".join(f"- {f}: {h}" for f, h in _decision_schema(
+        "chat-decision"))
+    if not schema:
+        raise RuntimeError("no chat-decision ruleset configured")
+    convo = "\n".join(f'{m["role"]}: {m["content"][:400]}'
+                      for m in history[-8:])
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+            json={"model": TRIAGE_MODEL,
+                  "messages": [
+                      {"role": "system",
+                       "content": DECISION_EXTRACT_SYSTEM.format(
+                           schema=schema)},
+                      {"role": "user", "content": convo or "(empty)"}],
+                  "max_tokens": 600, "temperature": 0.0})
+        content = r.json()["choices"][0]["message"]["content"] or ""
+    m = re.search(r"\{.*\}", content, re.S)
+    if not m:
+        raise RuntimeError("unparseable fact extraction")
+    d = json.loads(m.group(0))
+    facts = d.get("facts") or {}
+    missing = [str(f) for f in (d.get("missing") or [])][:6]
+    # trust the schema over the model for completeness
+    known = {f for f, _ in _decision_schema("chat-decision")}
+    missing = [f for f in known if f not in facts] or [
+        f for f in missing if f in known]
+    return {"facts": facts if isinstance(facts, dict) else {},
+            "missing": missing,
+            "ask": str(d.get("ask", ""))[:400]}
+
+
+async def _decision_answer(question_history: list[dict], facts: dict,
+                           decision: dict, policy: str) -> str:
+    """Phrase a deterministic decision for the visitor (non-streaming)."""
+    messages = ([{"role": "system",
+                  "content": DECISION_ANSWER_SYSTEM.format(
+                      decision=json.dumps(decision.get("result", {})),
+                      rule=decision.get("result", {}).get("rule", ""),
+                      policy=policy, support=SUPPORT_EMAIL)}]
+                + question_history[-6:])
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+            json={"model": ANSWER_MODEL, "messages": messages,
+                  "max_tokens": 800, "temperature": 0.3})
+        data = r.json()
+        if "choices" not in data:
+            raise RuntimeError(f"gateway {r.status_code}")
+        return (data["choices"][0]["message"]["content"] or "").strip()
 
 
 # ── escalation email ──────────────────────────────────────────────────────
@@ -1106,6 +1240,96 @@ async def chat_message(body: MessageRequest, request: Request):
                 "reason": "legal",
                 "message": ("Licensing-law questions go to the team — "
                             "can I take your email so a human follows up?")})
+            return
+        if t.get("decision"):
+            # a RULING request: extract facts conversationally, ask for
+            # what's missing, then let the deterministic policy decide
+            try:
+                ex = await _extract_decision_facts(history)
+            except Exception as e:
+                print(f"[gatekeeper] decision extract error: {e!r}")
+                await mark(True, topic=t["topic"])
+                yield await sse("escalate", {
+                    "reason": "decision-error",
+                    "message": ("I want to get this exactly right — can "
+                                "I take your email? The team will follow "
+                                "up.")})
+                return
+            if ex["missing"]:
+                ask = ex["ask"] or ("Could you tell me your "
+                                    f"{ex['missing'][0].replace('_', ' ')}?")
+                await _run(lambda: _save_assistant(
+                    body.session_id, ask, None, TRIAGE_MODEL))
+                yield await sse("token", {"t": ask})
+                yield await sse("done", {
+                    "kind": "decision-pending",
+                    "missing": ex["missing"], "topic": t["topic"]})
+                return
+            pol = await _run(lambda: _evaluate_policy(
+                "chat-decision", ex["facts"]))
+            if pol is None:
+                await mark(True, topic=t["topic"])
+                yield await sse("escalate", {
+                    "reason": "no-policy",
+                    "message": ("I want to get this exactly right — can "
+                                "I take your email? The team will follow "
+                                "up.")})
+                return
+            answer_parts: list[str] = []
+            try:
+                async with httpx.AsyncClient(timeout=90) as c:
+                    async with c.stream(
+                            "POST",
+                            f"{GATEWAY_URL}/v1/chat/completions",
+                            headers={"Authorization":
+                                     f"Bearer {GATEWAY_KEY}"},
+                            json={"model": ANSWER_MODEL,
+                                  "messages": [
+                                      {"role": "system", "content":
+                                       DECISION_ANSWER_SYSTEM.format(
+                                           decision=json.dumps(
+                                               pol["result"]),
+                                           rule=pol["result"].get(
+                                               "rule", ""),
+                                           policy=pol["policy"],
+                                           support=SUPPORT_EMAIL)}]
+                                  + history[-6:],
+                                  "max_tokens": 800, "temperature": 0.3,
+                                  "stream": True}) as r:
+                        r.raise_for_status()
+                        async for line in r.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                delta = json.loads(data)["choices"][0].get(
+                                    "delta", {})
+                            except Exception:
+                                continue
+                            tok = delta.get("content")
+                            if tok:
+                                answer_parts.append(tok)
+                                yield await sse("token", {"t": tok})
+            except Exception as e:
+                print(f"[gatekeeper] decision answer error: {e!r}")
+                await mark(True, topic=t["topic"])
+                yield await sse("escalate", {
+                    "reason": "answer-error",
+                    "message": ("Something went wrong on my side — can I "
+                                "take your email? The team will follow "
+                                "up.")})
+                return
+            answer = "".join(answer_parts)
+            await _run(lambda: _save_assistant(
+                body.session_id, answer, None, ANSWER_MODEL))
+            yield await sse("done", {
+                "kind": "decision",
+                "decision": pol["result"].get("decision"),
+                "rule": pol["result"].get("rule"),
+                "policy": pol["policy"], "topic": t["topic"],
+                "sources": []})
             return
         if not (t["confident"] and t["chunks"]):
             await mark(True, topic=t["topic"])
@@ -1339,6 +1563,61 @@ async def email_inbound(body: InboundEmail, request: Request):
                    t["confident"] and t["chunks"]) else "inbox",
                    "rule": "builtin"}}
     tri_rule = str(tri["result"].get("rule", ""))
+
+    # one-shot decision request (refund/eligibility): extract the facts
+    # from the email, let the deterministic policy decide. Missing facts
+    # queue for the team — email has no follow-up loop.
+    if t.get("decision"):
+        try:
+            ex = await _extract_decision_facts(
+                [{"role": "user", "content": text}])
+        except Exception as e:
+            print(f"[gatekeeper] email decision extract error: {e!r}")
+            ex = {"missing": ["facts"]}
+        if ex["missing"]:
+            await _run(lambda: _insert_inbound(
+                mid, frm, subject, text, "review", False, None,
+                "decision", json.dumps(ex["missing"])[:200],
+                "decision-missing-facts"))
+            return {"status": "review", "reason": "decision-missing-facts",
+                    "missing": ex["missing"]}
+        pol = await _run(lambda: _evaluate_policy(
+            "chat-decision", ex["facts"]))
+        if pol:
+            try:
+                answer = await _decision_answer(
+                    [{"role": "user", "content": text}], ex["facts"],
+                    pol["result"], pol["policy"])
+            except Exception as e:
+                print(f"[gatekeeper] email decision answer error: {e!r}")
+                answer = ""
+            if answer:
+                ok, detail = await send_reply_email(frm, subject,
+                                                    answer, mid)
+                status = "answered" if ok else "review"
+                await _run(lambda: _insert_inbound(
+                    mid, frm, subject, text, status, True, None,
+                    "decision", answer if ok else "",
+                    pol["result"].get("rule", "")))
+                await _run_email_log(
+                    frm, ok, detail or "decision auto-reply",
+                    kind="gatekeeper-decision-reply",
+                    subject=f"Re: {subject}" if subject
+                    else "Your refund request — Gatelodge",
+                    body=answer)
+                print(f"[gatekeeper] inbound {mid[:12]} from {frm}: "
+                      f"DECISION {pol['result'].get('decision')} "
+                      f"(rule {pol['result'].get('rule')})")
+                return {"status": status,
+                        "decision": pol["result"].get("decision"),
+                        "rule": pol["result"].get("rule"),
+                        "policy": pol["policy"]}
+        # fall through: no policy or phrasing failed -> human review
+        await _run(lambda: _insert_inbound(
+            mid, frm, subject, text, "review", False, None,
+            "decision", "", "decision-error"))
+        return {"status": "review", "reason": "decision-error"}
+
     if tri["result"].get("action") != "auto_reply":
         await _run(lambda: _insert_inbound(
             mid, frm, subject, text, "review", False, primary,
@@ -1840,6 +2119,27 @@ DEFAULT_RULESETS = [
           ['"auto_reply"', '"confident-faq"']),
          ("not-confident", ["", "", ""],
           ['"inbox"', '"not-confident"']),
+     ]),
+    ("Visitor refund eligibility", "chat-decision",
+     "Deterministic refund policy for visitor requests (chat + email): "
+     "the agent extracts the facts, this policy decides.",
+     ["prior_refunds_90d", "customer_tier", "days_since_purchase",
+      "order_amount_usd", "reason"], ["decision", "rule"], [
+         ("guard-abuse", [">= 3", "", "", "", ""],
+          ['"manual_review"', '"guard-abuse"']),
+         ("ent-90d", ["", '== "enterprise"', "<= 90", "", ""],
+          ['"approved"', '"ent-90d"']),
+         ("std-defective", ["", '== "standard"', "<= 30", "<= 500",
+                            '== "defective"'],
+          ['"approved"', '"std-defective"']),
+         ("premium-mindchange", ["", '== "premium"', "<= 30", "<= 200",
+                                 '== "changed_mind"'],
+          ['"approved"', '"premium-mindchange"']),
+         ("std-late", ["", '== "standard"', "<= 14", "",
+                       '== "late_delivery"'],
+          ['"approved"', '"std-late"']),
+         ("fallback-deny", ["", "", "", "", ""],
+          ['"denied"', '"fallback-deny"']),
      ]),
 ]
 

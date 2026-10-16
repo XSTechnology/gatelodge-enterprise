@@ -31,9 +31,10 @@ from fastapi import FastAPI, Request                      # noqa: E402
 from fastapi.responses import StreamingResponse           # noqa: E402
 
 mock = FastAPI()
-MODE = {"triage": "confident"}
+MODE = {"triage": "confident", "decision": False}
 CAPTURE = []          # answer-model request bodies (prompt assertions)
 TASKSCRIPT = []       # queued task-agent turns (plan/execute/review)
+DECSCRIPT = []        # queued decision fact-extraction responses
 
 
 @mock.get("/healthz")
@@ -65,18 +66,25 @@ async def completions(request: Request):
             else:
                 d = {"done": True, "report": "(script exhausted)"}
             return {"choices": [{"message": {"content": json.dumps(d)}}]}
+        # decision fact extraction — scripted queue
+        if "deterministic decision policy" in body["messages"][0]["content"]:
+            if DECSCRIPT:
+                d = DECSCRIPT.pop(0)
+            else:
+                d = {"facts": {}, "missing": [], "ask": ""}
+            return {"choices": [{"message": {"content": json.dumps(d)}}]}
         # pick the first candidates the retrieval stage actually offered
         ids = re.findall(r"\[(\d+)\] doc=",
                          body["messages"][0]["content"])
         if MODE["triage"] == "confident":
             d = {"ids": ids[:2], "confident": True, "legal": False,
-                 "topic": "what-is"}
+                 "decision": MODE["decision"], "topic": "what-is"}
         elif MODE["triage"] == "legal":
             d = {"ids": ids[:1], "confident": True, "legal": True,
-                 "topic": "license-legal"}
+                 "decision": MODE["decision"], "topic": "license-legal"}
         else:
             d = {"ids": [], "confident": False, "legal": False,
-                 "topic": "off-topic"}
+                 "decision": MODE["decision"], "topic": "off-topic"}
         return {"choices": [{"message": {"content": json.dumps(d)}}]}
 
     if not body.get("stream"):
@@ -241,6 +249,55 @@ with TestClient(app.app) as client:
     evs = sse_events(r.text)
     esc = next((d for e, d in evs if e == "escalate"), {})
     check("off-topic escalates", esc.get("reason") == "off-topic", str(evs))
+
+    # 5b. decision-capable chat — the agent asks for missing facts,
+    # then the deterministic policy decides (real zen evaluation)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        rs = next(r6 for r6 in app.DEFAULT_RULESETS
+                  if r6[1] == "chat-decision")
+        c.execute("DELETE FROM rulesets WHERE kind='chat-decision'")
+        c.execute(
+            "INSERT INTO rulesets (name, kind, description, jdm) VALUES "
+            "(%s, 'chat-decision', %s, %s)",
+            (rs[0], rs[2], app._table_jdm(rs[0], rs[3], rs[4], rs[5])))
+    MODE["triage"] = "confident"
+    MODE["decision"] = True
+    DECSCRIPT[:] = [{"facts": {"customer_tier": "premium",
+                               "days_since_purchase": 12,
+                               "order_amount_usd": 250,
+                               "reason": "changed_mind"},
+                     "missing": ["prior_refunds_90d"],
+                     "ask": "How many refunds have you had this quarter?"}]
+    r = client.post("/api/chat/message", json={
+        "session_id": sid,
+        "text": "Can I get a refund? Premium, 12 days ago, $250, "
+                "changed my mind."})
+    evs = sse_events(r.text)
+    done = next((d for e, d in evs if e == "done"), {})
+    toks = [d.get("t", "") for e, d in evs if e == "token"]
+    check("decision asks for missing fact",
+          done.get("kind") == "decision-pending"
+          and done.get("missing") == ["prior_refunds_90d"]
+          and "refunds" in "".join(toks).lower(), str(done))
+    # complete facts on the follow-up turn -> deterministic decision
+    DECSCRIPT[:] = [{"facts": {"customer_tier": "premium",
+                               "days_since_purchase": 12,
+                               "order_amount_usd": 150,
+                               "reason": "changed_mind",
+                               "prior_refunds_90d": 0},
+                     "missing": [], "ask": ""}]
+    r = client.post("/api/chat/message", json={
+        "session_id": sid, "text": "No refunds so far."})
+    evs = sse_events(r.text)
+    done = next((d for e, d in evs if e == "done"), {})
+    check("decision turn decides deterministically",
+          done.get("kind") == "decision"
+          and done.get("decision") == "approved"
+          and done.get("rule") == "premium-mindchange"
+          and done.get("policy", "").startswith("Visitor refund"), str(done))
+    check("decision turn streamed answer", any(
+        d.get("t") for e, d in evs if e == "token"))
+    MODE["decision"] = False
 
     # 6. escalate endpoint
     r = client.post("/api/chat/escalate",
@@ -507,6 +564,25 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
 check("inbound contact captured", ct and ct[0] == "inbound"
       and ct[1] >= 2, str(ct))
 check("raw-MIME contact captured", cr and cr[0] == "inbound", str(cr))
+
+# 13b. email decision — one-shot refund ruling with complete facts
+MODE["decision"] = True
+DECSCRIPT[:] = [{"facts": {"customer_tier": "premium",
+                           "days_since_purchase": 12,
+                           "order_amount_usd": 150,
+                           "reason": "changed_mind",
+                           "prior_refunds_90d": 0},
+                 "missing": [], "ask": ""}]
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "dec-001", "from_addr": "buyer@example.com",
+    "subject": "refund please",
+    "text": "Premium customer, bought 12 days ago for $150, changed my "
+            "mind, no prior refunds. Can I get a refund?"})
+j = r.json()
+check("email decision one-shot",
+      j.get("decision") == "approved"
+      and j.get("rule") == "premium-mindchange", str(j))
+MODE["decision"] = False
 
 # 16. task engine — tools + full run (scripted agent turns)
 check("tools registered", set(app.TOOLS) >= {

@@ -1091,6 +1091,7 @@ p.small { font-size: .8rem; line-height: 1.6; }
   text-transform: uppercase; color: var(--faint); line-height: 1.6; }
 .gk-src a { color: var(--brass); text-decoration: none; }
 .gk-src a:hover { color: var(--brass-bright); text-decoration: underline; }
+.gk-dec { color: var(--brass); }
 .gk-turnstile { align-self: stretch; }
 
 .gk-input-row {

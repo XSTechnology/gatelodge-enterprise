@@ -102,10 +102,25 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
               "ADD COLUMN IF NOT EXISTS subject TEXT DEFAULT ''")
     c.execute("ALTER TABLE email_log "
               "ADD COLUMN IF NOT EXISTS body TEXT DEFAULT ''")
+    c.execute("""CREATE TABLE IF NOT EXISTS portal_clients (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL, company TEXT DEFAULT '',
+        email TEXT DEFAULT '', access_key TEXT UNIQUE NOT NULL,
+        brand_name TEXT DEFAULT '', enabled BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS portal_tasks (
+        id BIGSERIAL PRIMARY KEY,
+        client_id BIGINT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        goal TEXT NOT NULL DEFAULT '',
+        success_criteria TEXT DEFAULT '', inputs TEXT DEFAULT '',
+        schedule TEXT DEFAULT 'manual', enabled BOOLEAN DEFAULT TRUE,
+        next_run_at TIMESTAMPTZ, last_run_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT now())""")
     # deterministic: own the tables for this run
     for t in ("chat_messages", "chat_sessions", "licenses", "leads",
               "email_log", "admin_audit", "kb_overrides", "inbound_emails",
-              "contacts"):
+              "contacts", "portal_clients"):
         c.execute(f"TRUNCATE {t}")
     c.execute("INSERT INTO chat_sessions (id, email, needs_review, "
               "last_topic) VALUES ('testsess0001', 'cust@example.com', "
@@ -547,6 +562,40 @@ with TestClient(app.app) as client:
         v = c.execute("SELECT status FROM tool_proposals WHERE id=1"
                       ).fetchone()
     check("proposal approve", r.status_code == 303 and v[0] == "approved")
+
+    # 15b. portal client provisioning
+    r = client.get("/clients")
+    check("clients screen", r.status_code == 200
+          and "Create client + key" in r.text, r.text[:120])
+    r = client.post("/clients/new", data={
+        "name": "Test Partner", "company": "Partner Co",
+        "email": "partner@example.com", "brand": "Partner Desk",
+        "email_key": ""}, follow_redirects=False)
+    loc = r.headers.get("location", "")
+    check("client created with key", r.status_code == 303
+          and "key:+portal-" in loc, loc)
+    key = loc.split("key:+")[1] if "key:+" in loc else ""
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT name, brand_name, enabled FROM "
+                      "portal_clients WHERE access_key=%s",
+                      (key,)).fetchone()
+        cid = c.execute("SELECT id FROM portal_clients WHERE access_key=%s",
+                        (key,)).fetchone()[0]
+    check("client row + key valid", v == ("Test Partner", "Partner Desk",
+                                          True), str(v))
+    r = client.post("/clients/toggle", data={"id": str(cid)},
+                    follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT enabled FROM portal_clients WHERE id=%s",
+                      (cid,)).fetchone()
+    check("client pause toggles", r.status_code == 303 and v[0] is False)
+    r = client.post("/clients/regen", data={"id": str(cid)},
+                    follow_redirects=False)
+    loc = r.headers.get("location", "")
+    check("client key regen", r.status_code == 303
+          and "new+key+portal-" in loc, loc)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        c.execute("DELETE FROM portal_clients WHERE id=%s", (cid,))
 
     # 16. logout clears
     client.get("/logout")
