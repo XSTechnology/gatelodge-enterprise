@@ -267,6 +267,19 @@ async def t_submit_facts(spec: str) -> str:
         return ("ERROR: input must be a single JSON object of facts, "
                 'e.g. {"days_since_purchase": 12, "reason": "defective"}')
     _RUN_STATE["facts"] = d
+    # fact gate — the policy says which facts it needs; if any are
+    # missing the agent is told exactly what to go get and resubmit
+    policy = _RUN_STATE.get("policy")
+    if policy:
+        missing = _missing_fields(policy[2], d)
+        if missing:
+            return ("FACTS INCOMPLETE — the decision policy still needs: "
+                    + ", ".join(missing)
+                    + ". Re-read the request text and RESUBMIT all facts "
+                    "as one JSON object including these. If the text does "
+                    "not state a value, infer the most reasonable one "
+                    "from context (e.g. a count of prior events not "
+                    "mentioned = 0) and include it.")
     return "FACTS RECORDED: " + json.dumps(d, sort_keys=True)
 
 
@@ -300,28 +313,55 @@ def _missing_fields(jdm_json: str, facts: dict) -> list[str]:
 def _apply_policy(run_id: int, ruleset_id: int, report: str,
                   transcript: list[str]) -> tuple[str, str]:
     """Evaluate the task's ruleset against submitted facts. Returns
-    (report, decision_json) — decision appended to the report verbatim."""
+    (report, decision_json) — decision appended to the report verbatim.
+    If required facts are missing the policy is NOT evaluated — the
+    outcome is insufficient_facts with the missing list (the fact-gate
+    pattern: an incomplete fact set must never produce a decision)."""
     facts = _RUN_STATE.get("facts") or {}
     if not facts:
         return report, ""
     try:
-        with _db() as c:
-            rs = c.execute(
-                "SELECT name, version, jdm FROM portal_rulesets "
-                "WHERE id=%s AND enabled", (ruleset_id,)).fetchone()
+        rs = _RUN_STATE.get("policy")
+        if not rs:
+            with _db() as c:
+                rs = c.execute(
+                    "SELECT name, version, jdm FROM portal_rulesets "
+                    "WHERE id=%s AND enabled",
+                    (ruleset_id,)).fetchone()
         if not rs:
             return report, ""
         rs_name, rs_ver, jdm = rs
+
+        missing = _missing_fields(jdm, facts)
+        if missing:
+            decision_json = json.dumps(
+                {"decision": "insufficient_facts",
+                 "missing_fields": missing}, sort_keys=True)
+            detail = (f"INSUFFICIENT FACTS: {', '.join(missing)} — "
+                      f"the policy was NOT evaluated.")
+            with _db() as c:
+                c.execute("INSERT INTO portal_steps (run_id, seq, tool,"
+                          " input, output, status) VALUES (%s,%s,%s,%s,"
+                          "%s,%s)",
+                          (run_id, 900, "policy_check",
+                           json.dumps(facts, sort_keys=True)[:4000],
+                           detail[:6000], "blocked"))
+            report += (f"\n\n---\n**Policy decision** — `{rs_name}` "
+                       f"v{rs_ver}: **insufficient facts** "
+                       f"({', '.join(missing)}). The rules engine did "
+                       f"not evaluate — a decision requires every fact "
+                       f"the policy defines.")
+            transcript.append(f"policy_check (blocked): {rs_name} "
+                              f"v{rs_ver} → insufficient_facts "
+                              f"({', '.join(missing)})")
+            return report, decision_json
+
         r = _evaluate_ruleset(jdm, facts)
         res = r.get("result", {}) if isinstance(r, dict) else {}
         perf = r.get("performance", "") if isinstance(r, dict) else ""
         decision_json = json.dumps(res, sort_keys=True)
-        missing = _missing_fields(jdm, facts)
-        note = (f"\nMISSING FIELDS (decision may be unreliable): "
-                f"{', '.join(missing)}") if missing else ""
         detail = (f"DECISION: {decision_json}\n"
-                  f"RULESET: {rs_name} v{rs_ver} · evaluated in {perf}"
-                  f"{note}")
+                  f"RULESET: {rs_name} v{rs_ver} · evaluated in {perf}")
         with _db() as c:
             c.execute("INSERT INTO portal_steps (run_id, seq, tool, input,"
                       " output, status) VALUES (%s,%s,%s,%s,%s,%s)",
@@ -344,7 +384,8 @@ def _apply_policy(run_id: int, ruleset_id: int, report: str,
         return report, ""
 
 
-async def _gw_json(system: str, messages: list[dict]) -> str:
+async def _gw_json(system: str, messages: list[dict],
+                   max_tokens: int = 1200) -> str:
     async with httpx.AsyncClient(timeout=90) as c:
         r = await c.post(
             f"{GATEWAY_URL}/v1/chat/completions",
@@ -352,7 +393,7 @@ async def _gw_json(system: str, messages: list[dict]) -> str:
             json={"model": MODEL,
                   "messages": [{"role": "system", "content": system}]
                   + messages,
-                  "max_tokens": 1200, "temperature": 0.1})
+                  "max_tokens": max_tokens, "temperature": 0.1})
         data = r.json()
         if "choices" not in data:
             raise RuntimeError(f"gateway {r.status_code}: {str(data)[:300]}")
@@ -450,6 +491,13 @@ def _run_task(task_id: int) -> None:
             (task_id,)).fetchone()[0]
     _RUN_STATE.clear()
     _RUN_STATE["run_id"] = run_id
+    if ruleset_id:
+        with _db() as c:
+            rs = c.execute(
+                "SELECT name, version, jdm FROM portal_rulesets "
+                "WHERE id=%s AND enabled", (ruleset_id,)).fetchone()
+        if rs:
+            _RUN_STATE["policy"] = rs
     print(f"[portal] task '{name}' run {run_id}")
 
     user = f"TASK: {goal}"
@@ -584,6 +632,7 @@ body { background:radial-gradient(1100px 500px at 85% -5%,
 .ptable td { padding:.2rem .25rem; }
 .ptable input.cell, .ptable input.rname {
   padding:.3rem .4rem; font-family:Consolas,monospace; font-size:.76rem; }
+.ptable tr.drafted td { background:rgba(212,175,55,.08); }
 .mini { background:transparent; color:var(--faint); border:1px solid
   var(--line); border-radius:5px; padding:.05rem .35rem; font-size:.7rem;
   cursor:pointer; }
@@ -831,12 +880,65 @@ def _policy_model(jdm_json: str) -> dict | None:
 
 
 def _jdm_valid(jdm_json: str) -> bool:
+    """Structural + cell-syntax validation. zen itself accepts any cell
+    text and simply never matches bad expressions (fail-silent), so the
+    cell grammar is enforced here instead."""
     try:
         from zen import ZenEngine
         ZenEngine().create_decision(json.loads(jdm_json))
-        return True
+        model = _policy_model(jdm_json)
+        if not model:
+            return False
+        in_fields = [f for f, _, _ in model["inputs"]]
+        out_fields = [f for f, _, _ in model["outputs"]]
+        return all(
+            _cells_valid(in_fields, out_fields, cells)
+            for cells in [dict(zip(in_fields + out_fields, r["cells"]))
+                          for r in model["rules"]])
     except Exception:
         return False
+
+
+_COND_RE = re.compile(
+    r'^(?:(==|!=|<=|>=|<|>)\s*("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?)?)?$')
+_VAL_RE = re.compile(r'^("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?)?$')
+
+
+_BARE_RE = re.compile(r'^("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?)$')
+
+
+def _normalize_cells(in_fields: list[str], out_fields: list[str],
+                     cells: dict) -> dict:
+    """LLM drafts are messy in two predictable ways: bare values for
+    conditions ("premium" instead of == "premium" — a truthy always-match
+    in zen, silently wrong) and unquoted output words (approved instead
+    of "approved"). Both are normalized before grammar validation."""
+    for f in in_fields:
+        v = str(cells.get(f, "")).strip()
+        if v and _BARE_RE.match(v):
+            cells[f] = "== " + v
+    for f in out_fields:
+        v = str(cells.get(f, "")).strip()
+        if v and not _VAL_RE.match(v):
+            q = '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            if _VAL_RE.match(q):
+                cells[f] = q
+    return cells
+
+
+def _cells_valid(in_fields: list[str], out_fields: list[str],
+                 cells: dict) -> bool:
+    """Condition cells: operator + quoted string or bare number (or
+    empty = any). Output cells: a value (or empty). This is the subset
+    the editor documents; anything else silently never matches in zen,
+    so it is rejected up front."""
+    for f in in_fields:
+        if not _COND_RE.match(str(cells.get(f, ""))):
+            return False
+    for f in out_fields:
+        if not _VAL_RE.match(str(cells.get(f, ""))):
+            return False
+    return True
 
 
 @app.get("/policies", response_class=HTMLResponse)
@@ -985,6 +1087,79 @@ function fillFacts() {
   grid.querySelectorAll('thead th[data-kind=in] .f').forEach(i => { if (i.value) f[i.value] = ''; });
   document.getElementById('facts').value = JSON.stringify(f, null, 2);
 }
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function colFields() {
+  const inF = [...document.querySelectorAll('#grid thead th[data-kind=in] .f')].map(i => i.value);
+  const outF = [...document.querySelectorAll('#grid thead th[data-kind=out] .f')].map(i => i.value);
+  return {inF, outF};
+}
+function addRuleFromDraft(row) {
+  const grid = document.getElementById('grid');
+  const {inF, outF} = colFields();
+  const tr = document.createElement('tr');
+  tr.classList.add('drafted');
+  let h = '<td><input class="rname" value="' + esc(row.name) + '"></td>';
+  for (const f of [...inF, ...outF]) {
+    const kind = inF.includes(f) ? 'in' : 'out';
+    const ci = kind === 'in' ? inF.indexOf(f) : outF.indexOf(f);
+    const val = (row.cells && row.cells[f] !== undefined) ? row.cells[f] : '';
+    h += '<td><input class="cell" data-kind="' + kind + '" data-col="' + ci + '" value="' + esc(val) + '"></td>';
+  }
+  h += '<td><button type="button" class="mini" onclick="this.closest(\\'tr\\').remove()">✕</button></td>';
+  tr.innerHTML = h;
+  grid.querySelector('tbody').appendChild(tr);
+}
+function makeTh(kind, field, name) {
+  const th = document.createElement('th');
+  th.dataset.kind = kind;
+  th.innerHTML = '<input class="f mono" value="' + esc(field) + '" placeholder="field" style="font-size:.72rem">' +
+    '<input class="n" value="' + esc(name) + '" placeholder="label" style="font-size:.72rem">' +
+    '<button type="button" class="mini" onclick="delCol(this)">✕</button>';
+  return th;
+}
+function rebuildGrid(j) {
+  const grid = document.getElementById('grid');
+  const thead = grid.querySelector('thead');
+  const tbody = grid.querySelector('tbody');
+  thead.innerHTML = '';
+  const trh = document.createElement('tr');
+  trh.innerHTML = '<th style="min-width:110px">rule</th>';
+  j.inputs.forEach(c => trh.appendChild(makeTh('in', c.field, c.name)));
+  j.outputs.forEach(c => trh.appendChild(makeTh('out', c.field, c.name)));
+  const miniTh = document.createElement('th');
+  miniTh.className = 'mini-col';
+  trh.appendChild(miniTh);
+  thead.appendChild(trh);
+  tbody.innerHTML = '';
+  j.rows.forEach(row => addRuleFromDraft(row));
+  if (j.name) document.getElementById('pname').value = j.name;
+  const desc = document.querySelector('input[name=description]');
+  if (desc && j.description) desc.value = j.description;
+}
+async function draftRules() {
+  const pid = document.getElementById('pid').value;
+  const text = document.getElementById('nldesc').value.trim();
+  const out = document.getElementById('nlout');
+  if (!text) { out.textContent = 'Describe the rules first.'; return; }
+  out.textContent = 'drafting…';
+  try {
+    const r = await fetch('/policy/compile', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pid: +pid || 0, text})
+    });
+    const j = await r.json();
+    if (j.error) {
+      out.textContent = 'ERROR: ' + j.error +
+        (j.dropped && j.dropped.length ? ' — ' + j.dropped.map(d => d.name).join(', ') + ' could not compile' : '');
+      return;
+    }
+    if (j.mode === 'new') rebuildGrid(j);
+    else j.rows.forEach(row => addRuleFromDraft(row));
+    out.textContent = 'Drafted ' + j.rows.length + ' rule(s)' +
+      (j.dropped && j.dropped.length ? ' · dropped ' + j.dropped.length + ' invalid draft(s)' : '') +
+      ' — review every cell below, then Save.';
+  } catch (e) { out.textContent = 'ERROR: ' + e; }
+}
 """
 
 
@@ -1001,7 +1176,7 @@ async def policy_editor(request: Request, pid: int, flash: str = ""):
                 "FROM portal_rulesets WHERE id=%s", (pid,)).fetchone()
             return row
     row = await _run(q) if pid else None
-    editable = bool(pid) and row and row[5] == client["id"]
+    editable = (pid == 0) or bool(row and row[5] == client["id"])
     if pid and not row:
         return RedirectResponse("/policies", status_code=303)
     if pid and row[5] is not None and row[5] != client["id"]:
@@ -1069,6 +1244,23 @@ async def policy_editor(request: Request, pid: int, flash: str = ""):
                 f'style="padding:.3rem .8rem;font-size:.75rem" '
                 f'onclick="addCol(\'out\')">+ output column</button></div>'
                 if editable else "")
+    nl_label = ("Draft policy" if not pid else "Draft rules")
+    nl_box = (f"""
+<div class="box" style="margin-bottom:1.2rem;border-left:3px solid
+  var(--brass)">
+<label>describe your {"policy" if not pid else "new rules"} in plain
+english</label>
+<textarea id="nldesc" style="min-height:70px" placeholder="e.g.
+Premium customers can change their mind within 30 days for orders under
+$300. Anyone with 3 or more refunds in 90 days goes to manual review.
+Everything else is denied."></textarea>
+<div class="inline" style="margin-top:.6rem">
+<button type="button" class="btn" onclick="draftRules()">
+{nl_label}</button>
+<span class="note" id="nlout"></span></div>
+<p class="note" style="margin-top:.5rem">The AI drafts into the grid
+below — every cell is yours to review and edit before saving. Saved
+policies always run deterministically.</p></div>""" if editable else "")
 
     body = f"""
 <form method="post" action="/policy/save" id="pform">
@@ -1086,6 +1278,7 @@ async def policy_editor(request: Request, pid: int, flash: str = ""):
 <option value="first"{' selected' if hp == 'first' else ''}>first match — first rule that fits decides</option>
 <option value="collect"{' selected' if hp == 'collect' else ''}>collect — all matching rules combine</option>
 </select>
+{nl_box}
 {new_btns}
 <div style="overflow-x:auto"><table id="grid" class="ptable">
 <thead><tr>{head}</tr></thead><tbody>{rows_html}</tbody></table></div>
@@ -1197,6 +1390,225 @@ async def policy_test(request: Request, pid: int):
                 "missing_fields": _missing_fields(row[2], facts)}
     except Exception as e:
         return JSONResponse({"error": f"evaluation failed: {e!r}"},
+                            status_code=400)
+
+
+# ── natural-language rule authoring ───────────────────────────────────────
+# The LLM DRAFTS (rows into the editor grid); the human REVIEWS every
+# cell; zen-engine VALIDATES on save. Nothing the model produces becomes
+# a live policy without both.
+
+COMPILE_ROWS_SYSTEM = """You compile plain-English business rules into \
+decision-table rows for the ZEN rules engine. The policy's columns are \
+given. Output ONLY JSON, no prose:
+
+{"rows": [{"name": "kebab-case-id", "cells": {"<field>": "<cell>", ...}}]}
+
+Cell conventions (STRICT):
+- Condition cells are expressions RELATIVE to the column's field:
+  == "premium"   != "gold"   <= 30   >= 3   > 100   < 5
+  Empty string "" means no condition (any value matches).
+- Quote string literals: == "enterprise". Leave numbers unquoted: <= 90.
+- Output cells are the values the rule produces: quoted strings
+  "approved" or plain numbers 8.
+- EVERY input AND output column field must appear as a key in cells.
+- One row per distinct rule in the description; name = short kebab id.
+- Translate thresholds and conditions EXACTLY as stated.
+- Never invent columns or fields that are not in the given list.
+
+Example — columns inputs: [tier, days_since, amount], outputs: \
+[decision, rule]:
+{"rows": [
+  {"name": "premium-under-200", "cells": {"tier": "== \\"premium\\"", \
+"days_since": "<= 30", "amount": "<= 200", "decision": "\\"approved\\"", \
+"rule": "\\"premium-under-200\\""}},
+  {"name": "deny-rest", "cells": {"tier": "", "days_since": "", \
+"amount": "", "decision": "\\"denied\\"", "rule": "\\"deny-rest\\""}}
+]}"""
+
+COMPILE_NEW_SYSTEM = """You design a decision policy from a plain-English \
+description, for the ZEN rules engine. Output ONLY JSON, no prose:
+
+{"name": "Policy name", "description": "one sentence",
+ "inputs": [{"field": "snake_case", "name": "Human label"}],
+ "outputs": [{"field": "snake_case", "name": "Human label"}],
+ "rows": [{"name": "kebab-case-id", "cells": {"<field>": "<cell>", ...}}]}
+
+Requirements (STRICT):
+- inputs = 3-6 FACT columns the policy needs to decide (snake_case
+  fields like customer_tier, days_since_purchase, order_amount_usd).
+- One output column carries the decision/outcome value.
+- One output column has field "rule": its cell value is the row's own
+  name as a quoted string, so the trace shows which rule fired.
+- Condition cells are expressions relative to the field:
+  == "premium", != "gold", <= 30, >= 3; "" means any. Quote strings,
+  keep numbers bare. Output cells are values: "approved" (quoted) or 8.
+- EVERY input and output field must appear as a key in every row's cells.
+- Order rules most-specific-first. The LAST row must be a fallback named
+  "fallback" with every condition cell empty.
+- 3-8 rules total. Translate the description exactly; do not add
+  conditions it does not state."""
+
+
+def _trial_jdm(ins: list[dict], outs: list[dict], rule: dict) -> dict:
+    """Single-rule JDM used to validate a drafted row compiles + runs.
+    Column ids are normalized to the field names so drafted cells (keyed
+    by field) map straight onto the columns."""
+    norm = lambda cols: [{"field": c["field"], "id": c["field"],
+                          "name": c.get("name", c["field"]),
+                          "type": "expression"} for c in cols]
+    return {
+        "edges": [{"id": "e1", "sourceId": "i", "targetId": "t"},
+                  {"id": "e2", "sourceId": "t", "targetId": "o"}],
+        "nodes": [{"id": "i", "type": "inputNode", "name": "Facts"},
+                  {"id": "o", "type": "outputNode", "name": "Decision"},
+                  {"id": "t", "type": "decisionTableNode",
+                   "name": "trial",
+                   "content": {"hitPolicy": "first", "inputs": norm(ins),
+                               "outputs": norm(outs),
+                               "rules": [rule]}}]}
+
+
+def _draft_rows_valid(ins: list[dict], outs: list[dict],
+                      rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Keep only rows that pass the cell grammar and compile; return
+    (valid, dropped). zen accepts any cell text (fail-silent), so the
+    grammar check is what actually rejects malformed drafts."""
+    from zen import ZenEngine
+    engine = ZenEngine()
+    dummy = {c["field"]: 0 for c in ins}
+    in_fields = [c["field"] for c in ins]
+    out_fields = [c["field"] for c in outs]
+    valid, dropped = [], []
+    for r in rows:
+        name = str(r.get("name", "")).strip()[:60] or "draft"
+        cells = _normalize_cells(
+            in_fields, out_fields,
+            {k: str(v) for k, v in (r.get("cells") or {}).items()})
+        reason = None
+        if not _cells_valid(in_fields, out_fields, cells):
+            reason = "cell does not match the expression grammar"
+        else:
+            rule = {"_id": name, **cells}
+            try:
+                d = engine.create_decision(_trial_jdm(ins, outs, rule))
+                d.evaluate(dummy)
+            except Exception as e:
+                reason = str(e)[:200]
+        if reason:
+            dropped.append({"name": name, "error": reason})
+        else:
+            valid.append({"name": name, "cells": cells})
+    return valid, dropped
+
+
+@app.post("/policy/compile")
+async def policy_compile(request: Request):
+    """Draft rules (or a whole policy) from a plain-English description.
+    pid=0 → design a new policy (columns + rules). pid>0 → draft rows
+    against the existing policy's columns. The client reviews everything
+    in the editor before anything is saved."""
+    client = _authed(request)
+    if not client:
+        return JSONResponse({"error": "auth"}, status_code=403)
+    try:
+        body = await request.json()
+        pid = int(body.get("pid") or 0)
+        text = str(body.get("text", "")).strip()[:2000]
+    except Exception:
+        return JSONResponse({"error": "bad request body"},
+                            status_code=400)
+    if not text:
+        return JSONResponse({"error": "describe the rules first"},
+                            status_code=400)
+
+    try:
+        if pid:
+            def q():
+                with _db() as c:
+                    return c.execute(
+                        "SELECT jdm FROM portal_rulesets WHERE id=%s "
+                        "AND (client_id IS NULL OR client_id=%s)",
+                        (pid, client["id"])).fetchone()
+            row = await _run(q)
+            if not row:
+                return JSONResponse({"error": "policy not found"},
+                                    status_code=404)
+            model = _policy_model(row[0])
+            if not model:
+                return JSONResponse(
+                    {"error": "policy is not a single decision table"},
+                    status_code=400)
+            ins = [{"field": f, "name": n, "type": "expression"}
+                   for f, n, _ in model["inputs"]]
+            outs = [{"field": f, "name": n, "type": "expression"}
+                    for f, n, _ in model["outputs"]]
+            col_spec = ("COLUMNS\ninputs (conditions): "
+                        + "; ".join(f"{c['field']} — {c['name']}"
+                                    for c in ins)
+                        + "\noutputs (values): "
+                        + "; ".join(f"{c['field']} — {c['name']}"
+                                    for c in outs))
+            rv = await _gw_json(
+                COMPILE_ROWS_SYSTEM,
+                [{"role": "user", "content": f"{col_spec}\n\n"
+                                             f"DESCRIPTION:\n{text}\n\n"
+                                             f"Output ONLY the JSON."}],
+                max_tokens=3000)
+            m = re.search(r"\{.*\}", rv, re.S)
+            if not m:
+                return JSONResponse(
+                    {"error": "could not draft from that description"},
+                    status_code=400)
+            rows = json.loads(m.group(0)).get("rows") or []
+            valid, dropped = _draft_rows_valid(ins, outs, rows)
+            if not valid:
+                return JSONResponse(
+                    {"error": "no valid rules drafted",
+                     "dropped": dropped}, status_code=400)
+            return {"mode": "rows", "rows": valid, "dropped": dropped}
+
+        # new-policy mode: the LLM designs columns + rules together
+        rv = await _gw_json(
+            COMPILE_NEW_SYSTEM,
+            [{"role": "user",
+              "content": f"DESCRIPTION:\n{text}\n\nOutput ONLY the JSON."}],
+            max_tokens=3000)
+        m = re.search(r"\{.*\}", rv, re.S)
+        if not m:
+            return JSONResponse(
+                {"error": "could not design a policy from that "
+                          "description"}, status_code=400)
+        d = json.loads(m.group(0))
+        ins = [{"field": str(c.get("field", "")).strip(),
+                "name": str(c.get("name", c.get("field", "")))[:40],
+                "type": "expression"}
+               for c in (d.get("inputs") or []) if c.get("field")]
+        outs = [{"field": str(c.get("field", "")).strip(),
+                 "name": str(c.get("name", c.get("field", "")))[:40],
+                 "type": "expression"}
+                for c in (d.get("outputs") or []) if c.get("field")]
+        ins = ins[:6]
+        outs = outs[:4]
+        if not (2 <= len(ins) <= 6) or not (1 <= len(outs) <= 4):
+            return JSONResponse(
+                {"error": "draft needs 2-6 condition columns and "
+                          "1-4 output columns"}, status_code=400)
+        valid, dropped = _draft_rows_valid(ins, outs, d.get("rows") or [])
+        if not valid:
+            return JSONResponse(
+                {"error": "no valid rules drafted", "dropped": dropped},
+                status_code=400)
+        return {"mode": "new",
+                "name": str(d.get("name", ""))[:120] or "Drafted policy",
+                "description": str(d.get("description", ""))[:400],
+                "inputs": [{"field": c["field"], "name": c["name"]}
+                           for c in ins],
+                "outputs": [{"field": c["field"], "name": c["name"]}
+                            for c in outs],
+                "rows": valid, "dropped": dropped}
+    except Exception as e:
+        return JSONResponse({"error": f"draft failed: {e!r}"},
                             status_code=400)
 
 

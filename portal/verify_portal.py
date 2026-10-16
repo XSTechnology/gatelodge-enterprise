@@ -55,6 +55,14 @@ check("global policies listed", "Refund eligibility policy" in r.text
       and "Support ticket triage policy" in r.text, "missing")
 check("new policy button", "New policy" in r.text, "missing")
 
+# new-policy editor: editable + NL authoring box + save button
+r = c.get(f"{BASE}/policy/0")
+check("new policy editor 200", r.status_code == 200, r.status_code)
+check("editor editable (save button)", "Save policy" in r.text, "read-only")
+check("NL authoring box", "Draft policy" in r.text
+      and "describe your policy" in r.text, "missing NL box")
+check("editor grid present", 'id="grid"' in r.text, "no grid")
+
 # decision run viewer (run 3 = Contoso refund decision, ent-90d)
 r = c.get(f"{BASE}/run/3")
 check("decision run viewer 200", r.status_code == 200, r.status_code)
