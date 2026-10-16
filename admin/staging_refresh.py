@@ -48,8 +48,8 @@ subprocess.run(["git", "-C", WORK, "config", "user.name",
 r = subprocess.run(["git", "-C", WORK, "add", "-A"], check=True,
                    capture_output=True)
 r = subprocess.run(["git", "-C", WORK, "commit", "-m",
-                    "staging refresh: buying-committee personas "
-                    "(CEO/CIO/CISO/Audit) + fit trims"], capture_output=True,
+                    "staging refresh: styles.css cache-bust "
+                    "(persona fit trims)"], capture_output=True,
                    text=True)
 print("commit:", (r.stdout + r.stderr).strip()[:120])
 r = subprocess.run(["git", "-C", WORK, "push", "origin", "main"],
