@@ -1,37 +1,42 @@
 [
   {
-    "content": "[nav-1] styles.css: fixed dock footer + sticky tab bar + EULA modal + nav responsive + chat-widget offset",
-    "id": "nav-1",
-    "status": "in_progress"
+    "content": "[dp-1] Review KB docs + Lodge Office KB endpoint for the FAQ mirror",
+    "id": "dp-1",
+    "status": "completed"
   },
   {
-    "content": "[nav-2] site.js: tab engine (hash sync, keyboard) + EULA modal loader",
-    "id": "nav-2",
-    "status": "pending"
+    "content": "[dp-2] styles.css: method-map component, flow-diagram, run-strip, FAQ, matrix modal styles",
+    "id": "dp-2",
+    "status": "completed"
   },
   {
-    "content": "[nav-3] gatelodge.html: 7 tab panels (console into Capabilities)",
-    "id": "nav-3",
-    "status": "pending"
+    "content": "[dp-3] site.js: generalize modal engine (EULA + compare) — fixed missing dialog open-event bug",
+    "id": "dp-3",
+    "status": "completed"
   },
   {
-    "content": "[nav-4] services.html: tabs incl. 5 Gatehouse Method step tabs + step nav",
-    "id": "nav-4",
-    "status": "pending"
+    "content": "[dp-4] services.html: method map on What We Build + you-are-here strips ×5",
+    "id": "dp-4",
+    "status": "completed"
   },
   {
-    "content": "[nav-5] index.html + eula.html: unified nav, dock, legal-doc styles to styles.css",
-    "id": "nav-5",
-    "status": "pending"
+    "content": "[dp-5] gatelodge.html: How It Works page (lifecycle + audit chain + run strip), FAQ page, checkpoint renumber, editions compare modal",
+    "id": "dp-5",
+    "status": "completed"
   },
   {
-    "content": "[nav-6] Local verify: screenshots desktop + mobile, tab/modal behavior",
-    "id": "nav-6",
-    "status": "pending"
+    "content": "[dp-6] index.html: console caption links to How It Works",
+    "id": "dp-6",
+    "status": "completed"
   },
   {
-    "content": "[nav-7] Deploy: sync sites/, CF purge, live verify, commit",
-    "id": "nav-7",
-    "status": "pending"
+    "content": "[dp-7] Local verify incl. fit-on-screen for new pages — 60/60 checks",
+    "id": "dp-7",
+    "status": "completed"
+  },
+  {
+    "content": "[dp-8] Deploy: ?v=20261014c, sync, live verify, KB override pushed, commit bc6621d",
+    "id": "dp-8",
+    "status": "completed"
   }
 ]

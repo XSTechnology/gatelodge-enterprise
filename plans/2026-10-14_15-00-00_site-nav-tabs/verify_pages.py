@@ -80,7 +80,7 @@ def run():
         page.goto(BASE + "/gatelodge.html", wait_until="networkidle")
         gpages = page.eval_on_selector_all(
             ".nav-pages a", "els => els.map(a => a.textContent.trim())")
-        check("gate: 10 pages", gpages == ["One Gateway", "How It Works", "Problem", "Capabilities", "ROI",
+        check("gate: 11 pages", gpages == ["One Gateway", "How It Works", "The Product", "Problem", "Capabilities", "ROI",
                                            "Editions", "Channel", "Download", "FAQ", "Contact"], str(gpages))
         check("gate: gateway section current", page.eval_on_selector(
             '.nav-sections a[aria-current="page"]', "el => el.textContent") == "The Gateway")
@@ -94,12 +94,20 @@ def run():
         check("gate: One Gateway fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
         page.screenshot(path=os.path.join(SHOTS, "02-gate-intro.png"))
 
-        for pid in ["how", "problem", "capabilities", "roi", "editions",
+        for pid in ["how", "product", "problem", "capabilities", "roi", "editions",
                     "partners", "download", "faq", "contact"]:
             page.click(f'.nav-pages a[href="#{pid}"]')
             page.wait_for_timeout(350)
             h, _ = fit_report(pid)
             check(f"gate: {pid} fits screen", h["h"] <= h["vh"], f'{h["h"]} vs {h["vh"]}')
+            if pid == "product":
+                page.screenshot(path=os.path.join(SHOTS, "03a-gate-product.png"))
+                check("gate: product shows real screens",
+                      page.eval_on_selector_all("#product .shot img",
+                                                "els => els.length") == 3)
+                check("gate: product audit block",
+                      page.eval_on_selector("#product .product-note",
+                                            "el => !!el"))
             if pid == "problem":
                 page.screenshot(path=os.path.join(SHOTS, "03-gate-problem.png"))
             if pid == "how":

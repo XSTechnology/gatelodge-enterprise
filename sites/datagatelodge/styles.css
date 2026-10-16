@@ -266,7 +266,7 @@ main { display: block; padding-bottom: 1.5rem; }
 }
 .section h2 em { font-style: italic; color: var(--brass-bright); }
 
-.section-lede { color: var(--muted); font-size: 1rem; max-width: 42rem; margin-bottom: 1.3rem; }
+.section-lede { color: var(--muted); font-size: 1rem; max-width: 42rem; margin-bottom: .9rem; }
 
 /* ── ledger (the problem) ─────────────────────────────────────────────── */
 
@@ -294,15 +294,79 @@ main { display: block; padding-bottom: 1.5rem; }
 /* ── pillars (capabilities) ───────────────────────────────────────────── */
 
 .pillars {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: .85rem;
   padding-bottom: .4rem;
 }
 @media (max-width: 980px) { .pillars { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 640px) { .pillars { grid-template-columns: 1fr; } }
 
+/* personas — one line per stakeholder */
+.persona-row {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem;
+  margin: 0 0 .8rem;
+}
+@media (max-width: 980px) { .persona-row { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 640px) { .persona-row { grid-template-columns: 1fr; } }
+.persona {
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-left: 2px solid var(--brass); border-radius: 8px;
+  padding: .5rem .7rem; font-size: .76rem; line-height: 1.45;
+  color: var(--paper);
+}
+.persona-for {
+  color: var(--brass); font-size: .58rem; letter-spacing: .16em;
+  text-transform: uppercase; margin-right: .45rem;
+}
+
+/* product screenshots */
+.shot-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem;
+  margin-bottom: 1.5rem;
+}
+@media (max-width: 980px) { .shot-grid { grid-template-columns: 1fr; } }
+.shot {
+  margin: 0; background: var(--surface);
+  border: 1px solid var(--line-soft); border-radius: 12px;
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.shot img {
+  display: block; width: 100%; height: auto;
+  border-bottom: 1px solid var(--line-soft);
+}
+.shot figcaption {
+  font-size: .76rem; line-height: 1.5; color: var(--muted);
+  padding: .7rem .85rem;
+}
+.shot figcaption strong { color: var(--paper); }
+
+/* product band — audit verification + agents teaser */
+.product-band {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem;
+}
+@media (max-width: 980px) { .product-band { grid-template-columns: 1fr; } }
+.product-note {
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--brass); border-radius: 10px;
+  padding: .95rem 1.05rem;
+}
+.product-note p { font-size: .84rem; line-height: 1.6; margin: 0; }
+.product-note .note-tag {
+  color: var(--brass); font-size: .6rem; letter-spacing: .16em;
+  text-transform: uppercase; margin-bottom: .5rem;
+}
+.product-note a { color: var(--brass); }
+
+/* download alternate CTAs */
+.download-alt {
+  display: flex; gap: 1.1rem; justify-content: center;
+  margin-top: 1rem; font-size: .68rem; letter-spacing: .06em;
+}
+.download-alt a { color: var(--brass); text-decoration: none; }
+.download-alt a:hover { text-decoration: underline; }
+
 .pillar {
   background: var(--surface); border: 1px solid var(--line-soft);
-  border-radius: var(--r); padding: 1.15rem 1.25rem 1.25rem;
+  border-radius: var(--r); padding: .85rem 1.05rem .95rem;
   transition: transform .22s ease, border-color .22s ease, box-shadow .22s ease;
 }
 .pillar:hover {
@@ -311,7 +375,7 @@ main { display: block; padding-bottom: 1.5rem; }
 }
 .pillar-tag {
   font-size: .68rem; letter-spacing: .18em; text-transform: uppercase;
-  color: var(--brass); margin-bottom: .7rem;
+  color: var(--brass); margin-bottom: .5rem;
 }
 .pillar h3 { font-family: var(--font-display); font-weight: 500; font-size: 1.22rem; margin-bottom: .5rem; }
 .pillar p { color: var(--muted); font-size: .85rem; }
@@ -908,11 +972,11 @@ a.mm-node:hover { border-color: var(--brass); transform: translateY(-2px); }
 /* compact console — overview landing, where it sits under the estate
    pass and the whole page must fit one screen */
 .console-band.compact { padding-top: clamp(.25rem, 1.5vw, .75rem); }
-.console-band.compact .console-bar { padding: .55rem 1.1rem; }
-.console-band.compact .console-main { padding: .8rem 1.15rem .65rem; }
-.console-band.compact .console-side { padding: .8rem 1.15rem; gap: .7rem; }
-.console-band.compact .console-table td { padding: .38rem .6rem .38rem 0; }
-.console-band.compact .console-spark { height: 24px; margin: .7rem 0 .5rem; }
+.console-band.compact .console-bar { padding: .45rem 1.1rem; }
+.console-band.compact .console-main { padding: .6rem 1.15rem .45rem; }
+.console-band.compact .console-side { padding: .6rem 1.15rem; gap: .5rem; }
+.console-band.compact .console-table td { padding: .3rem .6rem .3rem 0; }
+.console-band.compact .console-spark { height: 20px; margin: .45rem 0 .35rem; }
 .console-band.compact .console-caption { margin-top: .3rem; }
 
 /* ── finish: grain, focus rings, ambient depth ─────────────────────────── */
