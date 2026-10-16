@@ -48,6 +48,16 @@ async def completions(request: Request):
     if model == "answer":
         CAPTURE.append(body)
     if model == "triage":
+        # intent analysis (pre-analyzed documents) — scripted per section
+        if "pre-analyze" in body["messages"][0]["content"]:
+            sec = re.search(r"SECTION: (.+)", body["messages"][-1]["content"])
+            s = sec.group(1).strip() if sec else "overview"
+            return {"choices": [{"message": {"content": json.dumps({
+                "summary": f"About {s.lower()}",
+                "topics": [s.lower()[:20]],
+                "questions": [f"what is the {s.lower()}",
+                              f"how does the {s.lower()} work",
+                              f"questions about {s.lower()}"]})}}]}
         # task-agent turns come from a scripted queue
         if "task agent" in body["messages"][0]["content"]:
             if TASKSCRIPT:
@@ -343,6 +353,53 @@ check("retrieval: methodology -> agent-services",
 top = app._search("purple elephant zebra quantum", chunks, idf)
 check("retrieval: nonsense -> no candidates", top == [],
       str([(c["doc"], c["section"]) for c in top[:3]]))
+
+# 12b. intent engine — pre-analyzed documents
+# analysis endpoint auth
+r = client.post("/api/kb/reanalyze", json={"doc": "faq"})
+check("reanalyze requires auth", r.status_code in (401, 403))
+# with the review key: the mock gateway scripts the analysis
+RH = {"Authorization": "Bearer review-key"}
+r = client.post("/api/kb/reanalyze", headers=RH, json={"doc": "faq"})
+j = r.json()
+check("reanalyze runs", r.status_code == 200 and j.get("ok")
+      and j.get("analyzed", {}).get("faq", 0) >= 1, r.text[:200])
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    irows = c.execute("SELECT section, questions FROM kb_intent WHERE "
+                      "doc='faq'").fetchall()
+check("kb_intent rows written", bool(irows)
+      and all(json.loads(q) for _, q in irows), str(irows)[:200])
+
+# the paraphrase test: intent questions share NO vocabulary with the
+# doc prose — a query phrased like a user finds the section only via
+# the pre-analyzed question map
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute(
+        "INSERT INTO kb_intent (doc, section, questions, summary, topics)"
+        " VALUES ('licensing', 'Downloading the trial', %s,"
+        " 'cost of ownership', '[]')"
+        " ON CONFLICT (doc, section) DO UPDATE SET questions=%s",
+        (json.dumps(["what will it set me back overall",
+                     "total cost of ownership over time"]),) * 2)
+_, cands = app._retrieve("what will it set me back overall")
+check("intent map routes paraphrase",
+      bool(cands) and cands[0]["doc"] == "licensing"
+      and cands[0]["section"] == "Downloading the trial",
+      str([(c["doc"], c["section"]) for c in cands[:3]]))
+check("intent candidates carry questions",
+      bool(cands) and cands[0].get("intent")
+      and "set me back" in " ".join(cands[0]["intent"]["questions"]),
+      str(cands[0].get("intent"))[:150])
+check("router block shows question map",
+      "answers:" in app._candidates_block(cands[:2]))
+# fallback: no intent rows at all -> content matching still works
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM kb_intent")
+_, cands2 = app._retrieve("what is gatelodge")
+check("fallback: content matching without intent map",
+      bool(cands2) and cands2[0]["doc"] == "presales"
+      and not cands2[0].get("intent"),
+      str([(c["doc"], c["section"]) for c in cands2[:3]]))
 
 # 13. inbound email agent
 IH = {"Authorization": "Bearer inbound-test-key"}

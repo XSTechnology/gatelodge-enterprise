@@ -45,6 +45,8 @@ SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL",
                                "support@datagatelodge.com")
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "").rstrip("/")
 GATEWAY_KEY = os.environ.get("GATEWAY_KEY", "")
+HELPDESK_URL = os.environ.get("HELPDESK_URL", "").rstrip("/")
+REVIEW_KEY = os.environ.get("REVIEW_KEY", "")
 LICENSING_URL = os.environ.get("LICENSING_URL",
                                "http://10.1.2.217:8100").rstrip("/")
 PORT = int(os.environ.get("PORT", "8111"))
@@ -860,18 +862,30 @@ async def kb_index(request: Request, flash: str = ""):
     base = sorted(p.stem for p in _kb_dir().glob("*.md"))
     over = {n for n, in await _q("SELECT name FROM kb_overrides")}
     custom = sorted(over - set(base))
+    iq = {n: q for n, q in await _q(
+        "SELECT doc, SUM(jsonb_array_length(questions::jsonb)) "
+        "FROM kb_intent GROUP BY doc")}
 
     rows = ""
     for n in base:
         state = ('<span class="tag warn">live-edited</span>' if n in over
                  else '<span class="tag ok">built-in</span>')
+        nq = iq.get(n)
+        intent = (f"<span class='tag' title='pre-analyzed questions'>"
+                  f"answers {nq} questions</span>" if nq
+                  else "<span class='tag'>not analyzed</span>")
         rows += (f"<tr><td class='pill'>{_e(n)}</td><td>{state}</td>"
+                 f"<td>{intent}</td>"
                  f"<td><a class='btn ghost' style='padding:.2rem .7rem;"
                  f"font-size:.72rem' href='/kb/edit?name={_e(n)}'>edit</a>"
                  f"</td></tr>")
     for n in custom:
+        nq = iq.get(n)
+        intent = (f"<span class='tag' title='pre-analyzed questions'>"
+                  f"answers {nq} questions</span>" if nq
+                  else "<span class='tag'>not analyzed</span>")
         rows += (f"<tr><td class='pill'>{_e(n)}</td>"
-                 f"<td><span class='tag'>custom</span></td>"
+                 f"<td><span class='tag'>custom</span></td><td>{intent}</td>"
                  f"<td><a class='btn ghost' style='padding:.2rem .7rem;"
                  f"font-size:.72rem' href='/kb/edit?name={_e(n)}'>edit</a> "
                  f"<a class='btn ghost' style='padding:.2rem .7rem;"
@@ -927,7 +941,7 @@ its retrieval routes on — write them as the question a visitor would
 ask.</p>
 {actions}
 {gaps_block}
-<table><tr><th>doc</th><th>state</th><th></th></tr>{rows}</table>"""
+<table><tr><th>doc</th><th>state</th><th>intent map</th><th></th></tr>{rows}</table>"""
     return page(request, "Knowledge base", body, flash=flash)
 
 
@@ -1050,6 +1064,35 @@ async def kb_edit(request: Request, name: str = "", flash: str = ""):
         content = p.read_text(encoding="utf-8")
     title, desc, body = _parse_doc(content)
     builtin = (_kb_dir() / f"{name}.md").exists()
+    # pre-analyzed intent map: what the Gatekeeper believes this doc
+    # answers — reviewable, refreshable
+    imap = await _q("SELECT section, questions, summary FROM kb_intent "
+                    "WHERE doc=%s ORDER BY section", (name,))
+    imap_html = ""
+    for section, qjson, summary in imap:
+        try:
+            qs = json.loads(qjson)
+        except Exception:
+            qs = []
+        qhtml = "".join(f"<p class='note' style='margin:.15rem 0'>— "
+                        f"{_e(q)}</p>" for q in qs)
+        imap_html += (f"<div style='margin-bottom:.7rem'>"
+                      f"<b>{_e(section)}</b>"
+                      f"<p class='note' style='margin:.1rem 0'>"
+                      f"{_e(summary)}</p>{qhtml}</div>")
+    intent_block = f"""
+<div class="box" style="margin-top:1.2rem">
+<p class="note" style="letter-spacing:.14em;text-transform:uppercase;
+color:var(--brass);margin-bottom:.6rem">Intent map — what the AI says
+this document answers</p>
+{imap_html or '<p class="note">Not analyzed yet — the Gatekeeper '
+'analyzes new documents automatically, or press Re-analyze.</p>'}
+<form method="post" action="/kb/reanalyze" class="inline">
+<input type="hidden" name="name" value="{_e(name)}">
+<button class="btn ghost" style="padding:.3rem .8rem;font-size:.75rem">
+Re-analyze</button></form>
+<span class="note">the map drives question routing — save first, then
+re-analyze to refresh it</span></div>"""
     danger = ("<a class='btn ghost' href='/kb/reset?name="
               f"{_e(name)}'>reset to built-in</a>" if builtin else
               f"<a class='btn ghost' href='/kb/reset?name={_e(name)}'"
@@ -1075,9 +1118,25 @@ async def kb_edit(request: Request, name: str = "", flash: str = ""):
 <div class="inline" style="margin-top:.8rem">
 <button class="btn">Save (live)</button>
 {danger}
-<a class="btn ghost" href="/kb">back</a></div></form>"""
+<a class="btn ghost" href="/kb">back</a></div></form>
+{intent_block}"""
     return page(request, f"Knowledge · <em>{_e(name)}</em>", body_form,
                 flash=flash)
+
+
+async def _request_reanalyze(doc: str) -> None:
+    """Ask the Gatekeeper to re-analyze a doc's intent map (background)."""
+    if not (HELPDESK_URL and REVIEW_KEY):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(
+                f"{HELPDESK_URL}/api/kb/reanalyze",
+                json={"doc": doc},
+                headers={"Authorization": f"Bearer {REVIEW_KEY}"})
+            print(f"[kb] reanalyze {doc}: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"[kb] reanalyze {doc} failed: {e!r}")
 
 
 @app.post("/kb/save")
@@ -1098,9 +1157,39 @@ async def kb_save(request: Request):
              "ON CONFLICT (name) DO UPDATE SET content=%s, "
              "updated_at=now()", (name, doc, doc))
     await _audit("kb-save", f"{name} ({len(doc)} chars)")
+    # the Gatekeeper re-analyzes what this doc answers (background)
+    asyncio.create_task(_request_reanalyze(name))
     return RedirectResponse(
         f"/kb/edit?name={name}&flash=saved+—+live+on+the+next+question",
         status_code=303)
+
+
+@app.post("/kb/reanalyze")
+async def kb_reanalyze_route(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    name = str(form.get("name", "")).strip()
+    if not (HELPDESK_URL and REVIEW_KEY):
+        return RedirectResponse(
+            f"/kb/edit?name={name}&flash=intent+engine+not+configured",
+            status_code=303)
+    try:
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post(
+                f"{HELPDESK_URL}/api/kb/reanalyze",
+                json={"doc": name},
+                headers={"Authorization": f"Bearer {REVIEW_KEY}"})
+        j = r.json() if r.status_code == 200 else {}
+        n = sum(j.get("analyzed", {}).values())
+        await _audit("kb-reanalyze", name)
+        return RedirectResponse(
+            f"/kb/edit?name={name}&flash=re-analyzed+{n}+sections",
+            status_code=303)
+    except Exception as e:
+        return RedirectResponse(
+            f"/kb/edit?name={name}&flash=re-analysis+failed:+"
+            f"{_e(repr(e)[:60])}", status_code=303)
 
 
 @app.get("/kb/reset")

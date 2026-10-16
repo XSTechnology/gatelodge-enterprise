@@ -222,6 +222,15 @@ CREATE TABLE IF NOT EXISTS rulesets (
   enabled BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS kb_intent (
+  doc TEXT NOT NULL,
+  section TEXT NOT NULL,
+  questions TEXT NOT NULL,
+  summary TEXT DEFAULT '',
+  topics TEXT DEFAULT '',
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (doc, section)
+);
 ALTER TABLE inbound_emails ADD COLUMN IF NOT EXISTS rule TEXT DEFAULT '';
 """
 
@@ -280,36 +289,31 @@ def _tok(text: str) -> list[str]:
             if len(t) > 2 and t not in _STOP]
 
 
-def _chunk_kb(kb: dict) -> list[dict]:
+def _chunk_kb(kb: dict, intents: dict | None = None) -> list[dict]:
     """Every '## ' section of every doc is a retrieval chunk. The doc's
     title/description/section-heading terms are folded into the chunk's
-    term counts, so doc-level and section-level queries both hit."""
+    term counts, so doc-level and section-level queries both hit.
+    When an intent map exists for the section, its pre-analyzed
+    QUESTIONS + summary + topics fold in too — user-language phrasing
+    ("how much does it cost") matches lexically even when the prose
+    doesn't share the words."""
+    intents = intents or {}
     chunks: list[dict] = []
     for name, d in kb.items():
-        content = d["content"]
-        m = re.search(r"^description:.*$", content, re.M)
-        body = content[m.end():] if m else content
-        sections: list[tuple[str, list[str]]] = []
-        cur_title, cur = "overview", []
-        for ln in body.splitlines():
-            h = re.match(r"^##\s+(.+?)\s*$", ln)
-            if h:
-                sections.append((cur_title, cur))
-                cur_title, cur = h.group(1), []
-            else:
-                cur.append(ln)
-        sections.append((cur_title, cur))
-        for title, lines in sections:
-            text = "\n".join(lines).strip()
-            if not text:
-                continue
+        for title, text in _split_sections(d["content"]):
+            intent = intents.get((name, title))
             tf: dict[str, int] = {}
-            for t in _tok(f'{d["title"]} {d["summary"]} {title} {title} '
-                          f"{text}"):
+            src = f'{d["title"]} {d["summary"]} {title} {title} {text}'
+            if intent:
+                src += (" " + intent["summary"] + " "
+                        + " ".join(intent["topics"]) + " "
+                        + " ".join(intent["questions"]))
+            for t in _tok(src):
                 tf[t] = tf.get(t, 0) + 1
             chunks.append({"id": len(chunks), "doc": name,
                            "doc_title": d["title"], "section": title,
-                           "text": text, "tf": tf})
+                           "text": text, "tf": tf,
+                           "intent": intent})
     return chunks
 
 
@@ -347,9 +351,168 @@ def _search(query: str, chunks: list[dict], idf: dict,
 def _retrieve(query: str) -> tuple[list[dict], list[dict]]:
     """Merged KB -> (all chunks, top candidates for the query)."""
     kb = _load_kb_overrides()
-    chunks = _chunk_kb(kb)
+    intents = _load_kb_intents(kb)
+    chunks = _chunk_kb(kb, intents)
     idf = _build_index(chunks)
     return chunks, _search(query, chunks, idf)
+
+
+# ── intent engine: pre-analyzed documents ─────────────────────────────────
+# Every KB doc is analyzed once (at authoring/deploy time, not question
+# time): an LLM reads each section and records what it contains and the
+# questions it answers — phrased the way users actually ask. The map is
+# data (kb_intent), reviewable in the Lodge Office, and folds into both
+# retrieval stages: TF-IDF terms (user-language lexical match) and the
+# triage router's candidate block (semantic pick without shipping the
+# full passages).
+
+INTENT_ANALYZE_SYSTEM = """You pre-analyze one section of product \
+documentation so a help desk can route real user questions to it. Given \
+the DOCUMENT and one SECTION, output ONLY JSON:
+
+{"summary": "<1-2 sentences: what this section contains>",
+ "topics": ["<short tag>", "..."],
+ "questions": ["<question a user would ask that THIS section answers>", \
+"..."]}
+
+Requirements:
+- 3-6 questions, phrased the way real users ask — include paraphrases
+  and synonyms ("how much does it cost", "what's the price", "is there
+  a free tier").
+- Only questions this SECTION genuinely answers on its own.
+- No meta commentary. Output ONLY the JSON."""
+
+
+def _split_sections(content: str) -> list[tuple[str, str]]:
+    """(title, text) for every '## ' section; the preamble is
+    'overview'."""
+    m = re.search(r"^description:.*$", content, re.M)
+    body = content[m.end():] if m else content
+    sections: list[tuple[str, list[str]]] = []
+    cur_title, cur = "overview", []
+    for ln in body.splitlines():
+        h = re.match(r"^##\s+(.+?)\s*$", ln)
+        if h:
+            sections.append((cur_title, cur))
+            cur_title, cur = h.group(1), []
+        else:
+            cur.append(ln)
+    sections.append((cur_title, cur))
+    return [(t, "\n".join(ls).strip()) for t, ls in sections
+            if "\n".join(ls).strip()]
+
+
+def _load_kb_intents(kb: dict) -> dict:
+    """{(doc, section): intent-dict} for every analyzed section."""
+    out: dict = {}
+    if not DATABASE_URL:
+        return out
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT doc, section, questions, summary, topics "
+                "FROM kb_intent").fetchall()
+    except Exception:
+        return out
+    for doc, section, qjson, summary, tjson in rows:
+        try:
+            questions = json.loads(qjson)
+        except Exception:
+            questions = []
+        try:
+            topics = json.loads(tjson)
+        except Exception:
+            topics = []
+        if questions:
+            out[(doc, section)] = {"questions": questions,
+                                   "summary": summary or "",
+                                   "topics": topics or []}
+    return out
+
+
+async def _analyze_section(doc_title: str, section: str,
+                           text: str) -> dict:
+    """One LLM call: what does this section contain + which questions
+    does it answer."""
+    user = (f"DOCUMENT: {doc_title}\n\nSECTION: {section}\n\n"
+            f"{text[:3000]}\n\nOutput ONLY the JSON.")
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(
+            f"{GATEWAY_URL}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+            json={"model": TRIAGE_MODEL,
+                  "messages": [
+                      {"role": "system",
+                       "content": INTENT_ANALYZE_SYSTEM},
+                      {"role": "user", "content": user}],
+                  "max_tokens": 600, "temperature": 0.1})
+        content = r.json()["choices"][0]["message"]["content"] or ""
+    m = re.search(r"\{.*\}", content, re.S)
+    if not m:
+        raise RuntimeError(f"unparseable analysis for {doc_title}/{section}")
+    d = json.loads(m.group(0))
+    questions = [str(q).strip()[:200] for q in (d.get("questions") or [])
+                 if str(q).strip()][:8]
+    if not questions:
+        raise RuntimeError(f"no questions for {doc_title}/{section}")
+    return {"summary": str(d.get("summary", ""))[:400],
+            "topics": [str(t).strip()[:40] for t in (d.get("topics") or [])
+                       if str(t).strip()][:6],
+            "questions": questions}
+
+
+def _write_kb_intent(name: str, rows: dict) -> None:
+    """Upsert the analysis rows; drop rows for removed sections."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute("DELETE FROM kb_intent WHERE doc=%s", (name,))
+        for section, intent in rows.items():
+            conn.execute(
+                "INSERT INTO kb_intent (doc, section, questions, summary,"
+                " topics) VALUES (%s, %s, %s, %s, %s)",
+                (name, section, json.dumps(intent["questions"]),
+                 intent["summary"], json.dumps(intent["topics"])))
+
+
+async def analyze_doc(name: str | None = None) -> dict:
+    """Analyze one doc (or every doc) and store its intent map.
+    Returns {doc: sections_analyzed}."""
+    kb = _load_kb_overrides()
+    names = [name] if name else sorted(kb)
+    results = {}
+    for n in names:
+        d = kb.get(n)
+        if not d:
+            continue
+        rows: dict = {}
+        for section, text in _split_sections(d["content"]):
+            try:
+                rows[section] = await _analyze_section(
+                    d["title"], section, text)
+            except Exception as e:
+                print(f"[intent] analyze failed {n}/{section}: {e!r}")
+        if rows:
+            await _run(lambda r=rows: _write_kb_intent(n, r))
+            results[n] = len(rows)
+            print(f"[intent] {n}: {len(rows)} sections analyzed")
+    return results
+
+
+async def _seed_kb_intents() -> None:
+    """Startup: analyze docs that have no intent map yet (idempotent,
+    background — never blocks serving)."""
+    try:
+        kb = _load_kb_overrides()
+        with psycopg.connect(DATABASE_URL) as conn:
+            done = {r[0] for r in conn.execute(
+                "SELECT DISTINCT doc FROM kb_intent").fetchall()}
+        todo = [n for n in sorted(kb) if n not in done]
+        for n in todo:
+            print(f"[intent] seeding analysis for {n}")
+            await analyze_doc(n)
+        if todo:
+            print(f"[intent] seed complete ({len(todo)} docs)")
+    except Exception as e:
+        print(f"[intent] seed error: {e!r}")
 
 
 # ── task tools (v3: the task engine's hands) ─────────────────────────────
@@ -745,11 +908,22 @@ product name is Gatelodge.
 
 
 def _candidates_block(cands: list[dict]) -> str:
+    """Compact candidate descriptions for the triage router. Analyzed
+    sections show their intent map (summary + the questions they
+    answer) — a much stronger routing signal than raw text snippets;
+    unanalyzed sections fall back to the snippet."""
     rows = []
     for c in cands:
-        snippet = " ".join(c["text"].split())[:220]
-        rows.append(f'[{c["id"]}] doc={c["doc"]} · {c["section"]}\n'
-                    f"    {snippet}")
+        if c.get("intent"):
+            it = c["intent"]
+            qs = " / ".join(it["questions"][:4])
+            rows.append(f'[{c["id"]}] doc={c["doc"]} · {c["section"]}\n'
+                        f"    {it['summary']}\n"
+                        f"    answers: {qs}")
+        else:
+            snippet = " ".join(c["text"].split())[:220]
+            rows.append(f'[{c["id"]}] doc={c["doc"]} · {c["section"]}\n'
+                        f"    {snippet}")
     return "\n".join(rows)
 
 
@@ -1744,6 +1918,8 @@ async def start_task_runner() -> None:
         await _run(_sync_rulesets)
     except Exception as e:
         print(f"[tasks] ruleset sync failed: {e!r}")
+    # pre-analyze documents that have no intent map yet (background)
+    asyncio.create_task(_seed_kb_intents())
     asyncio.create_task(_task_loop())
 
 
@@ -1752,6 +1928,20 @@ async def admin_run_tasks(request: Request):
     _require_review_key(request)
     await run_due_tasks()
     return {"ok": True}
+
+
+class ReanalyzeRequest(BaseModel):
+    doc: str = ""
+
+
+@app.post("/api/kb/reanalyze")
+async def kb_reanalyze(body: ReanalyzeRequest, request: Request):
+    """Re-run the intent analysis for one doc (or all docs when doc is
+    empty). Called by the Lodge Office after a KB save — the fresh map
+    goes live on the next question."""
+    _require_review_key(request)
+    results = await analyze_doc(body.doc.strip() or None)
+    return {"ok": True, "analyzed": results}
 
 
 @app.get("/api/admin/reviews")
