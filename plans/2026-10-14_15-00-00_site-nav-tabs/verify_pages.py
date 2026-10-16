@@ -145,6 +145,33 @@ def run():
         check("gate: compare modal closes", not page.eval_on_selector(
             "#compare-modal", "el => el.open"))
 
+        # executive messaging: CIO band (how), CEO band (roi), brief modal
+        page.click('.nav-pages a[href="#how"]')
+        page.wait_for_timeout(300)
+        check("gate: CIO band on how-it-works", page.eval_on_selector(
+            "#how .product-note .note-tag",
+            "el => el.textContent.includes('CIO')"))
+        page.click('.nav-pages a[href="#roi"]')
+        page.wait_for_timeout(300)
+        check("gate: CEO band on ROI", page.eval_on_selector(
+            "#roi .product-note .note-tag",
+            "el => el.textContent.includes('CEO')"))
+        page.click('#roi [data-modal-open="exec-modal"]')
+        page.wait_for_timeout(300)
+        check("gate: exec brief modal opens", page.eval_on_selector(
+            "#exec-modal", "el => el.open"))
+        check("gate: exec brief has four roles", page.eval_on_selector_all(
+            "#exec-modal .exec-role", "els => els.length") == 4)
+        check("gate: exec brief carries concern table",
+              page.eval_on_selector_all(
+                  "#exec-modal .exec-table tbody tr",
+                  "els => els.length") == 10)
+        page.screenshot(path=os.path.join(SHOTS, "03d-exec-brief.png"))
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+        check("gate: exec brief modal closes", not page.eval_on_selector(
+            "#exec-modal", "el => el.open"))
+
         # deep link still works
         page.goto(BASE + "/gatelodge.html#download", wait_until="networkidle")
         check("gate: deep link opens download", page.eval_on_selector(

@@ -108,6 +108,19 @@
     checks the budget, routes the task down the right chain, and writes the exchange
     to a ledger that cannot be quietly edited.</p>
 
+  <div class="product-band">
+    <div class="product-note reveal">
+      <p class="note-tag mono">For the CIO — your apps don't change</p>
+      <p>Keep your OpenAI SDKs; repoint the endpoint. Swap providers,
+        fail over, run local — no code changes.</p>
+    </div>
+    <div class="product-note reveal">
+      <p class="note-tag mono">It fits the stack you run</p>
+      <p>SSO from your IdP, OTLP to your observability, JSONL to your
+        SIEM — self-hosted in your perimeter.</p>
+    </div>
+  </div>
+
   <svg class="flow-diagram" viewBox="0 0 958 340" role="img" aria-label="Request lifecycle: your app calls one endpoint; Gatelodge resolves the key and role, checks budgets, routes through alias chains with a semantic cache, fans out to allowlisted providers, and appends every exchange to a hash-chained audit ledger.">
     <defs>
       <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
@@ -184,7 +197,7 @@
   </svg>
   <p class="console-caption mono">the gate decides · the ledger remembers</p>
 
-  <div class="mm-wrap" style="margin-top:1.1rem">
+  <div class="mm-wrap" style="margin-top:.6rem">
     <p class="section-label mono" style="margin-bottom:.1rem">Run it — four steps</p>
     <div class="method-map">
       <span class="mm-node"><span class="mm-no">01</span><span class="mm-name">Download</span><span class="mm-desc">one binary, no installer</span></span>
@@ -197,7 +210,7 @@
     </div>
   </div>
 
-  <p class="backend-chips" style="margin-top:1.2rem">
+  <p class="backend-chips" style="margin-top:.7rem">
     <span class="bc-head">10 backend types</span>
     <span>embedded GGUF</span><span>llama-server</span><span>RunPod</span><span>OpenAI</span>
     <span>Anthropic</span><span>Gemini</span><span>Responses</span><span>Azure</span>
@@ -391,6 +404,21 @@
   <h2>The math of<br><em>the front door</em></h2>
   <p class="section-lede">Direct savings from caching and routing, cost avoidance from
     audit readiness, and one governance layer across every provider.</p>
+
+  <div class="product-band">
+    <div class="product-note reveal">
+      <p class="note-tag mono">For the CEO — the board-ready answer</p>
+      <p>Every request is identified, budgeted, and logged — and the
+        evidence verifies with a command. That's the board answer.</p>
+    </div>
+    <div class="product-note reveal">
+      <p class="note-tag mono">Spend is a budget line, not a surprise</p>
+      <p>Hard caps per team and key — refusals, not overage invoices.
+        Governance ships in the binary: no new platform team.</p>
+    </div>
+  </div>
+  <p class="exec-brief-link mono"><button type="button"
+    data-modal-open="exec-modal">Read the executive brief</button></p>
 
   <div class="roi-grid">
     <div class="calc reveal">
@@ -691,6 +719,66 @@
       </table>
     </div>
     <div class="eula-foot mono">Self-hosted always — no SaaS tier · your prompts never transit our infrastructure</div>
+  </div>
+</dialog>
+
+<dialog class="eula-modal modal" id="exec-modal" aria-labelledby="exec-title">
+  <div class="eula-frame">
+    <div class="eula-head">
+      <div>
+        <p class="eula-kicker">For the leadership team</p>
+        <p class="eula-title" id="exec-title">The executive brief</p>
+      </div>
+      <button class="eula-close" type="button" data-modal-close aria-label="Close brief">✕</button>
+    </div>
+    <div class="eula-body">
+      <div class="exec-roles">
+        <div class="exec-role">
+          <p class="note-tag mono">CEO — the business case</p>
+          <p>AI spend capped by policy, not hope — and a board-ready answer
+            to "how do we govern AI?" without new headcount. Hard budgets per
+            team and key; cost attributed per workload; the governance ships
+            in the binary.</p>
+        </div>
+        <div class="exec-role">
+          <p class="note-tag mono">CIO — the architecture</p>
+          <p>OpenAI-compatible drop-in: applications keep their SDKs. Swap
+            providers, fail over mid-outage, mix local and cloud — without
+            touching code. SSO, OTLP and SIEM fit the stack you already run.</p>
+        </div>
+        <div class="exec-role">
+          <p class="note-tag mono">CISO — the controls</p>
+          <p>Approved providers only — unapproved models don't even display.
+            Per-request identity. Centralized secrets. A tamper-evident audit
+            chain you can verify yourself.</p>
+        </div>
+        <div class="exec-role">
+          <p class="note-tag mono">Audit — the evidence</p>
+          <p>Hash-linked request ledger, verification as a command, JSONL
+            export into your SIEM. Honest posture: no certification theater —
+            we say exactly what we are.</p>
+        </div>
+      </div>
+      <table class="matrix-table exec-table">
+        <thead><tr><th>The concern</th><th>The control</th></tr></thead>
+        <tbody>
+          <tr><td>Shadow AI</td><td>Provider allowlisting — unapproved models don't display</td></tr>
+          <tr><td>Data leakage</td><td>Governed routing — approved providers only, every request logged</td></tr>
+          <tr><td>Credential exposure</td><td>Centralized secrets — key values never logged</td></tr>
+          <tr><td>Unauthorized access</td><td>Per-request identity — keys with roles, RBAC, SSO</td></tr>
+          <tr><td>Audit requirements</td><td>Tamper-evident audit chain — verification is a command</td></tr>
+          <tr><td>Incident investigation</td><td>Per-request forensic record — who, which model, when, cost, outcome</td></tr>
+          <tr><td>Regulatory compliance</td><td>Exportable evidence — structured JSONL into your SIEM</td></tr>
+          <tr><td>Third-party risk</td><td>Provider abstraction — apps don't change when providers do</td></tr>
+          <tr><td>Provider outage</td><td>Automatic failover; hedge routing races a slow primary</td></tr>
+          <tr><td>Cost abuse</td><td>Hard budgets per team and key — refusals, not warnings</td></tr>
+        </tbody>
+      </table>
+      <p class="exec-scope mono">Governs every AI interaction your applications and
+        agents make via API · self-hosted in your perimeter · request records are
+        metadata — prompt content is never logged</p>
+    </div>
+    <div class="eula-foot mono">The Gatekeeper answers these questions live — chat, bottom right</div>
   </div>
 </dialog>
 

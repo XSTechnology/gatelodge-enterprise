@@ -356,6 +356,35 @@ main { display: block; padding-bottom: 1.5rem; }
 }
 .product-note a { color: var(--brass); }
 
+/* executive brief — trigger link + modal role blocks */
+.exec-brief-link {
+  margin: .35rem 0 0; font-size: .68rem; letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.exec-brief-link button {
+  background: none; border: none; color: var(--brass); cursor: pointer;
+  font: inherit; letter-spacing: inherit; text-transform: inherit;
+  padding: 0; text-decoration: none;
+}
+.exec-brief-link button:hover { text-decoration: underline; }
+.exec-roles { display: grid; grid-template-columns: 1fr 1fr; gap: .9rem; }
+@media (max-width: 860px) { .exec-roles { grid-template-columns: 1fr; } }
+.exec-role {
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--brass); border-radius: 10px;
+  padding: .8rem .95rem;
+}
+.exec-role p { font-size: .82rem; line-height: 1.55; margin: 0; }
+.exec-role .note-tag {
+  color: var(--brass); font-size: .6rem; letter-spacing: .16em;
+  text-transform: uppercase; margin-bottom: .45rem;
+}
+.exec-table { margin-top: 1rem; }
+.exec-scope {
+  margin-top: .9rem; color: var(--muted); font-size: .64rem;
+  letter-spacing: .08em; text-transform: uppercase; line-height: 1.7;
+}
+
 /* download alternate CTAs */
 .download-alt {
   display: flex; gap: 1.1rem; justify-content: center;
@@ -704,7 +733,7 @@ a.mm-node:hover { border-color: var(--brass); transform: translateY(-2px); }
 
 /* ── flow diagram (How It Works — request lifecycle) ──────────────────── */
 
-.flow-diagram { width: 100%; max-width: 940px; height: auto; display: block;
+.flow-diagram { width: 100%; max-width: 760px; height: auto; display: block;
   margin: 0 auto; }
 .fd-box { fill: var(--surface); stroke: var(--line); }
 .fd-gate { fill: rgba(26, 36, 29, .65); stroke: var(--brass); stroke-width: 1.2; }
