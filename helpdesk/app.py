@@ -242,6 +242,18 @@ CREATE TABLE IF NOT EXISTS kb_intent (
   PRIMARY KEY (doc, section)
 );
 ALTER TABLE inbound_emails ADD COLUMN IF NOT EXISTS rule TEXT DEFAULT '';
+CREATE TABLE IF NOT EXISTS escalation_topics (
+  id BIGSERIAL PRIMARY KEY,
+  topic TEXT UNIQUE NOT NULL,
+  guidance TEXT NOT NULL,
+  enabled BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS agent_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
 """
 
 
@@ -367,7 +379,8 @@ def _retrieve(query: str) -> tuple[list[dict], list[dict]]:
     intents = _load_kb_intents(kb)
     chunks = _chunk_kb(kb, intents)
     idf = _build_index(chunks)
-    return chunks, _search(query, chunks, idf)
+    return chunks, _search(query, chunks, idf,
+                           k=_setting_int("retrieval_top_k", 8))
 
 
 # ── intent engine: pre-analyzed documents ─────────────────────────────────
@@ -890,6 +903,80 @@ async def turnstile_ok(token: str, ip: str) -> bool:
 
 # ── gateway calls ─────────────────────────────────────────────────────────
 
+# ── escalation criteria + agent settings: prompt data, not code ───────────
+# The rerank prompt's legal-escalation list and the retrieval thresholds
+# live in the DB (editable in the Lodge Office), seeded from these
+# defaults. Behavior never regresses: an empty/unreachable table falls
+# back to the code defaults.
+
+DEFAULT_ESCALATIONS = [
+    ("EULA/contract interpretation",
+     "requests to interpret the EULA or contract language"),
+    ("Certification status",
+     "certification or compliance-status questions (SOC 2, ISO, audit "
+     "certifications)"),
+    ("Pricing negotiations",
+     "pricing negotiations or discounts (custom quotes, deal terms — "
+     "NOT plain questions about published prices, which the passages "
+     "answer)"),
+    ("Security incidents",
+     "reports of a security incident or a suspected vulnerability"),
+]
+
+DEFAULT_SETTINGS = {
+    "retrieval_top_k": "8",     # TF-IDF candidates sent to the reranker
+    "rerank_pick_max": "3",     # passages the answer may cite
+    "inbound_daily_cap": "3",   # auto-replies per sender per day
+}
+
+
+def _escalation_block() -> str:
+    """The rerank prompt's legal-escalation list, from the DB."""
+    rows = None
+    if DATABASE_URL:
+        try:
+            with psycopg.connect(DATABASE_URL) as conn:
+                rows = conn.execute(
+                    "SELECT topic, guidance FROM escalation_topics "
+                    "WHERE enabled ORDER BY id").fetchall()
+        except Exception:
+            rows = None
+    if not rows:
+        rows = DEFAULT_ESCALATIONS
+    return "\n".join(f"  * {g}" for _, g in rows)
+
+
+_SETTINGS_CACHE: dict = {"at": 0.0, "data": {}}
+
+
+def _settings() -> dict:
+    """Agent settings (key -> value), cached 15s — edits go live on the
+    next question without a per-request DB hit."""
+    if not DATABASE_URL:
+        return {}
+    now = time.time()
+    if _SETTINGS_CACHE["data"] and now - _SETTINGS_CACHE["at"] < 15:
+        return _SETTINGS_CACHE["data"]
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM agent_settings").fetchall()
+        data = dict(rows)
+        if data:
+            _SETTINGS_CACHE.update(at=now, data=data)
+        return data
+    except Exception:
+        return {}
+
+
+def _setting_int(key: str, default: int) -> int:
+    try:
+        v = int(str(_settings().get(key, default)).strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
 RERANK_SYSTEM = """You triage customer questions for the Gatelodge help \
 desk. Keyword search retrieved the CANDIDATE passages below; you pick the \
 best ones.
@@ -898,12 +985,9 @@ Pick 1-3 candidate ids that answer the LATEST question (follow-ups refer \
 to earlier turns — judge them in conversation context). Calibrate:
 - confident=true ONLY when a passage clearly and fully answers it
 - vague, borderline, or partially-covered questions: confident=false
-- legal=true for requests to interpret the EULA/contract — always escalate
-- legal=true also for certification or compliance-status questions \
-(SOC 2, ISO, audit certifications), pricing negotiations or discounts \
-(custom quotes, deal terms — NOT plain questions about published \
-prices, which the passages answer), and security incident reports — \
-these always go to the team, never the AI
+- legal=true when the question matches any ESCALATION TOPIC below — \
+these always go to the team, never the AI:
+{escalations}
 - decision=true when the visitor asks for a RULING or eligibility — a \
 refund, approval, discount, exception, entitlement — rather than \
 information. Questions about what the policy IS are information \
@@ -957,6 +1041,33 @@ def _passages_block(chunks: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+def _suggestions(doc: str | None, picked: list[dict]) -> list[str]:
+    """2-3 related questions from the routed doc's intent map — the
+    sections OTHER than the ones just answered. This is the pre-analyzed
+    map doing double duty: the widget offers the natural next question."""
+    if not doc or not DATABASE_URL:
+        return []
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            rows = conn.execute(
+                "SELECT section, questions FROM kb_intent WHERE doc=%s",
+                (doc,)).fetchall()
+    except Exception:
+        return []
+    skip = {c["section"] for c in picked}
+    out: list[str] = []
+    for section, qjson in rows:
+        if section in skip:
+            continue
+        try:
+            qs = json.loads(qjson)
+        except Exception:
+            continue
+        if qs:
+            out.append(str(qs[0]).strip())
+    return [q for q in out if 8 < len(q) <= 70][:3]
+
+
 async def triage(question: str, history: list[dict]) -> dict:
     """Stage 1 — hybrid retrieval (TF-IDF) + LLM rerank (semantic pick,
     calibrated confidence, follow-up aware). Fail-safe to escalate on
@@ -991,6 +1102,7 @@ async def triage(question: str, history: list[dict]) -> dict:
                       "messages": [
                           {"role": "system",
                            "content": RERANK_SYSTEM.format(
+                               escalations=_escalation_block(),
                                candidates=_candidates_block(cands))},
                           {"role": "user", "content": user_msg}],
                       "max_tokens": 600, "temperature": 0.0})
@@ -1004,8 +1116,9 @@ async def triage(question: str, history: list[dict]) -> dict:
     try:
         d = json.loads(m.group(0))
         by_id = {c["id"]: c for c in cands}
+        pick_max = _setting_int("rerank_pick_max", 3)
         ids = [i for i in (d.get("ids") or [])
-               if str(i).isdigit() and int(i) in by_id][:3]
+               if str(i).isdigit() and int(i) in by_id][:pick_max]
         picked = [by_id[int(i)] for i in ids]
         return {"chunks": picked, "confident": bool(d.get("confident")),
                 "legal": bool(d.get("legal")),
@@ -1401,8 +1514,10 @@ async def chat_message(body: MessageRequest, request: Request):
         answer = "".join(answer_parts)
         await _run(lambda: _save_assistant(body.session_id, answer,
                                            primary, ANSWER_MODEL))
+        sugg = await _run(lambda: _suggestions(primary, picked))
         yield await sse("done", {"doc": primary, "topic": t["topic"],
-                                 "sources": sources})
+                                 "sources": sources,
+                                 "suggestions": sugg})
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -1561,7 +1676,8 @@ async def email_inbound(body: InboundEmail, request: Request):
     if await _run(lambda: _inbound_seen(mid)):
         return {"status": "ignored", "reason": "duplicate"}
     await _run(lambda: _contact_upsert(frm, source="inbound"))
-    if await _run(lambda: _inbound_sender_count(frm)) >= INBOUND_DAILY_CAP:
+    if await _run(lambda: _inbound_sender_count(frm)) >= \
+            _setting_int("inbound_daily_cap", INBOUND_DAILY_CAP):
         await _run(lambda: _insert_inbound(
             mid, frm, subject, text, "review", False, None,
             "daily-cap", ""))
@@ -2209,6 +2325,25 @@ def _sync_rulesets() -> None:
             "WHERE a.kind = b.kind AND a.id > b.id")
 
 
+def _sync_governance_data() -> None:
+    """Seed the escalation topics + agent settings (idempotent). The
+    rerank prompt's legal list and the retrieval thresholds are data —
+    these are their code defaults."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        for topic, guidance in DEFAULT_ESCALATIONS:
+            conn.execute(
+                "INSERT INTO escalation_topics (topic, guidance) "
+                "SELECT %s, %s WHERE NOT EXISTS "
+                "(SELECT 1 FROM escalation_topics WHERE topic=%s)",
+                (topic, guidance, topic))
+        for k, v in DEFAULT_SETTINGS.items():
+            conn.execute(
+                "INSERT INTO agent_settings (key, value) "
+                "SELECT %s, %s WHERE NOT EXISTS "
+                "(SELECT 1 FROM agent_settings WHERE key=%s)",
+                (k, v, k))
+
+
 async def run_due_tasks() -> None:
     if not DATABASE_URL:
         return
@@ -2267,6 +2402,11 @@ async def start_task_runner() -> None:
         await _run(_sync_rulesets)
     except Exception as e:
         print(f"[tasks] ruleset sync failed: {e!r}")
+    # seed the escalation topics + agent settings (prompt data)
+    try:
+        await _run(_sync_governance_data)
+    except Exception as e:
+        print(f"[tasks] governance data sync failed: {e!r}")
     # pre-analyze documents that have no intent map yet (background)
     asyncio.create_task(_seed_kb_intents())
     asyncio.create_task(_task_loop())

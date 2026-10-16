@@ -503,6 +503,121 @@ check("public new docs present",
       "evaluation" in docs_internal and "comparison" in docs_internal,
       str(sorted(docs_internal)))
 
+# 12e. escalation topics — the rerank prompt's legal list, as data
+# (the suite runs with RUN_TASKS=0, so seed like the startup would)
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM escalation_topics")
+    for topic, guidance in app.DEFAULT_ESCALATIONS:
+        c.execute("INSERT INTO escalation_topics (topic, guidance) "
+                  "VALUES (%s, %s)", (topic, guidance))
+    c.execute("INSERT INTO escalation_topics (topic, guidance) "
+              "VALUES ('vip handling', 'questions from vip flagged "
+              "senders')")
+    c.execute("UPDATE escalation_topics SET enabled=false "
+              "WHERE topic='Pricing negotiations'")
+blk = app._escalation_block()
+check("escalation block reads the db",
+      "vip flagged senders" in blk
+      and "pricing negotiations or discounts" not in blk
+      and "SOC 2" in blk, blk[:160].replace("\n", " | "))
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("UPDATE escalation_topics SET enabled=true "
+              "WHERE topic='Pricing negotiations'")
+    c.execute("DELETE FROM escalation_topics WHERE topic="
+              "'vip handling'")
+blk = app._escalation_block()
+check("escalation block reflects edits",
+      "pricing negotiations or discounts" in blk
+      and "vip flagged" not in blk, blk[:160].replace("\n", " | "))
+
+# 12f. agent settings — routing thresholds as data
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("INSERT INTO agent_settings (key, value) "
+              "VALUES ('retrieval_top_k', '3') ON CONFLICT (key) "
+              "DO UPDATE SET value='3'")
+app._SETTINGS_CACHE.update(at=0.0, data={})
+_, cands_top = app._retrieve("what is gatelodge")
+check("retrieval_top_k setting honored", 0 < len(cands_top) <= 3,
+      str(len(cands_top)))
+# intent rows for the direct suggestions test (the fallback test wiped
+# them), plus a uniquely-named doc so the flow test's routing is
+# deterministic regardless of corpus state
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    for s in ("How long is the trial?", "Self-hosting effort",
+              "Data residency"):
+        c.execute(
+            "INSERT INTO kb_intent (doc, section, questions, "
+            "summary, topics) VALUES ('faq', %s, %s, %s, '[]') "
+            "ON CONFLICT (doc, section) DO UPDATE SET questions=%s",
+            (s, json.dumps([f"what is the {s.lower()}",
+                            f"how does {s.lower()} work"]),
+             f"About {s.lower()}",
+             json.dumps([f"what is the {s.lower()}",
+                         f"how does {s.lower()} work"])))
+    c.execute(
+        "INSERT INTO kb_overrides (name, content) VALUES ('suggtest',"
+        " %s) ON CONFLICT (name) DO UPDATE SET content=%s",
+        ("# Suggtest\ntitle: Suggtest\ndescription: zephyr quilt "
+         "orchard\n\n## Zephyr basics\n\nzephyr quilt orchard notes\n\n"
+         "## Orchard care\n\nrows and seasons\n\n## Quilt patterns\n\n"
+         "stitch libraries\n",) * 2)
+    for s, qs in (("Zephyr basics", ["what is the zephyr basics"]),
+                  ("Orchard care", ["how do i tend the orchard rows"]),
+                  ("Quilt patterns", ["which quilt patterns exist"])):
+        c.execute(
+            "INSERT INTO kb_intent (doc, section, questions, summary, "
+            "topics) VALUES ('suggtest', %s, %s, 'about it', '[]') "
+            "ON CONFLICT (doc, section) DO UPDATE SET questions=%s",
+            (s, json.dumps(qs), json.dumps(qs)))
+SUGG_QS = {"what is the zephyr basics", "how do i tend the orchard rows",
+           "which quilt patterns exist"}
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("INSERT INTO agent_settings (key, value) "
+              "VALUES ('rerank_pick_max', '1') ON CONFLICT (key) "
+              "DO UPDATE SET value='1'")
+app._SETTINGS_CACHE.update(at=0.0, data={})
+MODE["triage"] = "confident"
+MODE["decision"] = False
+r = client.post("/api/chat/message", json={
+    "session_id": sid, "text": "zephyr quilt orchard"})
+evs = sse_events(r.text)
+done = next((d for e, d in evs if e == "done"), {})
+picked_sec = (done.get("sources") or [{}])[0].get("section")
+check("rerank_pick_max setting honored",
+      len(done.get("sources", [])) == 1, str(done.get("sources")))
+check("done carries suggestions from the intent map",
+      done.get("doc") == "suggtest"
+      and isinstance(done.get("suggestions"), list)
+      and 1 <= len(done["suggestions"]) <= 2
+      and set(done["suggestions"]) <= SUGG_QS
+      and (picked_sec != "Zephyr basics"
+           or "what is the zephyr basics" not in done["suggestions"]),
+      str(done)[:200])
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("DELETE FROM kb_overrides WHERE name='suggtest'")
+    c.execute("DELETE FROM kb_intent WHERE doc='suggtest'")
+    c.execute("UPDATE agent_settings SET value='3' "
+              "WHERE key='rerank_pick_max'")
+    c.execute("UPDATE agent_settings SET value='8' "
+              "WHERE key='retrieval_top_k'")
+app._SETTINGS_CACHE.update(at=0.0, data={})
+
+# suggestions come only from OTHER sections of the routed doc
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    rows_f = c.execute("SELECT section, questions FROM kb_intent "
+                       "WHERE doc='faq'").fetchall()
+if rows_f:
+    skip = rows_f[0][0]
+    other_q = {q for sec, qj in rows_f if sec != skip
+               for q in json.loads(qj)}
+    sugg = app._suggestions("faq", [{"section": skip}])
+    check("suggestions skip the answered section",
+          bool(sugg) and set(sugg) <= other_q and len(sugg) <= 3,
+          f"skip={skip} sugg={sugg}")
+else:
+    check("suggestions skip the answered section", False,
+          "no faq intent rows")
+
 # 13. inbound email agent
 IH = {"Authorization": "Bearer inbound-test-key"}
 r = client.post("/api/email/inbound", json={"from_addr": "a@b.co",
@@ -572,6 +687,25 @@ r = client.post("/api/email/inbound", headers=IH, json={
 check("inbound daily cap queues for review",
       r.json().get("status") == "review"
       and r.json().get("reason") == "daily-cap", r.text[:150])
+
+# daily cap as a setting: cap=1 caps the SECOND reply from a sender
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("INSERT INTO agent_settings (key, value) "
+              "VALUES ('inbound_daily_cap', '1') ON CONFLICT (key) "
+              "DO UPDATE SET value='1'")
+    c.execute("INSERT INTO inbound_emails (id, from_addr, status) "
+              "VALUES ('cap-one', 'onecap@example.com', 'answered')")
+app._SETTINGS_CACHE.update(at=0.0, data={})
+r = client.post("/api/email/inbound", headers=IH, json={
+    "message_id": "inb-005b", "from_addr": "onecap@example.com",
+    "text": "what is gatelodge?"})
+check("inbound_daily_cap setting honored",
+      r.json().get("status") == "review"
+      and r.json().get("reason") == "daily-cap", r.text[:150])
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    c.execute("UPDATE agent_settings SET value='3' "
+              "WHERE key='inbound_daily_cap'")
+app._SETTINGS_CACHE.update(at=0.0, data={})
 
 # raw MIME parsing path
 r = client.post("/api/email/inbound", headers=IH, json={

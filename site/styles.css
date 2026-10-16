@@ -1157,6 +1157,18 @@ p.small { font-size: .8rem; line-height: 1.6; }
 .gk-src a:hover { color: var(--brass-bright); text-decoration: underline; }
 .gk-dec { color: var(--brass); }
 .gk-turnstile { align-self: stretch; }
+.gk-sugg { display: flex; flex-wrap: wrap; gap: .4rem;
+  margin-top: .5rem; padding-top: .45rem;
+  border-top: 1px dashed var(--line-soft); }
+.gk-sugg button {
+  background: transparent; color: var(--brass);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: .28rem .7rem; font-family: var(--font-body);
+  font-size: .74rem; cursor: pointer; text-align: left;
+  transition: border-color .15s ease, color .15s ease;
+}
+.gk-sugg button:hover { border-color: var(--brass);
+  color: var(--brass-bright); }
 
 .gk-input-row {
   display: flex; gap: .55rem; padding: .8rem 1rem .5rem;

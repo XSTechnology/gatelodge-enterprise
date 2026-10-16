@@ -215,6 +215,19 @@ async def _init() -> None:
                 enabled BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMPTZ DEFAULT now()
             )""")
+            # rerank-prompt escalation criteria + agent thresholds
+            conn.execute("""CREATE TABLE IF NOT EXISTS escalation_topics (
+                id BIGSERIAL PRIMARY KEY,
+                topic TEXT UNIQUE NOT NULL,
+                guidance TEXT NOT NULL,
+                enabled BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS agent_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )""")
     await _run(run)
 
 
@@ -1732,6 +1745,71 @@ async def policies_index(request: Request, flash: str = ""):
                 f"<a class='btn ghost' style='padding:.15rem .5rem;"
                 f"font-size:.7rem' href='/policy/{rid}#test'>test</a> "
                 f"{toggle}</td></tr>")
+
+    # escalation topics — the rerank prompt's legal list, as data
+    erows = await _q(
+        "SELECT id, topic, guidance, enabled FROM escalation_topics "
+        "ORDER BY id")
+    etrs = ""
+    for eid, topic, guidance, en in erows:
+        state = ('<span class=tag ok>on</span>' if en
+                 else '<span class=tag bad>off</span>')
+        etrs += (f"<tr><td>{_e(topic)}</td>"
+                 f"<td class='note'>{_e(guidance[:110])}</td>"
+                 f"<td>{state}</td>"
+                 f"<td><a class='btn ghost' style='padding:.15rem .5rem;"
+                 f"font-size:.7rem' href='/escalation/{eid}'>edit</a> "
+                 f"<form method='post' action='/escalation/toggle' "
+                 f"class='inline'><input type='hidden' name='id' "
+                 f"value='{eid}'><button class='btn ghost' "
+                 f"style='padding:.15rem .5rem;font-size:.7rem'>"
+                 f"{'disable' if en else 'enable'}</button></form>"
+                 f"</td></tr>")
+    escalation_block = f"""
+<div class="box" style="margin-top:1.8rem">
+<p class="note" style="letter-spacing:.14em;text-transform:uppercase;
+color:var(--brass);margin-bottom:.7rem">Escalation topics — what the
+AI always sends to the team</p>
+<p class="note" style="margin-bottom:.7rem">These feed the Gatekeeper's
+question triage: a question matching a topic is escalated (legal=true)
+instead of answered. Seeded from the repo; edits go live on the next
+question.</p>
+<table><tr><th>topic</th><th>matches</th><th>state</th><th></th></tr>
+{etrs or '<tr><td colspan=4 class=note>None — the Gatekeeper falls '
+'back to its built-in list.</td></tr>'}</table></div>"""
+
+    # agent settings — retrieval + reply thresholds, as data
+    srows = await _q(
+        "SELECT key, value, updated_at FROM agent_settings "
+        "ORDER BY key")
+    SETTING_HELP = {
+        "retrieval_top_k": "candidates the keyword stage sends to the "
+                           "AI triage (1-50)",
+        "rerank_pick_max": "passages an answer may cite (1-5)",
+        "inbound_daily_cap": "auto-reply emails per sender per day "
+                             "(1-100)",
+    }
+    str_ = ""
+    for k, v, at in srows:
+        str_ += (f"<tr><td class='pill'>{_e(k)}</td>"
+                 f"<td class='mono'>{_e(v)}</td>"
+                 f"<td class='note'>{_e(SETTING_HELP.get(k, ''))}</td>"
+                 f"<td><form method='post' action='/settings/save' "
+                 f"class='inline'><input type='hidden' name='key' "
+                 f"value='{_e(k)}'><input type='text' name='value' "
+                 f"value='{_e(v)}' style='width:70px'> "
+                 f"<button class='btn ghost' style='padding:.15rem "
+                 f".5rem;font-size:.7rem'>save</button></form></td></tr>")
+    settings_block = f"""
+<div class="box" style="margin-top:1.2rem">
+<p class="note" style="letter-spacing:.14em;text-transform:uppercase;
+color:var(--brass);margin-bottom:.7rem">Agent settings — routing
+thresholds</p>
+<table><tr><th>setting</th><th>value</th><th>controls</th><th></th></tr>
+{str_ or '<tr><td colspan=4 class=note>Defaults in effect — the '
+'Gatekeeper seeds these at startup.</td></tr>'}</table>
+<p class="note" style="margin-top:.5rem">Read per question (15s cache):
+changes apply to the next request, no restart.</p></div>"""
     body = f"""
 <p class="note" style="margin-bottom:1.2rem">Deterministic system
 policies. The Gatekeeper loads these on every request — the tool gate
@@ -1746,7 +1824,9 @@ fail-opens the behavior it guards.</p>
 <p class="note" style="margin-top:1rem">Policies are data, not code:
 the model extracts facts, this table decides, the run trace names the
 rule that fired. New kinds are wired in the repo — these screens edit
-what exists.</p>"""
+what exists.</p>
+{escalation_block}
+{settings_block}"""
     return page(request, "Policies", body, flash=flash)
 
 
@@ -1922,6 +2002,116 @@ async def policy_test(request: Request, rid: int):
     except Exception as e:
         return JSONResponse({"error": f"evaluation failed: {e!r}"},
                             status_code=400)
+
+
+# ── escalation topics + agent settings (prompt data, editable) ────────────
+
+@app.get("/escalation/{eid}", response_class=HTMLResponse)
+async def escalation_edit(request: Request, eid: int, flash: str = ""):
+    if (r := _guard(request)):
+        return r
+    row = await _q(
+        "SELECT id, topic, guidance, enabled FROM escalation_topics "
+        "WHERE id=%s", (eid,), fetch="one")
+    if not row:
+        return RedirectResponse("/policies?flash=not+found",
+                                status_code=303)
+    _, topic, guidance, en = row
+    body = f"""
+<div class="inline" style="margin-bottom:1rem">
+<a class="btn ghost" href="/policies">← policies</a>
+<span class="tag {'ok' if en else 'bad'}">{'enabled' if en else
+'disabled'}</span></div>
+<form method="post" action="/escalation/save">
+<input type="hidden" name="id" value="{eid}">
+<label>topic name</label>
+<input name="topic" value="{_e(topic)}" required>
+<label>matches — the guidance the triage AI reads (one phrase, precise;
+this text goes into the prompt verbatim)</label>
+<textarea name="guidance" required
+ style="min-height:110px">{_e(guidance)}</textarea>
+<label class="inline" style="gap:.5rem;margin-top:.6rem">
+<input type="checkbox" name="enabled" value="1"
+{' checked' if en else ''} style="width:auto"> enabled</label>
+<div class="inline" style="margin-top:.8rem">
+<button class="btn">Save (live on the next question)</button></div></form>
+<p class="note" style="margin-top:1rem">This is prompt data: write it
+as the shape of question to escalate, not as instructions.</p>"""
+    return page(request, f"Escalation · <em>{_e(topic)}</em>", body,
+                flash=flash)
+
+
+@app.post("/escalation/save")
+async def escalation_save(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    eid = int(form.get("id") or 0)
+    topic = str(form.get("topic", "")).strip()[:120]
+    guidance = str(form.get("guidance", "")).strip()[:400]
+    enabled = bool(form.get("enabled"))
+    if not (topic and guidance):
+        return RedirectResponse(
+            f"/escalation/{eid}?flash=topic+and+guidance+required",
+            status_code=303)
+    await _x("UPDATE escalation_topics SET topic=%s, guidance=%s, "
+             "enabled=%s WHERE id=%s", (topic, guidance, enabled, eid))
+    await _audit("escalation-save", f"#{eid} {topic}")
+    return RedirectResponse("/policies?flash=escalation+topic+saved",
+                            status_code=303)
+
+
+@app.post("/escalation/toggle")
+async def escalation_toggle(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    eid = int(form.get("id") or 0)
+    row = await _q("SELECT topic, enabled FROM escalation_topics "
+                   "WHERE id=%s", (eid,), fetch="one")
+    if not row:
+        return RedirectResponse("/policies?flash=not+found",
+                                status_code=303)
+    await _x("UPDATE escalation_topics SET enabled=NOT enabled "
+             "WHERE id=%s", (eid,))
+    await _audit("escalation-toggle",
+                 f"#{eid} {row[0]} -> {'off' if row[1] else 'on'}")
+    return RedirectResponse("/policies", status_code=303)
+
+
+# known settings + their valid ranges — the Gatekeeper reads these keys
+_SETTING_RANGES = {
+    "retrieval_top_k": (1, 50),
+    "rerank_pick_max": (1, 5),
+    "inbound_daily_cap": (1, 100),
+}
+
+
+@app.post("/settings/save")
+async def settings_save(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    key = str(form.get("key", "")).strip()
+    value = str(form.get("value", "")).strip()
+    rng = _SETTING_RANGES.get(key)
+    if not rng:
+        return RedirectResponse("/policies?flash=unknown+setting",
+                                status_code=303)
+    try:
+        v = int(value)
+        if not (rng[0] <= v <= rng[1]):
+            raise ValueError
+    except ValueError:
+        return RedirectResponse(
+            f"/policies?flash={key}+must+be+{rng[0]}-{rng[1]}",
+            status_code=303)
+    await _x("INSERT INTO agent_settings (key, value) VALUES (%s, %s) "
+             "ON CONFLICT (key) DO UPDATE SET value=%s, "
+             "updated_at=now()", (key, value, value))
+    await _audit("setting-save", f"{key}={value}")
+    return RedirectResponse(f"/policies?flash={key}+saved",
+                            status_code=303)
 
 
 # ── portal clients: provisioning for the client task portal ──────────────

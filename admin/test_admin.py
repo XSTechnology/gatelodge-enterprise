@@ -136,6 +136,22 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
         version INT DEFAULT 1, jdm TEXT NOT NULL,
         enabled BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS escalation_topics (
+        id BIGSERIAL PRIMARY KEY, topic TEXT UNIQUE NOT NULL,
+        guidance TEXT NOT NULL, enabled BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS agent_settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("DELETE FROM escalation_topics")
+    c.execute("DELETE FROM agent_settings")
+    c.execute("INSERT INTO escalation_topics (topic, guidance) "
+              "VALUES ('Certification status', 'certification or "
+              "compliance-status questions (SOC 2, ISO)'), "
+              "('Security incidents', 'reports of a security incident')")
+    c.execute("INSERT INTO agent_settings (key, value) VALUES "
+              "('retrieval_top_k', '8'), ('rerank_pick_max', '3'), "
+              "('inbound_daily_cap', '3')")
     # deterministic: own the tables for this run
     for t in ("chat_messages", "chat_sessions", "licenses", "leads",
               "email_log", "admin_audit", "kb_overrides", "inbound_emails",
@@ -577,6 +593,62 @@ with TestClient(app.app) as client:
         en = c.execute("SELECT enabled FROM rulesets WHERE id=%s",
                        (rid,)).fetchone()[0]
     check("policy toggle re-enables", en is True)
+
+    # 8l. escalation topics + agent settings (prompt data screens)
+    r = client.get("/policies")
+    check("policies: escalation topics box",
+          "Escalation topics" in r.text
+          and "Certification status" in r.text
+          and "SOC 2" in r.text)
+    check("policies: agent settings box",
+          "Agent settings" in r.text and "retrieval_top_k" in r.text
+          and "rerank_pick_max" in r.text)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        eid = c.execute("SELECT id FROM escalation_topics WHERE "
+                        "topic='Certification status'").fetchone()[0]
+    r = client.get(f"/escalation/{eid}")
+    check("escalation edit renders", r.status_code == 200
+          and "compliance-status" in r.text)
+    r = client.post("/escalation/save", data={
+        "id": eid, "topic": "Certification status",
+        "guidance": "any question about SOC 2 or ISO status",
+        "enabled": "1"}, follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        ev = c.execute("SELECT guidance, enabled FROM escalation_topics"
+                       " WHERE id=%s", (eid,)).fetchone()
+    check("escalation save updates guidance",
+          r.status_code == 303 and ev[0] == "any question about SOC 2 "
+          "or ISO status" and ev[1] is True, str(ev))
+    client.post("/escalation/toggle", data={"id": eid})
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        ev = c.execute("SELECT enabled FROM escalation_topics"
+                       " WHERE id=%s", (eid,)).fetchone()[0]
+    check("escalation toggle disables", ev is False)
+    client.post("/escalation/toggle", data={"id": eid})
+    r = client.post("/settings/save", data={
+        "key": "retrieval_top_k", "value": "12"}, follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        sv = c.execute("SELECT value FROM agent_settings WHERE "
+                       "key='retrieval_top_k'").fetchone()[0]
+    check("settings save updates value",
+          r.status_code == 303 and sv == "12", sv)
+    r = client.post("/settings/save", data={
+        "key": "retrieval_top_k", "value": "abc"}, follow_redirects=False)
+    check("settings save rejects non-numeric",
+          r.status_code == 303 and "must+be+1-50" in
+          r.headers.get("location", ""))
+    r = client.post("/settings/save", data={
+        "key": "retrieval_top_k", "value": "999"}, follow_redirects=False)
+    check("settings save rejects out-of-range",
+          r.status_code == 303 and "must+be+1-50" in
+          r.headers.get("location", ""))
+    r = client.post("/settings/save", data={
+        "key": "unknown_key", "value": "1"}, follow_redirects=False)
+    check("settings save rejects unknown key",
+          r.status_code == 303 and "unknown+setting" in
+          r.headers.get("location", ""))
+    client.post("/settings/save", data={
+        "key": "retrieval_top_k", "value": "8"})
 
     # 9. leads CSV
     r = client.get("/leads.csv")

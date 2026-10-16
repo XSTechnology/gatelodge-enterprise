@@ -69,7 +69,7 @@
       + "</div>"
       + '<div class="gk-foot mono">'
       + '<a href="#" class="gk-human">talk to a human</a>'
-      + '<span class="gk-brand">datagatelodge.solutions</span>'
+      + '<span class="gk-brand">datagatelodge.com</span>'
       + "</div>";
 
     launch.appendChild(label);
@@ -210,6 +210,7 @@
         if (!bubble2.textContent) bubble2.textContent = "(no answer)";
         renderSources(bubble2, d.sources || []);
         renderDecision(bubble2, d);
+        renderSuggestions(bubble2, d.suggestions || []);
       } else if (ev === "escalate") {
         bubble2.textContent = d.message ||
           "I want to get this exactly right — can I take your email?";
@@ -228,6 +229,26 @@
         " — deterministic policy, not the AI's judgment";
       line.appendChild(t);
       bubble2.appendChild(line);
+      dom.msgs.scrollTop = dom.msgs.scrollHeight;
+    }
+
+    /* suggested next questions — from the pre-analyzed intent map of
+       the doc that just answered; clicking asks them */
+    function renderSuggestions(bubble2, suggestions) {
+      if (!suggestions || !suggestions.length) return;
+      var row = el("div", "gk-sugg");
+      suggestions.slice(0, 3).forEach(function (q) {
+        var b = el("button");
+        b.type = "button";
+        b.textContent = q;
+        b.addEventListener("click", function () {
+          row.remove();
+          dom.input.value = q;
+          send();
+        });
+        row.appendChild(b);
+      });
+      bubble2.appendChild(row);
       dom.msgs.scrollTop = dom.msgs.scrollHeight;
     }
 
