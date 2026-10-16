@@ -282,6 +282,7 @@ dev = [
     { name = "ordered-set" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "zen-engine" },
     { name = "zstandard" },
 ]
 
@@ -309,6 +310,7 @@ dev = [
     { name = "ordered-set", specifier = ">=4.1.0" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "zen-engine", specifier = ">=2.1.3" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 
@@ -1273,6 +1275,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5d/ad/04bbb797c84fc1f26cb171f7394716f4865ffb8d8c5e1eef42565c2dfa6b/uvicorn-0.53.0.tar.gz", hash = "sha256:a9356f0cb89b3b8621529c5d5eebd69bfe154f4c3f68b4cf2de47e45fa855c2e", size = 110881, upload-time = "2026-09-14T07:44:23.815Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/76/18/0eea75741ee812e9f598b687619ce2454f6c3a1c5cd21ea990ec6bd26f45/uvicorn-0.53.0-py3-none-any.whl", hash = "sha256:e8dca71ec86dce5f04e333f0d56cdedf942446e6643b9cea1af0d6d3a02cb03e", size = 87081, upload-time = "2026-09-14T07:44:22.179Z" },
+]
+
+[[package]]
+name = "zen-engine"
+version = "2.1.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/da/38deff29a6423c1a78fc80ba253cb6b980745ff283ca69d796f75e95c3a9/zen_engine-2.1.3.tar.gz", hash = "sha256:c723bb3f8b152d6d3f21ef45a6ac791e6a94e58711464bec8cfbc5f804dc83cb", size = 697375, upload-time = "2026-10-09T10:42:07.976Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/24/91bcde4674795453290f4d0bffb6cf352f2fe22944cbd983a148a5743e23/zen_engine-2.1.3-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:c2e8f27963b508e2c9d73e0f084304584b0667061b48a0e3d78de72221c6706c", size = 10410389, upload-time = "2026-10-09T10:41:57.863Z" },
+    { url = "https://files.pythonhosted.org/packages/40/d3/33930ea3d81cec066fc1432f123de179b5236bb8636dbf6d523681ad57df/zen_engine-2.1.3-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:ff08bca38c0e4e73ec2164f2d593f8ecf10b60b5ec8901559c9aaeff1e6ab666", size = 9575294, upload-time = "2026-10-09T10:42:00.058Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/e4/411be083fa54668ecf37e538d805b53a4fba8f47b0b478a305af630650cd/zen_engine-2.1.3-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:6fce1a4ce5482bb17c1eb4f19f6a8c6aaa2caea2640388bd2a42ccf1ff846384", size = 9877723, upload-time = "2026-10-09T10:42:02.105Z" },
+    { url = "https://files.pythonhosted.org/packages/07/f7/92b8d7a0a3c4f40efa185f7f523e70e530cfbb8acfa6a0cc39631c2b5bb0/zen_engine-2.1.3-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:40964e767299155716155fde92e5d45d713f6a037ce183afd862ee8e10f053e7", size = 10662223, upload-time = "2026-10-09T10:42:03.989Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/b9/39f407e098c2ce77d2af6045bfb81f4d95d0d6dca2dc0033eaa98b73243f/zen_engine-2.1.3-cp38-abi3-win_amd64.whl", hash = "sha256:7a39e06cb6f78884202a58191726b46285a47eea60df6bf0104e4d9eec40dc00", size = 10980329, upload-time = "2026-10-09T10:42:05.939Z" },
 ]
 
 [[package]]

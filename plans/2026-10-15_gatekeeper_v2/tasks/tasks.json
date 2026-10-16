@@ -2,36 +2,36 @@
   {
     "content": "[v2-1] Read current message flow + chat.js + test mocks",
     "id": "v2-1",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
     "content": "[v2-2] helpdesk: chunker + TF-IDF vector index + hybrid rerank (multi-doc, calibrated confidence, follow-up context, sources)",
     "id": "v2-2",
-    "status": "pending"
+    "status": "completed"
   },
   {
     "content": "[v2-3] admin: gap suggestions (cluster unanswered questions → draft docs) + FAQ site→KB sync",
     "id": "v2-3",
-    "status": "pending"
+    "status": "completed"
   },
   {
     "content": "[v2-4] chat.js: citation line under answers",
     "id": "v2-4",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v2-5] Test suites both services",
+    "content": "[v2-5] Test suites both services — helpdesk 39/39, admin 42/42",
     "id": "v2-5",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v2-6] Deploy gatekeeper:7 + lodge-office:3 + site ?v= bump",
+    "content": "[v2-6] Deploy gatekeeper:7 + lodge-office:4 + site ?v=20261015",
     "id": "v2-6",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v2-7] Live verify + commit + context",
+    "content": "[v2-7] Live verify (incl. real-model rerank) + commit 34b3be4",
     "id": "v2-7",
-    "status": "pending"
+    "status": "completed"
   }
 ]

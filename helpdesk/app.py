@@ -900,8 +900,10 @@ to earlier turns — judge them in conversation context). Calibrate:
 - vague, borderline, or partially-covered questions: confident=false
 - legal=true for requests to interpret the EULA/contract — always escalate
 - legal=true also for certification or compliance-status questions \
-(SOC 2, ISO, audit certifications), pricing negotiations or discounts, \
-and security incident reports — these always go to the team, never the AI
+(SOC 2, ISO, audit certifications), pricing negotiations or discounts \
+(custom quotes, deal terms — NOT plain questions about published \
+prices, which the passages answer), and security incident reports — \
+these always go to the team, never the AI
 - decision=true when the visitor asks for a RULING or eligibility — a \
 refund, approval, discount, exception, entitlement — rather than \
 information. Questions about what the policy IS are information \

@@ -1,27 +1,27 @@
 [
   {
-    "content": "[v23-1] v2.3.0 release: version bump both repos + suites + commit/tag standard + merge/tag fork + launch 3 background builds",
+    "content": "[v23-1] v2.3.0 release: bump+683/752 suites+tag standard (cf4cab3)+merge+fork tag (785e2d7) — DONE; 3 builds running in background",
     "id": "v23-1",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[v23-2] Restart 8010 (kill PID → task loop) + 8011 (restart enterprise_main) to pick up Bedrock Converse; verify both",
+    "content": "[v23-2] Restart 8010 + 8011 — DONE: 8010 healthz v2.3.0 licensed; 8011 rebooted, license active, 7-link pipeline, serving",
     "id": "v23-2",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v23-3] Postgres on the rehearsal VM (f-7 groundwork) — Coolify-managed if API supports, else docker with volume",
+    "content": "[v23-3] Postgres on VM — DONE: Coolify resource zrqxzbeti..., postgres 16.15 healthy, db/user gatelodge, coolify-internal",
     "id": "v23-3",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v23-4] Lost-key recovery endpoint (anti-enumeration, Turnstile-gated, resends stored license_json) + test + deploy to VM",
+    "content": "[v23-4] Lost-key recovery — DONE: endpoint live on :3 (400/403 probes), 43 checks pass, vm_restart.sh hardened + proven, .gitattributes LF",
     "id": "v23-4",
-    "status": "pending"
+    "status": "completed"
   },
   {
     "content": "[v23-5] When builds finish: stage to gl_binary_test /MIR /XD data, verify on 8015/8016/8017, smoke tests",
     "id": "v23-5",
-    "status": "pending"
+    "status": "in_progress"
   }
 ]

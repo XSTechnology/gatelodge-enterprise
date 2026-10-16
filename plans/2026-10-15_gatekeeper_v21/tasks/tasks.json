@@ -1,37 +1,37 @@
 [
   {
-    "content": "[em-1] Check groq catalog for embedding models (swap feasibility)",
+    "content": "[em-1] Check groq catalog — 11 models, NO embedding model; swap parked",
     "id": "em-1",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[em-2] helpdesk: inbound_emails table + last_topic migration + /api/email/inbound (loop guards, per-sender cap, agent reply via Resend, review queue) + store topic on escalation",
+    "content": "[em-2] helpdesk: inbound email agent (webhook, loop guards, daily cap, auto-reply, review queue) + last_topic",
     "id": "em-2",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[em-3] admin: Inbox review screen (approve-reply / ignore) + Analytics screen (sessions/day, confidence rate, doc hits, escalation topics, top unanswered)",
+    "content": "[em-3] admin: Inbox screen + Analytics screen",
     "id": "em-3",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[em-4] CF Email Worker script (repo, deploy-ready when token exists)",
+    "content": "[em-4] CF Email Worker script (helpdesk/deploy/mail-worker.js)",
     "id": "em-4",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[em-5] Test suites (inbound flow, inbox, analytics)",
+    "content": "[em-5] Test suites — helpdesk 53/53, admin 49/49",
     "id": "em-5",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[em-6] Deploy gatekeeper:8 + lodge-office:5, live verify with simulated inbound",
+    "content": "[em-6] Deploy gatekeeper:8 + lodge-office:5, live verify — all 8 checks",
     "id": "em-6",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[em-7] Commit + context + summary",
+    "content": "[em-7] Commit 7cdf451 + context",
     "id": "em-7",
-    "status": "pending"
+    "status": "completed"
   }
 ]
