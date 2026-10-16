@@ -7,6 +7,7 @@ Run: docker run -d --name helpdesk-pg -p 5433:5432 -e POSTGRES_PASSWORD=test \
      ..\.venv\Scripts\python.exe test_admin.py   (from admin/)
 """
 import os
+import json
 import sys
 import threading
 import time
@@ -117,10 +118,29 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
         schedule TEXT DEFAULT 'manual', enabled BOOLEAN DEFAULT TRUE,
         next_run_at TIMESTAMPTZ, last_run_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("ALTER TABLE inbound_emails "
+              "ADD COLUMN IF NOT EXISTS rule TEXT DEFAULT ''")
+    c.execute("""CREATE TABLE IF NOT EXISTS kb_intent (
+        doc TEXT NOT NULL, section TEXT NOT NULL,
+        questions TEXT NOT NULL, summary TEXT DEFAULT '',
+        topics TEXT DEFAULT '',
+        updated_at TIMESTAMPTZ DEFAULT now(),
+        PRIMARY KEY (doc, section))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS kb_history (
+        id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL,
+        action TEXT NOT NULL, old_content TEXT, new_content TEXT,
+        created_at TIMESTAMPTZ DEFAULT now())""")
+    c.execute("""CREATE TABLE IF NOT EXISTS rulesets (
+        id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL,
+        kind TEXT DEFAULT 'general', description TEXT DEFAULT '',
+        version INT DEFAULT 1, jdm TEXT NOT NULL,
+        enabled BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT now())""")
     # deterministic: own the tables for this run
     for t in ("chat_messages", "chat_sessions", "licenses", "leads",
               "email_log", "admin_audit", "kb_overrides", "inbound_emails",
-              "contacts", "portal_clients"):
+              "contacts", "portal_clients", "kb_history", "rulesets",
+              "kb_intent"):
         c.execute(f"TRUNCATE {t}")
     c.execute("INSERT INTO chat_sessions (id, email, needs_review, "
               "last_topic) VALUES ('testsess0001', 'cust@example.com', "
@@ -133,11 +153,45 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as c:
               "confident, doc) VALUES ('testsess0001', 'assistant', "
               "'answered ok', TRUE, 'presales')")
     c.execute("INSERT INTO inbound_emails (id, from_addr, subject, body, "
-              "status, topic, doc) VALUES "
+              "status, topic, doc, rule) VALUES "
               "('inb-a', 'waiting@example.com', 'Trial question', "
-              "'How long is the trial?', 'review', 'trial', 'faq'), "
+              "'How long is the trial?', 'review', 'trial', 'faq', "
+              "'no-kb'), "
               "('inb-b', 'done@example.com', 'Answered', 'thanks', "
-              "'answered', 'what-is', 'presales')")
+              "'answered', 'what-is', 'presales', 'confident-faq')")
+    c.execute("INSERT INTO rulesets (name, kind, description, jdm) "
+              "VALUES (%s, %s, %s, %s)",
+              ("Test gate", "test-gate", "test policy for the suite",
+               json.dumps({
+                   "edges": [
+                       {"id": "e1", "sourceId": "n-input",
+                        "targetId": "n-table"},
+                       {"id": "e2", "sourceId": "n-table",
+                        "targetId": "n-out"}],
+                   "nodes": [
+                       {"id": "n-input", "type": "inputNode",
+                        "name": "Facts"},
+                       {"id": "n-out", "type": "outputNode",
+                        "name": "Decision"},
+                       {"id": "n-table", "type": "decisionTableNode",
+                        "name": "Test gate",
+                        "content": {
+                            "hitPolicy": "first",
+                            "inputs": [{"field": "tool", "id": "c1",
+                                        "name": "Tool",
+                                        "type": "expression"}],
+                            "outputs": [
+                                {"field": "allow", "id": "o1",
+                                 "name": "Allow", "type": "expression"},
+                                {"field": "rule", "id": "o2",
+                                 "name": "Rule", "type": "expression"}],
+                            "rules": [
+                                {"_id": "deny-email",
+                                 "c1": '== "email_send"',
+                                 "o1": "false", "o2": '"deny-email"'},
+                                {"_id": "allow-all", "c1": "",
+                                 "o1": "true",
+                                 "o2": '"allow-all"'}]}}]})))
     c.execute("INSERT INTO leads (email, business_name, ip) "
               "VALUES ('lead@example.com', 'Acme Corp', '1.2.3.4')")
     c.execute("INSERT INTO licenses (serial, email, edition, kind, "
@@ -241,6 +295,49 @@ with TestClient(app.app) as client:
         v = c.execute("SELECT COUNT(*) FROM kb_overrides "
                       "WHERE name='presales'").fetchone()[0]
     check("kb reset removes override", v == 0)
+
+    # 8a. provenance: the save + reset just recorded history
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        hv = c.execute("SELECT action, old_content, new_content "
+                       "FROM kb_history WHERE name='presales' "
+                       "ORDER BY id").fetchall()
+    check("kb history records save + reset",
+          len(hv) == 2 and hv[0][0] == "save" and hv[1][0] == "reset"
+          and hv[0][1] is not None and hv[0][2] is not None
+          and "edited body" in hv[0][2], str([h[0] for h in hv]))
+
+    # 8a2. restore round-trip: save twice, restore the first version
+    client.post("/kb/save", data={
+        "name": "presales", "title": "Presales — v1",
+        "description": "d", "content": "## first body"})
+    client.post("/kb/save", data={
+        "name": "presales", "title": "Presales — v2",
+        "description": "d", "content": "## second body"})
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        hid = c.execute("SELECT id FROM kb_history WHERE "
+                        "name='presales' AND action='save' "
+                        "AND new_content LIKE '%first body%' "
+                        "ORDER BY id LIMIT 1").fetchone()[0]
+    r = client.get("/kb/version", params={"id": hid})
+    check("kb version view renders", r.status_code == 200
+          and "first body" in r.text)
+    r = client.post("/kb/restore", data={"id": hid},
+                    follow_redirects=False)
+    check("kb restore redirects", r.status_code == 303
+          and "restored" in r.headers.get("location", ""))
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        v = c.execute("SELECT content FROM kb_overrides "
+                      "WHERE name='presales'").fetchone()
+        acts = [a for a, in c.execute(
+            "SELECT action FROM kb_history WHERE name='presales' "
+            "ORDER BY id").fetchall()]
+    check("kb restore writes the old version back",
+          v is not None and "first body" in v[0]
+          and "Presales — v1" in v[0], str(v)[:80])
+    check("kb restore records history",
+          acts.count("restore") == 1 and acts.count("save") == 3,
+          str(acts))
+    client.get("/kb/reset", params={"name": "presales"})
 
     # 8b. header parse/assemble round-trip
     t, d, b = app._parse_doc(
@@ -355,6 +452,132 @@ with TestClient(app.app) as client:
             c.execute("DELETE FROM chat_sessions WHERE id = %s",
                       (f"gaptest{i:04d}",))
 
+    # 8j. security lint engine
+    f = app._lint_text("write to owner@privatecorp.com or surf "
+                       "http://10.1.2.217:8111 today", internal=False)
+    check("lint finds email + private net",
+          any(x["rule"] == "email" for x in f)
+          and any(x["rule"] == "private-net" for x in f), str(f))
+    f = app._lint_text("key = sk-abcdef0123456789abcdef0123", internal=True)
+    check("lint finds secret", any(x["rule"] == "secret" for x in f),
+          str(f))
+    f = app._lint_text("console at http://localhost:8010 by default",
+                       internal=False)
+    check("lint allows documented console default",
+          not any(x["rule"] in ("private-net", "local-port") for x in f),
+          str(f))
+    f = app._lint_text("the office runs on http://localhost:8111",
+                       internal=False)
+    check("lint flags non-default local ports",
+          any(x["rule"] == "local-port" for x in f), str(f))
+    f = app._lint_text("the Lodge Office handles tier 2", internal=False)
+    check("lint flags internal mention in public doc",
+          any(x["rule"] == "internal-mention" for x in f), str(f))
+    f = app._lint_text("the Lodge Office handles tier 2", internal=True)
+    check("internal docs skip internal-mention rule",
+          not any(x["rule"] == "internal-mention" for x in f), str(f))
+    f = app._lint_text("you need an admin key for your console",
+                       internal=False)
+    check("lint allows customer admin-key phrasing",
+          not any(x["rule"] == "internal-mention" for x in f), str(f))
+    f = app._lint_text("Gatelodge routes requests — write to "
+                       "support@datagatelodge.com.", internal=False)
+    check("lint clean on ordinary text", f == [], str(f))
+    r = client.get("/kb")
+    check("kb list shows security column",
+          "security" in r.text and "clean" in r.text)
+    check("kb list lint counts docs",
+          r.text.count("clean") >= 10, str(r.text.count("clean")))
+
+    # 8k. policies CRUD (system rulesets as reviewable data)
+    r = client.get("/policies")
+    check("policies list renders", r.status_code == 200
+          and "Test gate" in r.text and "test-gate" in r.text
+          and "2 rules" in r.text and "v1" in r.text)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        rid = c.execute("SELECT id FROM rulesets WHERE "
+                        "kind='test-gate'").fetchone()[0]
+    r = client.get(f"/policy/{rid}")
+    check("policy editor renders grid", r.status_code == 200
+          and "deny-email" in r.text and 'value="tool"' in r.text
+          and "allow-all" in r.text and "hit policy" in r.text.lower())
+    r = client.post(f"/policy/{rid}/test",
+                    json={"facts": {"tool": "email_send"}})
+    j = r.json() if r.status_code == 200 else {}
+    check("policy test evaluates + fires rule",
+          j.get("result", {}).get("rule") == "deny-email"
+          and j.get("result", {}).get("allow") is False, str(j))
+    r = client.post(f"/policy/{rid}/test",
+                    json={"facts": {"tool": "web_fetch"}})
+    j = r.json() if r.status_code == 200 else {}
+    check("policy test allows other tools",
+          j.get("result", {}).get("rule") == "allow-all"
+          and j.get("result", {}).get("allow") is True, str(j))
+    # save an edit -> version bump + audit
+    new_jdm = json.dumps({
+        "edges": [{"id": "e1", "sourceId": "n-input",
+                   "targetId": "n-table"},
+                  {"id": "e2", "sourceId": "n-table",
+                   "targetId": "n-out"}],
+        "nodes": [{"id": "n-input", "type": "inputNode", "name": "Facts"},
+                  {"id": "n-out", "type": "outputNode",
+                   "name": "Decision"},
+                  {"id": "n-table", "type": "decisionTableNode",
+                   "name": "Test gate v2",
+                   "content": {
+                       "hitPolicy": "first",
+                       "inputs": [{"field": "tool", "id": "c1",
+                                   "name": "Tool", "type": "expression"}],
+                       "outputs": [{"field": "allow", "id": "o1",
+                                    "name": "Allow",
+                                    "type": "expression"},
+                                   {"field": "rule", "id": "o2",
+                                    "name": "Rule",
+                                    "type": "expression"}],
+                       "rules": [{"_id": "deny-sms", "c1": '== "send_sms"',
+                                  "o1": "false", "o2": '"deny-sms"'},
+                                 {"_id": "allow-all", "c1": "",
+                                  "o1": "true",
+                                  "o2": '"allow-all"'}]}}]})
+    r = client.post("/policy/save", data={
+        "id": rid, "name": "Test gate", "description": "edited",
+        "enabled": "1", "jdm": new_jdm}, follow_redirects=False)
+    check("policy save redirects", r.status_code == 303
+          and "saved" in r.headers.get("location", ""))
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        pr = c.execute("SELECT version, description, jdm FROM rulesets "
+                       "WHERE id=%s", (rid,)).fetchone()
+        au = c.execute("SELECT COUNT(*) FROM admin_audit WHERE "
+                       "action='policy-save'").fetchone()[0]
+    check("policy save bumps version + audits",
+          pr[0] == 2 and pr[1] == "edited" and "deny-sms" in pr[2]
+          and au == 1, f"v={pr[0]} audit={au}")
+    r = client.post(f"/policy/{rid}/test",
+                    json={"facts": {"tool": "send_sms"}})
+    j = r.json() if r.status_code == 200 else {}
+    check("edited policy live on next request",
+          j.get("result", {}).get("rule") == "deny-sms", str(j))
+    # invalid jdm rejected (zen would silently never match bad cells)
+    r = client.post("/policy/save", data={
+        "id": rid, "name": "Test gate", "description": "d",
+        "enabled": "1", "jdm": '{"broken": tru'}, follow_redirects=False)
+    check("policy save rejects invalid jdm", r.status_code == 303
+          and "invalid" in r.headers.get("location", ""))
+    # toggle -> disabled -> test endpoint 404s
+    r = client.post("/policy/toggle", data={"id": rid},
+                    follow_redirects=False)
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        en = c.execute("SELECT enabled FROM rulesets WHERE id=%s",
+                       (rid,)).fetchone()[0]
+    check("policy toggle disables", r.status_code == 303 and en is False)
+    r = client.post(f"/policy/{rid}/test", json={"facts": {}})
+    check("disabled policy not testable", r.status_code == 404)
+    client.post("/policy/toggle", data={"id": rid})
+    with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+        en = c.execute("SELECT enabled FROM rulesets WHERE id=%s",
+                       (rid,)).fetchone()[0]
+    check("policy toggle re-enables", en is True)
+
     # 9. leads CSV
     r = client.get("/leads.csv")
     check("leads csv", r.status_code == 200
@@ -379,6 +602,8 @@ with TestClient(app.app) as client:
           and "waiting@example.com" in r.text
           and "How long is the trial?" in r.text
           and "done@example.com" in r.text)
+    check("inbox shows fired triage rules", "no-kb" in r.text
+          and "confident-faq" in r.text)
     r = client.post("/inbox/reply", data={
         "id": "inb-a", "reply": "The trial runs 30 days from first boot."},
         follow_redirects=False)

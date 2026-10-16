@@ -418,8 +418,23 @@ check("retrieval: nonsense -> no candidates", top == [],
 # analysis endpoint auth
 r = client.post("/api/kb/reanalyze", json={"doc": "faq"})
 check("reanalyze requires auth", r.status_code in (401, 403))
-# with the review key: the mock gateway scripts the analysis
 RH = {"Authorization": "Bearer review-key"}
+# prompts endpoint (Lodge Office security lint source)
+r = client.get("/api/kb/prompts")
+check("prompts endpoint requires auth", r.status_code in (401, 403))
+r = client.get("/api/kb/prompts", headers=RH)
+j = r.json() if r.status_code == 200 else {}
+pnames = {p.get("name") for p in j.get("prompts", [])}
+check("prompts endpoint lists templates",
+      r.status_code == 200
+      and {"rerank", "answer", "task-agent", "task-review",
+           "decision-extract", "decision-answer", "intent-analyze"}
+      <= pnames, str(sorted(pnames)))
+check("prompt texts are the real constants",
+      any("triage customer questions" in p["text"]
+          for p in j.get("prompts", [])
+          if p["name"] == "rerank"))
+# with the review key: the mock gateway scripts the analysis
 r = client.post("/api/kb/reanalyze", headers=RH, json={"doc": "faq"})
 j = r.json()
 check("reanalyze runs", r.status_code == 200 and j.get("ok")

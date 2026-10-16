@@ -1763,6 +1763,37 @@ Reply with ONLY a JSON object:
 - review: the result needs a human decision before it counts"""
 
 
+@app.get("/api/kb/prompts")
+async def kb_prompts(request: Request):
+    """The prompt templates, for the Lodge Office's security lint.
+    Read-only: prompts are code — findings are fixed in the repo."""
+    _require_review_key(request)
+    return {"prompts": [
+        {"name": "intent-analyze",
+         "role": "pre-analyzes KB sections into the intent map",
+         "text": INTENT_ANALYZE_SYSTEM},
+        {"name": "rerank",
+         "role": "triages questions: candidate pick + confidence + "
+                 "legal/decision flags",
+         "text": RERANK_SYSTEM},
+        {"name": "answer",
+         "role": "phrases customer-facing answers from passages",
+         "text": ANSWER_SYSTEM},
+        {"name": "decision-extract",
+         "role": "extracts structured facts for a ruling",
+         "text": DECISION_EXTRACT_SYSTEM},
+        {"name": "decision-answer",
+         "role": "phrases a deterministic decision outcome",
+         "text": DECISION_ANSWER_SYSTEM},
+        {"name": "task-agent",
+         "role": "drives the task agent's plan/execute loop",
+         "text": TASK_SYSTEM},
+        {"name": "task-review",
+         "role": "judges a completed task run",
+         "text": REVIEW_SYSTEM},
+    ]}
+
+
 async def _llm_json(system: str, messages: list[dict],
                      model: str) -> str:
     """One non-streaming completion; returns raw content."""
