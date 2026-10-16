@@ -1,0 +1,22 @@
+[
+  {
+    "content": "[deck] Ground-truthed security-architecture deck file (slide + table + talk track + claims discipline)",
+    "id": "deck",
+    "status": "in_progress"
+  },
+  {
+    "content": "[kb] Corrected concern-to-control table in evaluation.md + intent re-analysis",
+    "id": "kb",
+    "status": "pending"
+  },
+  {
+    "content": "[site] Buying-committee roles (CEO/CIO/CISO/Audit) with differentiated messaging + concern-to-control pairs",
+    "id": "site",
+    "status": "pending"
+  },
+  {
+    "content": "[ship] Fit suite + deploy gatekeeper:21 + lodge-office:17 + staging refresh + verify + commit",
+    "id": "ship",
+    "status": "pending"
+  }
+]

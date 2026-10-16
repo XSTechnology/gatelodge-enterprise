@@ -13,6 +13,12 @@ Every request that passes through Gatelodge appends a record to a local, append-
 
 Licenses and key revocations are signed with public-key cryptography and checked against a tamper-evident revocation list — a revoked key stops working even if someone replays an old license file.
 
+## Is prompt content logged?
+
+No. The request log and the OTLP traces record the activity around each request — who, which model, when, duration, tokens, cost, and outcome — never the prompt or response text. The audit chain and your SIEM export carry the same metadata-only records.
+
+The one place request text is kept is the semantic cache: recent requests and responses stored on your own disk, inside your perimeter, so a paraphrased repeat can be served without re-billing upstream. It can be disabled in configuration (it is on by default) and cleared at any time.
+
 ## How are budgets enforced?
 
 Budgets are hard limits, not warnings. Teams get monthly token budgets; when a team's budget is exhausted, further requests are denied — not throttled, not "overage billed." Per-session budgets cap individual long conversations. The console shows spend against budget in real time, per team and per backend, so cost attribution answers "which workload, which team, which model."
@@ -40,6 +46,39 @@ Not yet. Our posture today: self-hosted deployment (your perimeter, your data re
 ## How does it scale?
 
 A single binary boots in one command and serves most deployments. For higher availability, gateway replicas share state over Redis, so you can run multiple instances behind a load balancer with consistent budgets, keys, and audit.
+
+## Security concerns mapped to controls
+
+The concerns a CISO brings to an AI gateway, and the specific control
+that answers each one:
+
+- **Shadow AI** — provider allowlisting; unapproved models don't even
+  display, so they can't be clicked.
+- **Data leakage** — governed routing: traffic only to approved
+  providers, and every request logged. We govern where data goes; we
+  do not inspect content.
+- **Credential exposure** — centralized secrets: the console holds
+  provider credentials, applications hold none, and key values are
+  never logged.
+- **Unauthorized access** — per-request identity: gateway keys with
+  roles, RBAC, SSO from your identity provider.
+- **Audit requirements** — the tamper-evident audit chain, verified
+  with a command you run yourself.
+- **Incident investigation** — a per-request forensic record: who,
+  which model, when, cost, outcome.
+- **Regulatory compliance** — exportable evidence: structured JSONL
+  into your own SIEM or analysis pipeline.
+- **Third-party risk** — provider abstraction: applications don't
+  change when providers do.
+- **Provider outage** — automatic failover; hedge routing races a
+  slow primary.
+- **Cost abuse** — hard budgets per team and key: refusals, not
+  warnings.
+
+One boundary stated plainly: this governs every AI interaction your
+applications and agents make via API. AI embedded inside SaaS products
+does not route through your gateway — that honesty is why the
+control-point architecture is credible.
 
 ## What should you ask any vendor?
 

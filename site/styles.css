@@ -266,7 +266,7 @@ main { display: block; padding-bottom: 1.5rem; }
 }
 .section h2 em { font-style: italic; color: var(--brass-bright); }
 
-.section-lede { color: var(--muted); font-size: 1rem; max-width: 42rem; margin-bottom: .9rem; }
+.section-lede { color: var(--muted); font-size: 1rem; max-width: 42rem; margin-bottom: .75rem; }
 
 /* ── ledger (the problem) ─────────────────────────────────────────────── */
 
@@ -295,7 +295,7 @@ main { display: block; padding-bottom: 1.5rem; }
 
 .pillars {
   display: grid; grid-template-columns: repeat(3, 1fr); gap: .85rem;
-  padding-bottom: .4rem;
+  padding-bottom: .3rem;
 }
 @media (max-width: 980px) { .pillars { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 640px) { .pillars { grid-template-columns: 1fr; } }
@@ -303,19 +303,19 @@ main { display: block; padding-bottom: 1.5rem; }
 /* personas — one line per stakeholder */
 .persona-row {
   display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem;
-  margin: 0 0 .8rem;
+  margin: 0 0 .45rem;
 }
 @media (max-width: 980px) { .persona-row { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 640px) { .persona-row { grid-template-columns: 1fr; } }
 .persona {
   background: var(--surface); border: 1px solid var(--line-soft);
   border-left: 2px solid var(--brass); border-radius: 8px;
-  padding: .5rem .7rem; font-size: .76rem; line-height: 1.45;
+  padding: .38rem .6rem; font-size: .76rem; line-height: 1.38;
   color: var(--paper);
 }
 .persona-for {
   color: var(--brass); font-size: .58rem; letter-spacing: .16em;
-  text-transform: uppercase; margin-right: .45rem;
+  text-transform: uppercase; margin-right: .35rem;
 }
 
 /* product screenshots */
