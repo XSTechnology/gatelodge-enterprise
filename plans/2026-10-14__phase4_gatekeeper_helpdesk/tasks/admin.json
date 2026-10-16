@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[adm-1] licensing: Postgres dual-mode DB + admin-issue endpoint + dual test runs (sqlite + local pg)",
+    "id": "adm-1",
+    "status": "in_progress"
+  },
+  {
+    "content": "[adm-2] Migrate VM licensing data → Postgres (docker cp + in-container script); redeploy licensing with DATABASE_URL + coolify network",
+    "id": "adm-2",
+    "status": "pending"
+  },
+  {
+    "content": "[adm-3] Gatekeeper: kb_overrides merge (live KB edits) + escalation writes email_log; redeploy :4",
+    "id": "adm-3",
+    "status": "pending"
+  },
+  {
+    "content": "[adm-4] Admin service: auth (cookie+key), dashboard+stats, conversations, reviews + approve-reply (auto email from support@ + KB append), leads+CSV, licenses (claims/expiry/features + verify + revoke + manual issue), KB editor, email log, gateway panel",
+    "id": "adm-4",
+    "status": "pending"
+  },
+  {
+    "content": "[adm-5] Deploy admin to VM (LAN-bound 10.1.2.217:8111, gatehouse+coolify nets) + end-to-end verify incl. approve-reply email",
+    "id": "adm-5",
+    "status": "pending"
+  },
+  {
+    "content": "[adm-6] Commit all + context update",
+    "id": "adm-6",
+    "status": "pending"
+  }
+]

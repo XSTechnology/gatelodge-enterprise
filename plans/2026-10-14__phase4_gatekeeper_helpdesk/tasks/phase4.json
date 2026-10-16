@@ -1,0 +1,32 @@
+[
+  {
+    "content": "[p4-1] KB corpus — DONE: 7 docs in helpdesk/kb/ (43f8ffa)",
+    "id": "p4-1",
+    "status": "completed"
+  },
+  {
+    "content": "[p4-2] helpdesk service — DONE: 27 checks ALL PASS; live on VM as container 'gatekeeper' (43f8ffa, 4ef3eef, 825812d)",
+    "id": "p4-2",
+    "status": "completed"
+  },
+  {
+    "content": "[p4-3] VM gateway — DONE: closed v2.3.0 image on VM as 'gatekeeper-gw', license GL-41C1667F8A3F (groq), triage=20b/answer=120b, $25/mo budget cap",
+    "id": "p4-3",
+    "status": "completed"
+  },
+  {
+    "content": "[p4-4] Widget — DONE: live on datagatelodge.com, config-gate open, button rendering through the public URL (7b1c1dd)",
+    "id": "p4-4",
+    "status": "completed"
+  },
+  {
+    "content": "[p4-5] Tests — DONE: 27-check suite + widget e2e 5/5 + live full-chain (real groq answer, stored confident doc=presales)",
+    "id": "p4-5",
+    "status": "completed"
+  },
+  {
+    "content": "[p4-6] Deploy + live verify — DONE: chat.datagatelodge.com via tunnel (ingress 10.1.2.217:8105), Postgres wired, e2e verified; deploy tooling committed (4dc1dc9)",
+    "id": "p4-6",
+    "status": "completed"
+  }
+]

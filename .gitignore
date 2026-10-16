@@ -14,3 +14,10 @@ dist/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Workshop workspace + session task files
+.workshop/
+tasks.json
+
+# Owner documents kept locally, not versioned
+tuning.docx

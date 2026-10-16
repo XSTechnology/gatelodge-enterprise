@@ -197,6 +197,10 @@ with TestClient(app.app) as client:
           r.json()["kb_docs"] == len(app.KB), r.text)
     r = client.get("/api/config")
     check("config name", r.json().get("name") == "The Gatekeeper")
+    r = client.get("/", follow_redirects=False)
+    check("root redirects to the site", r.status_code == 302
+          and "datagatelodge.com" in r.headers.get("location", ""),
+          str(r.headers.get("location")))
 
     # 2. session
     r = client.post("/api/chat/session", json={})

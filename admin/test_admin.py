@@ -517,6 +517,9 @@ with TestClient(app.app) as client:
     check("policy editor renders grid", r.status_code == 200
           and "deny-email" in r.text and 'value="tool"' in r.text
           and "allow-all" in r.text and "hit policy" in r.text.lower())
+    check("policy editor has reorder + duplicate",
+          "moveRule" in r.text and "dupRule" in r.text
+          and "rowBtns" in r.text)
     r = client.post(f"/policy/{rid}/test",
                     json={"facts": {"tool": "email_send"}})
     j = r.json() if r.status_code == 200 else {}

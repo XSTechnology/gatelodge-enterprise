@@ -987,6 +987,30 @@ edit and version.</p>
 
 
 POLICY_JS = """
+function rowBtns() {
+  return '<button type="button" class="mini" title="move up" onclick="moveRule(this,-1)">&#8593;</button>'
+       + '<button type="button" class="mini" title="move down" onclick="moveRule(this,1)">&#8595;</button>'
+       + '<button type="button" class="mini" title="duplicate rule" onclick="dupRule(this)">&#10697;</button>'
+       + '<button type="button" class="mini" title="remove rule" onclick="this.closest(\\'tr\\').remove()">\\u2715</button>';
+}
+function moveRule(btn, dir) {
+  const tr = btn.closest('tr');
+  if (dir < 0 && tr.previousElementSibling)
+    tr.parentNode.insertBefore(tr, tr.previousElementSibling);
+  else if (dir > 0 && tr.nextElementSibling)
+    tr.parentNode.insertBefore(tr.nextElementSibling, tr);
+}
+function dupRule(btn) {
+  const tr = btn.closest('tr');
+  const copy = tr.cloneNode(true);
+  const src = tr.querySelectorAll('input');
+  const dst = copy.querySelectorAll('input');
+  src.forEach((inp, i) => { if (dst[i]) dst[i].value = inp.value; });
+  const name = copy.querySelector('.rname');
+  if (name && name.value && !name.value.endsWith('-copy'))
+    name.value = name.value + '-copy';
+  tr.parentNode.insertBefore(copy, tr.nextElementSibling);
+}
 function addRule() {
   const grid = document.getElementById('grid');
   const nIn = grid.querySelectorAll('thead th[data-kind=in]').length;
@@ -997,7 +1021,7 @@ function addRule() {
     const kind = i < nIn ? 'in' : 'out';
     h += `<td><input class="cell" data-kind="${kind}" data-col="${kind==='in'?i:i-nIn}"></td>`;
   }
-  h += '<td><button type="button" class="mini" onclick="this.closest(\\'tr\\').remove()">✕</button></td>';
+  h += '<td>' + rowBtns() + '</td>';
   tr.innerHTML = h;
   grid.querySelector('tbody').appendChild(tr);
 }
@@ -1105,7 +1129,7 @@ function addRuleFromDraft(row) {
     const val = (row.cells && row.cells[f] !== undefined) ? row.cells[f] : '';
     h += '<td><input class="cell" data-kind="' + kind + '" data-col="' + ci + '" value="' + esc(val) + '"></td>';
   }
-  h += '<td><button type="button" class="mini" onclick="this.closest(\\'tr\\').remove()">✕</button></td>';
+  h += '<td>' + rowBtns() + '</td>';
   tr.innerHTML = h;
   grid.querySelector('tbody').appendChild(tr);
 }
@@ -1221,12 +1245,20 @@ async def policy_editor(request: Request, pid: int, flash: str = ""):
             cells += (f'<td><input class="cell" data-kind="{kind}" '
                       f'data-col="{ci}" value="{_e(val)}"'
                       + ("" if editable else " disabled") + "></td>")
+        btns = ('<button type="button" class="mini" title="move up" '
+                'onclick="moveRule(this,-1)">&#8593;</button>'
+                '<button type="button" class="mini" title="move down" '
+                'onclick="moveRule(this,1)">&#8595;</button>'
+                '<button type="button" class="mini" '
+                'title="duplicate rule" onclick="dupRule(this)">'
+                '&#10697;</button>'
+                '<button type="button" class="mini" title="remove rule" '
+                "onclick='this.closest(\"tr\").remove()'>&#10005;</button>"
+                ) if editable else ""
         rows_html += (f'<tr><td><input class="rname" value="{_e(r["name"])}"'
                       + ("" if editable else " disabled") + "></td>"
                       + cells
-                      + ("<td><button type='button' class='mini' "
-                         "onclick='this.closest(\"tr\").remove()'>✕</button>"
-                         "</td>" if editable else "<td></td>")
+                      + (f"<td>{btns}</td>" if editable else "<td></td>")
                       + "</tr>")
 
     hp = model["hitPolicy"]

@@ -47,7 +47,8 @@ import httpx
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, \
+    StreamingResponse
 from pydantic import BaseModel
 
 # ── config ────────────────────────────────────────────────────────────────
@@ -1312,6 +1313,14 @@ async def healthz():
     return {"ok": True, "service": "gatekeeper",
             "gateway": bool(GATEWAY_URL and GATEWAY_KEY),
             "db": bool(DATABASE_URL), "kb_docs": len(KB)}
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """chat.datagatelodge.com is the API host — the chat itself lives
+    in the site's Gatekeeper widget."""
+    return RedirectResponse("https://datagatelodge.com/",
+                            status_code=302)
 
 
 @app.get("/api/config")

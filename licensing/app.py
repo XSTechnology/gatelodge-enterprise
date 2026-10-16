@@ -327,6 +327,16 @@ async def healthz():
     return {"ok": True, "service": "gatelodge-licensing"}
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    """get.datagatelodge.com lands on the site's download section —
+    the download itself lives here, the pitch lives there."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(
+        "https://datagatelodge.com/gatelodge.html#download",
+        status_code=302)
+
+
 @app.get("/api/config")
 async def config():
     return {"payment_link": PAYMENT_LINK,

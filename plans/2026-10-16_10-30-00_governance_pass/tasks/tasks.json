@@ -2,31 +2,31 @@
   {
     "content": "[g1-lint] Security lint engine (admin) + gatekeeper /api/kb/prompts + Knowledge screen badges",
     "id": "g1-lint",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
     "content": "[g1-prov] kb_history table + save/reset/restore hooks + history view on edit page",
     "id": "g1-prov",
-    "status": "pending"
+    "status": "completed"
   },
   {
     "content": "[g1-rules] Rulesets CRUD screen + grid editor + test box + inbox fired-rule column",
     "id": "g1-rules",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[g1-ship] Extend suites, deploy lodge-office:13 + gatekeeper:18, live verify",
+    "content": "[g1-ship] Suites extended, deployed lodge-office:14 + gatekeeper:18, live-verified 14/14 (commit 54d51c8)",
     "id": "g1-ship",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[g2-intent] Escalation criteria as data + settings table + chat widget suggestions",
+    "content": "[g2-intent] Escalation data + settings + chat suggestions — LIVE, 10/10 verified (commit 6f8de22, gatekeeper:19 + lodge-office:15)",
     "id": "g2-intent",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[g34-polish] Portal polish (editor, root redirects) + estate hygiene (staging, mail, repo)",
+    "content": "[g34-polish] Portal polish (editor reorder/duplicate, get./chat. root redirects) + estate hygiene (staging, mail, repo)",
     "id": "g34-polish",
-    "status": "pending"
+    "status": "in_progress"
   }
 ]
