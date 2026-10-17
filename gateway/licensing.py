@@ -89,7 +89,7 @@ _RECHECK_S = 60.0                 # middleware re-evaluates at most 1x/min
 # (status surfaces the catalog). New codes ride a license-tool +
 # licensing.py bump together.
 FEATURE_CODES = ("tier_d", "scim", "session_budgets", "mcp", "teams",
-                 "vault")
+                 "vault", "evidence")
 
 # Provider entitlement (v2.2): local compute is FREE; cloud provider
 # backends serve only under their per-backend license claim.

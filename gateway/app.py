@@ -907,11 +907,21 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
             _metric_inc("gateway_requests_by_key_total", (kid,))
     try:
         with _log_lock:
-            global _LOG_MONTH_STATE
+            global _LOG_MONTH_STATE, _REQ_CHAIN_HEAD
             if _LOG_MONTH_STATE != _month_key():
                 _LOG_MONTH_STATE = _month_key()
                 _rollup_closed_months()
             path = _ensure_month_log()
+            # Request-ledger chaining (v2.5): under the lock so the
+            # head advances atomically with the append. Plain path
+            # (no 'evidence' claim) writes exactly today's line.
+            if _req_chain_on():
+                if _REQ_CHAIN_HEAD is None:
+                    _REQ_CHAIN_HEAD = _req_chain_tail_hash()
+                rec["prev"] = _REQ_CHAIN_HEAD
+                rec["hash"] = _req_record_hash(rec)
+                _REQ_CHAIN_HEAD = rec["hash"]
+                line = json.dumps(rec)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
     except OSError:
@@ -993,6 +1003,89 @@ def _ensure_month_log(month: str | None = None) -> Path:
     except OSError:
         logger.warning("gateway log migration failed", exc_info=True)
     return path
+
+
+# ── request-ledger chaining (v2.5 Evidence Center, 'evidence' claim) ──────
+# Same pattern as config-audit (§hash-chained audit below): prev + hash,
+# sha256 over canonical sorted-keys JSON. GATED LIVE by the license —
+# requests under an evidence-carrying Enterprise license chain; anything
+# else (community trial/key, unmanaged source) writes today's plain
+# line. The gate is read per request, so license swaps mid-month yield
+# mixed records in one file; verify_request_chain() skips plain records
+# TRANSPARENTLY (prev preserved — the writer keeps its head across
+# plain lines) and still detects downgrades: a chained record edited
+# into a plain one orphans the next chained record's prev → break.
+
+_REQ_CHAIN_HEAD: str | None = None
+_REQ_GENESIS = "genesis"
+
+
+def _req_record_hash(rec: dict) -> str:
+    """Canonical record hash: sha256 over sorted-keys JSON (hash field
+    excluded by the caller) — identical rule to _audit_hash."""
+    return hashlib.sha256(
+        json.dumps(rec, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _req_chain_on() -> bool:
+    """The 'evidence' license claim, read live per request. Never
+    raises — chaining is a property of logging, which must never
+    break the request path."""
+    try:
+        return licensing.allows("evidence")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _req_month_files() -> list[Path]:
+    """Month log files in chronological order (archive first — it holds
+    the oldest, pre-migration history; the legacy gateway_log.jsonl
+    name is NOT a month file and is excluded)."""
+    out: list[Path] = []
+    arch = _LOG_PATH.parent / "gateway-log-archive.jsonl"
+    if arch.is_file():
+        out.append(arch)
+    if _LOG_PATH.parent.is_dir():
+        out += sorted(p for p in _LOG_PATH.parent.iterdir()
+                      if re.fullmatch(r"gateway-log-\d{4}-\d{2}\.jsonl",
+                                      p.name))
+    return out
+
+
+def _req_chain_tail_hash() -> str:
+    """Chain head across cold starts and month rotations: walk the
+    month files newest-first and return the LAST chained record's hash
+    (plain-only tails keep walking — the chain is global across files
+    and across plain stretches). Genesis when no chained record exists.
+    Reads only file tails; a partial first line from the windowed read
+    is discarded."""
+    try:
+        for p in reversed(_req_month_files()):
+            try:
+                with open(p, "rb") as f:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    window = 8192
+                    f.seek(max(0, size - window))
+                    skipped = size > window
+                    tail = f.read().decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = [l for l in tail.strip().splitlines() if l.strip()]
+            if skipped and lines:
+                lines = lines[1:]   # may be cut mid-record
+            for ln in reversed(lines):
+                try:
+                    rec = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                h = rec.get("hash")
+                if h:
+                    return str(h)
+                # plain record — keep walking back
+        return _REQ_GENESIS
+    except Exception:  # noqa: BLE001 — unreadable → fresh chain
+        return _REQ_GENESIS
 
 
 def _iter_month_lines(month: str) -> list[dict[str, Any]]:
@@ -4134,6 +4227,69 @@ async def admin_audit() -> Response:
         except json.JSONDecodeError:
             continue
     return {"audit": out[::-1], "chain": verify_audit_chain()}
+
+
+def verify_request_chain() -> dict:
+    """Walk the request ledger (archive + month files, chronological)
+    and verify the chain over every CHAINED record. Plain records —
+    pre-v2.5 history and lines written without the 'evidence' claim —
+    are skipped TRANSPARENTLY (counted as plain, prev preserved: the
+    writer keeps its head across plain lines, so a later chained
+    record still references the last chained hash). A chained record
+    edited into a plain one (downgrade) orphans the next chained
+    record's prev → break. Returns {files, lines, chained, plain,
+    breaks, valid} — surfaced by GET /admin/ledger and the Evidence
+    Package (v2.5 Evidence Center)."""
+    breaks: list[dict] = []
+    files: list[dict] = []
+    chained = plain = 0
+    prev = _REQ_GENESIS
+    for p in _req_month_files():
+        f_lines = f_chained = f_plain = 0
+        try:
+            lines = p.read_text(encoding="utf-8",
+                                errors="replace").strip().splitlines()
+        except OSError:
+            lines = []
+        for i, ln in enumerate(lines, 1):
+            if not ln.strip():
+                continue
+            f_lines += 1
+            try:
+                rec = json.loads(ln)
+            except json.JSONDecodeError:
+                breaks.append({"file": p.name, "line": i,
+                               "reason": "unparseable"})
+                continue
+            h = rec.get("hash")
+            if not h:
+                plain += 1              # transparent — prev preserved
+                f_plain += 1
+                continue
+            body = {k: v for k, v in rec.items() if k != "hash"}
+            if _req_record_hash(body) != h:
+                breaks.append({"file": p.name, "line": i,
+                               "reason": "hash mismatch (tampered)"})
+            elif rec.get("prev") != prev:
+                breaks.append({"file": p.name, "line": i,
+                               "reason": "chain break (prev mismatch)"})
+            prev = h
+            chained += 1
+            f_chained += 1
+        files.append({"file": p.name, "lines": f_lines,
+                      "chained": f_chained, "plain": f_plain})
+    return {"files": files,
+            "lines": sum(f["lines"] for f in files),
+            "chained": chained, "plain": plain, "breaks": breaks,
+            "valid": not breaks}
+
+
+@app.get("/admin/ledger")
+async def admin_ledger() -> Response:
+    """Request-ledger chain verification (v2.5 Evidence Center):
+    per-file chained/plain counts + the tamper-evidence walk. Same
+    admin gate as /admin/audit."""
+    return {"ledger": verify_request_chain()}
 
 
 def _mutate_config(mutator, action: str = "config-mutation") -> None:
