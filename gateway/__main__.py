@@ -72,6 +72,13 @@ def main() -> None:
     cfg = get_gateway_config()
     cfg.maybe_reload()
 
+    # Content Vault (v2.4): vault.enabled requires an installed capture
+    # backend (enterprise build + the 'vault' license claim, which wires
+    # gateway_enterprise/vault). Fail fast with a clear error — silent
+    # non-capture would be worse than no vault.
+    from . import traffic
+    traffic.assert_configured(cfg)
+
     import uvicorn
     from .app import app
 
