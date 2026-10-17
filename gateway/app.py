@@ -131,6 +131,7 @@ from . import licensing
 from . import llamaserver
 from . import semantic_cache
 from . import tracing
+from . import traffic
 from . import wire
 from . import modelsearch
 from . import providers
@@ -879,6 +880,16 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
     tracing.add_llm_span(model, backend, ms, usage or {}, status,
                          cost_usd=cost_usd)
     line = json.dumps(rec)
+    # Traffic capture seam (v2.4 Content Vault): the terminal flush for
+    # the request that observed itself at entry. No collector (no
+    # backend installed, or a non-chat endpoint) = pure no-op. Called
+    # from EVERY terminal path — errors and early exits included: the
+    # vault's forensic value is the request side of a failure too.
+    traffic.flush({"model": model, "backend": backend, "stream": stream,
+                   "ms": ms, "usage": usage or {}, "status": status,
+                   "err": err, "cost_usd": cost_usd, "key": kid,
+                   "session": sid, "team": team, "req": rid,
+                   "trace": trace_id})
     # Prometheus counters (best-effort; single chokepoint for every
     # request whatever its status — errors included)
     _metric_inc("gateway_requests_total",
@@ -907,8 +918,7 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
         logger.warning("gateway_log write failed", exc_info=True)
 
 
-# ── monthly spend ledger + rotating request log ────────────────────────────
-# The request log IS the ledger. Files are month-scoped
+# ── monthly spend ledger + rotating request log ────────────────────────────# The request log IS the ledger. Files are month-scoped
 # (gateway-log-YYYY-MM.jsonl next to the legacy path); the legacy single
 # file migrates once (current-month lines imported, older lines archived
 # to gateway-log-archive.jsonl, legacy renamed *.migrated). Closed months
@@ -916,6 +926,19 @@ def _log_request(model: str, backend: str, stream: bool, ms: int,
 # history without scanning archives. Spend scopes: "backend:<name>"
 # (openai-type token budgets) and "key:<id>" (per-consumer token/USD
 # budgets). Cache hits log backend="cache" and never bill upstream.
+
+
+def _capture_content(resp: dict) -> str:
+    """First-choice assistant text of an OpenAI-shaped response — the
+    content the traffic-capture seam observes for non-streaming
+    responses and cache hits. Defensive by design: any shape quirk is
+    an empty string, never an exception."""
+    try:
+        return str((((resp.get("choices") or [{}])[0])
+                    .get("message") or {}).get("content") or "")
+    except Exception:  # noqa: BLE001 — observation must never throw
+        return ""
+
 
 # Spend state rides the storage backend (shared when the enterprise
 # swaps in RedisStorage; dict/set semantics preserved via the facades).
@@ -2159,6 +2182,10 @@ async def chat_completions(body: ChatRequest) -> Response:
                       code="rate_limited", headers={"Retry-After": "1"})
 
     requested = body.model.strip() or cfg.default_alias
+    # Traffic capture seam (v2.4): entry observation — before any
+    # execution, so early exits (429/400/403/guardrail) still flush
+    # with their terminal status and the request side captured.
+    traffic.observe_request(requested, body)
     try:
         plan = cfg.resolve_chain(requested)
     except ProviderNotLicensedError:
@@ -2216,6 +2243,9 @@ async def chat_completions(body: ChatRequest) -> Response:
             _RESPONSE_CACHE[ckey] = {**hit,
                                      "hits": int(hit.get("hits", 0)) + 1}
             resp = dict(hit["resp"])
+            # observe BEFORE the log call — the flush inside _log_request
+            # drops the collector token
+            traffic.observe_response(_capture_content(resp))
             _log_request(requested, "cache", body.stream, 0,
                          resp.get("usage") or {}, 200)
             return JSONResponse(resp)
@@ -2232,6 +2262,7 @@ async def chat_completions(body: ChatRequest) -> Response:
             (body.max_tokens, body.temperature))
         if sem_resp is not None:
             _metric_inc("gateway_semantic_cache_hits_total", (requested,))
+            traffic.observe_response(_capture_content(sem_resp))
             _log_request(requested, "semantic-cache", body.stream, 0,
                          sem_resp.get("usage") or {}, 200)
             return JSONResponse(sem_resp)
@@ -2296,6 +2327,7 @@ async def chat_completions(body: ChatRequest) -> Response:
             return _blocked
         if _content:
             resp["choices"][0]["message"]["content"] = _content
+        traffic.observe_response(_content)
         resp.setdefault("served_by", {"backend": winner, "model": model_key,
                                       "ms": ms})
         if ckey:
@@ -2400,6 +2432,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 # streams; the shared tail charges/logs).
                 resp, _, _ = await _exec_entry(cfg, entry, body, requested)
                 usage_out.update(resp.get("usage") or {})
+                traffic.observe_response(_capture_content(resp))
                 yield "data: " + json.dumps(resp) + "\n\n"
             elif backend.get("type") == "embedded":
                 engine = get_engine()
@@ -2420,6 +2453,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         if text:
                             content_buf.append(text)
                             text_chars += len(text)
+                            traffic.observe_response(text)
                             yield _chunk({"content": text})
                 # If tools were offered, check buffered content for a tool call
                 if body.tools and content_buf:
@@ -2481,6 +2515,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                                    .get("delta") or {}).get("content")
                             if ch0:
                                 text_chars += len(ch0)
+                                traffic.observe_response(ch0)
                     except ValueError:
                         pass
                     yield f"data: {data}\n\n"
@@ -2540,6 +2575,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                                        .get("delta") or {}).get("content")
                                 if ch0:
                                     text_chars += len(ch0)
+                                    traffic.observe_response(ch0)
                         except ValueError:
                             pass
                         yield f"data: {data}\n\n"
@@ -2574,6 +2610,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         content, done, reason = runpod.ollama_chunk_content(chunk)
                         if content:
                             got_any = True
+                            traffic.observe_response(content)
                             yield _chunk({"content": content})
                         if done:
                             finish = reason or "stop"
@@ -2590,6 +2627,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                     usage_out = resp.get("usage") or usage_out
                     choice = resp["choices"][0]
                     if choice["message"].get("content"):
+                        traffic.observe_response(
+                            str(choice["message"].get("content") or ""))
                         yield _chunk({"content": choice["message"]["content"]})
                     yield _chunk({}, finish=choice.get("finish_reason") or "stop")
             elif backend.get("type") == "runpod-public":
@@ -2614,6 +2653,8 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                 usage_out = resp.get("usage") or usage_out
                 choice = resp["choices"][0]
                 if choice["message"].get("content"):
+                    traffic.observe_response(
+                        str(choice["message"].get("content") or ""))
                     yield _chunk({"content": choice["message"]["content"]})
                 yield _chunk({}, finish=choice.get("finish_reason") or "stop")
             else:
@@ -2682,6 +2723,7 @@ def _stream_chat(requested: str, entry: tuple[str, str],
                         cs = getattr(chunk, "choices", None)
                         if cs and getattr(cs[0].delta, "content", None):
                             text_chars += len(cs[0].delta.content)
+                            traffic.observe_response(cs[0].delta.content)
                     except Exception:      # noqa: BLE001 — passthrough
                         pass
                     data = (chunk.model_dump_json()

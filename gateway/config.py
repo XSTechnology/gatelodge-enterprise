@@ -1001,6 +1001,16 @@ class GatewayConfig:
             "ttl_s": max(0.0, float(sc.get("ttl_s") or 3600)),
             "max": max(0, int(sc.get("max") or 100)),
         }
+        # Content Vault (v2.4, ENTERPRISE add-on): full-traffic capture
+        # seam (gateway/traffic.py). The standard build ships NO capture
+        # backend — vault.enabled without one fails the boot gate
+        # (traffic.assert_configured) with a clear error. All vault
+        # detail (keys, modes, rotation, retention) is enterprise-side;
+        # the core section is just the switch.
+        vt = raw.get("vault") if isinstance(raw.get("vault"), dict) else {}
+        self.vault = {
+            "enabled": bool(vt.get("enabled", False)),
+        }
         # Virtual (per-consumer) keys + cached provider pricing
         self.api_keys = _normalize_api_keys(raw.get("api_keys"))
         self.model_prices = _normalize_model_prices(raw.get("model_prices"))
