@@ -198,12 +198,12 @@ deck survivable in a technical evaluation:
 4. **Metadata by default — content is never silently logged.** The
    default record is who / which model / when / cost / outcome / trace
    correlation. Prompt content is captured only if the customer
-   explicitly enables the Content Vault (Enterprise add-on, in
-   development): full-traffic records encrypted to keys only the
+   explicitly enables the Content Vault (Enterprise add-on, shipped
+   in v2.4.0): full-traffic records encrypted to keys only the
    customer holds, searchable by user without decrypting content,
-   escrowed so no single lost key loses data. Until it ships, "we can
-   show you the prompts" is not a claim — the honest answer is
-   "roadmap: the Content Vault."
+   escrowed so no single lost key loses data. With the vault on, "we
+   can show you the prompts" is a claim — the records exist, chain-
+   verified, and open only to the customer's keys.
 5. **API-driven AI only.** SaaS-embedded AI (M365 Copilot et al.)
    does not route through the gateway. Say it plainly — the honest
    boundary is why the control-point story is credible.
@@ -213,14 +213,16 @@ deck survivable in a technical evaluation:
    local GGUF. (Native translators in the product — the full row is
    real.)
 
-## Roadmap — always say it as roadmap
+## Shipped — say it as shipped (v2.4.0)
 
-- **Content Vault (Enterprise, in development):** optional full-
+- **Content Vault (Enterprise add-on, shipped):** optional full-
   traffic capture — every request and response written to an
   encrypted, tamper-evident local vault, keyed to the customer's own
   keys so the gateway can write but never read. A separate search key
   lets auditors extract a specific user's records without decrypting
   content; escrow is built in (multi-wrap keys, canary checks) so no
   single lost key means lost data. Off by default — the metadata-only
-  default posture is the product's standing posture. Full spec:
-  specs/content-vault-spec.md.
+  default posture is the product's standing posture. Chain
+  verification needs no keys at all; keycheck proves possession
+  offline without the private key ever touching the gateway. Full
+  spec: specs/content-vault-spec.md.

@@ -22,7 +22,10 @@ first boot** — no license file needed during the trial.
 
 ## Installing the key
 
-1. Download `gatelodge-community.exe` if you haven't
+1. Download `gatelodge-community.zip` if you haven't, unzip it, and
+   run `gatelodge-community.exe` from the unzipped folder (the exe
+   needs the files beside it — don't run it straight from the zip or
+   copy it out alone)
 2. Save the license block from your email as **`license.json`** in
    Gatelodge's **data folder** — the `data` directory beside the
    executable (create the folder if it doesn't exist)

@@ -389,11 +389,12 @@ async def download_community(request: Request):
         raise HTTPException(429, "too many downloads — try again later")
     if not BINARY_PATH or not os.path.exists(BINARY_PATH):
         raise HTTPException(404, "binary not configured")
-    return FileResponse(
-        BINARY_PATH,
-        media_type="application/octet-stream",
-        filename="gatelodge-community.exe",
-    )
+    name = os.path.basename(BINARY_PATH)
+    # the shipped artifact is the zipped dist folder (standalone build:
+    # the exe needs its DLL/.pyd siblings — a bare exe cannot run)
+    media = ("application/zip" if name.endswith(".zip")
+             else "application/octet-stream")
+    return FileResponse(BINARY_PATH, media_type=media, filename=name)
 
 
 # ── lost-key recovery ─────────────────────────────────────────────────────

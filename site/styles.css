@@ -385,6 +385,24 @@ main { display: block; padding-bottom: 1.5rem; }
   letter-spacing: .08em; text-transform: uppercase; line-height: 1.7;
 }
 
+/* content vault modal */
+.vault-intro { color: var(--muted); font-size: .88rem; line-height: 1.65; margin-bottom: 1rem; }
+.vault-shot {
+  display: block; width: 100%; height: auto;
+  border: 1px solid var(--line-soft); border-radius: 10px;
+  background: #0c110e;
+}
+.vault-points { list-style: none; margin-top: 1rem; display: grid; gap: .55rem; }
+.vault-points li {
+  color: var(--muted); font-size: .82rem; line-height: 1.55;
+  padding-left: 1.1rem; position: relative;
+}
+.vault-points li::before {
+  content: "◆"; position: absolute; left: 0; top: 0;
+  color: var(--brass); font-size: .6rem; line-height: 2;
+}
+.vault-points strong { color: var(--paper); }
+
 /* download alternate CTAs */
 .download-alt {
   display: flex; gap: 1.1rem; justify-content: center;

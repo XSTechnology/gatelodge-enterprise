@@ -20,7 +20,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20261019">
+<link rel="stylesheet" href="styles.css?v=20261020">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
@@ -257,11 +257,15 @@
   <div class="product-band">
     <div class="product-note">
       <p class="note-tag mono">&#9670; How the audit chain verifies</p>
-      <p>Every request appends a record to a local, append-only ledger &#8212; each record
-        carries the hash of the one before it, so any edit anywhere breaks the chain
-        and the console says so. Licenses and key revocations are signed with
-        public-key cryptography and checked against a tamper-evident revocation list.
-        Verification is a command, not a promise.</p>
+      <p>Every request appends a record to a local, append-only ledger — each
+        record carries the hash of the one before it, so any edit anywhere
+        breaks the chain and the console says so. Verification is a command,
+        not a promise.</p>
+      <p>Need the prompts themselves? The <strong>Content Vault</strong>
+        (Enterprise add-on, v2.4.0) captures full traffic encrypted to keys
+        only you hold — searchable by user without decrypting, escrowed so no
+        lost key loses data. <button class="btn btn-ghost btn-sm" type="button"
+        data-modal-open="vault-modal">See the audit commands</button></p>
     </div>
     <div class="product-note">
       <p class="note-tag mono">&#9670; And the agents that walk through it</p>
@@ -490,6 +494,7 @@
         <li>Multi-replica tier D with shared state</li>
         <li>SCIM provisioning · SSO · teams &amp; workspaces</li>
         <li>Session budgets · MCP gateway governance</li>
+        <li>Content Vault add-on — encrypted full-traffic capture</li>
         <li>Support, compliance &amp; audit assistance</li>
       </ul>
       <a class="btn btn-brass wide" href="#contact">Book a walkthrough</a>
@@ -575,8 +580,9 @@
         <p class="mono muted">The binary runs a full-feature 30-day trial from first boot —
           no license file needed.</p>
         <a class="btn btn-brass wide" id="trial-download-link"
-           href="#" download>Download gatelodge-community.exe</a>
-        <p class="mono muted" style="margin-top:12px">156 MB · Windows · SHA-256 verified build</p>
+           href="#" download>Download gatelodge-community.zip</a>
+        <p class="mono muted" style="margin-top:12px">156 MB · Windows · SHA-256 verified build ·
+          unzip, then run gatelodge-community.exe</p>
         <p class="mono muted" id="trial-email-note" hidden
            style="margin-top:0">We also emailed your download link — keep that message for later.</p>
       </div>
@@ -714,6 +720,7 @@
           <tr><td>SSO/OIDC · SCIM provisioning</td><td class="no">—</td><td class="yes">✓</td></tr>
           <tr><td>Teams &amp; workspaces</td><td class="no">—</td><td class="yes">✓</td></tr>
           <tr><td>Session budgets · MCP gateway governance</td><td class="no">—</td><td class="yes">✓</td></tr>
+          <tr><td>Content Vault — encrypted full-traffic capture (add-on)</td><td class="no">—</td><td class="yes">✓</td></tr>
           <tr><td>Support</td><td>Email + this site's agent</td><td>Support, compliance &amp; audit assistance</td></tr>
         </tbody>
       </table>
@@ -779,6 +786,45 @@
         metadata — prompt content is never logged</p>
     </div>
     <div class="eula-foot mono">The Gatekeeper answers these questions live — chat, bottom right</div>
+  </div>
+</dialog>
+
+<dialog class="eula-modal modal" id="vault-modal" aria-labelledby="vault-title">
+  <div class="eula-frame">
+    <div class="eula-head">
+      <div>
+        <p class="eula-kicker">Enterprise add-on &#183; shipped in v2.4.0</p>
+        <p class="eula-title" id="vault-title">The Content Vault</p>
+      </div>
+      <button class="eula-close" type="button" data-modal-close aria-label="Close vault">✕</button>
+    </div>
+    <div class="eula-body">
+      <p class="vault-intro">Regulated environments need content-level records. The
+        vault writes every request and response to an encrypted, tamper-evident
+        local log — keyed to your own keys, so the gateway can write but never
+        read. These are the vault&#8217;s own commands, run against a live
+        capture:</p>
+      <img class="vault-shot" src="img/vault-terminal.png?v=20261017"
+           alt="Terminal session: the vault chain verifies with no keys, a user's
+           records are found by blind index while still encrypted, and the records
+           open offline with an escrow key" loading="lazy" width="880" height="550">
+      <ul class="vault-points">
+        <li><strong>Verify with no keys.</strong> The chain walks the ciphertext —
+          integrity is checkable by anyone, decryptable by no one but you.</li>
+        <li><strong>Search without decrypting.</strong> A blind index finds one
+          user&#8217;s records while content stays encrypted — Key S never
+          decrypts anything.</li>
+        <li><strong>Escrow by construction.</strong> Every record&#8217;s data key
+          is wrapped to every key in the set — the primary can be lost and the
+          escrow key still opens everything.</li>
+        <li><strong>Offline possession proof.</strong> keycheck challenges are
+          answered off-gateway; the private key never touches the gateway.</li>
+      </ul>
+      <p class="exec-scope mono">Off by default — the metadata-only posture is the
+        product&#8217;s standing posture &#183; the vault is an explicit,
+        auditable choice</p>
+    </div>
+    <div class="eula-foot mono">Full spec on request &#183; Enterprise licenses carry the vault claim</div>
   </div>
 </dialog>
 

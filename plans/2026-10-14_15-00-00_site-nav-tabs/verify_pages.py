@@ -108,6 +108,29 @@ def run():
                 check("gate: product audit block",
                       page.eval_on_selector("#product .product-note",
                                             "el => !!el"))
+                check("gate: vault note on product",
+                      "Content Vault" in page.eval_on_selector(
+                          "#product .product-note", "el => el.textContent"))
+                check("gate: vault modal opens", (
+                    page.click('#product [data-modal-open="vault-modal"]')
+                    or page.wait_for_timeout(300)
+                    or page.eval_on_selector("#vault-modal",
+                                             "el => el.open")))
+                check("gate: vault modal carries terminal shot", (
+                    page.eval_on_selector("#vault-modal .vault-shot",
+                                          "el => el.naturalWidth > 0")
+                    and page.eval_on_selector_all(
+                        "#vault-modal .vault-points li",
+                        "els => els.length") == 4))
+                page.screenshot(path=os.path.join(SHOTS, "03d-gate-vault.png"))
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+                check("gate: vault modal closes", not page.eval_on_selector(
+                    "#vault-modal", "el => el.open"))
+            if pid == "editions":
+                check("gate: editions list the vault", "Content Vault" in
+                      page.eval_on_selector("#editions .edition-primary",
+                                            "el => el.textContent"))
             if pid == "problem":
                 page.screenshot(path=os.path.join(SHOTS, "03-gate-problem.png"))
             if pid == "how":
@@ -137,8 +160,8 @@ def run():
         page.wait_for_timeout(300)
         check("gate: compare modal opens", page.eval_on_selector(
             "#compare-modal", "el => el.open"))
-        check("gate: matrix has 12 rows", page.eval_on_selector_all(
-            "#compare-modal .matrix-table tbody tr", "els => els.length") == 12)
+        check("gate: matrix has 13 rows", page.eval_on_selector_all(
+            "#compare-modal .matrix-table tbody tr", "els => els.length") == 13)
         page.screenshot(path=os.path.join(SHOTS, "03c-editions-matrix.png"))
         page.keyboard.press("Escape")
         page.wait_for_timeout(200)

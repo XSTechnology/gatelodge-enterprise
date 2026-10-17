@@ -48,7 +48,8 @@ subprocess.run(["git", "-C", WORK, "config", "user.name",
 r = subprocess.run(["git", "-C", WORK, "add", "-A"], check=True,
                    capture_output=True)
 r = subprocess.run(["git", "-C", WORK, "commit", "-m",
-                    "staging refresh: business-first ledes (how, roi)"],
+                    "staging refresh: v2.4.0 content vault (modal + "
+                    "editions) + zip download"],
                    capture_output=True, text=True)
 print("commit:", (r.stdout + r.stderr).strip()[:120])
 r = subprocess.run(["git", "-C", WORK, "push", "origin", "main"],

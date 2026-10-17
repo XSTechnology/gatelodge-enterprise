@@ -150,7 +150,7 @@ def render_purchase(serial: str, license_json: str) -> tuple[str, str, str]:
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:28px;">
 <tr>
   <td style="width:34px;vertical-align:top;font-family:'Courier New',Courier,monospace;font-size:13px;color:{_BRASS};padding:0 10px 12px 0;">01</td>
-  <td style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:{_INK};padding-bottom:12px;">Download the binary &mdash; <a href="{dl}" style="color:{_INK};text-decoration:underline;">gatelodge-community.exe</a></td>
+  <td style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:{_INK};padding-bottom:12px;">Download the binary &mdash; <a href="{dl}" style="color:{_INK};text-decoration:underline;">gatelodge-community.zip</a>. Unzip it, then run <span style="font-family:'Courier New',Courier,monospace;font-size:13px;">gatelodge-community.exe</span> from the unzipped folder.</td>
 </tr>
 <tr>
   <td style="width:34px;vertical-align:top;font-family:'Courier New',Courier,monospace;font-size:13px;color:{_BRASS};padding:0 10px 12px 0;">02</td>
