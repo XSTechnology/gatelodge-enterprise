@@ -35,10 +35,10 @@ TURNSTILE_SITEKEY=$(envof licensing TURNSTILE_SITEKEY)
 ADMIN_KEY=$(envof lodge-office ADMIN_KEY)
 GK_KEY=$(envof lodge-office GATEWAY_KEY)
 
-echo "== build gatekeeper:22 =="
+echo "== build gatekeeper:23 =="
 cd /home/coolify/gatekeeper
-docker build -t gatekeeper:22 helpdesk > /tmp/g22.log 2>&1 || {
-  echo GK_BUILD_FAILED; tail -20 /tmp/g22.log; exit 1; }
+docker build -t gatekeeper:23 helpdesk > /tmp/g23.log 2>&1 || {
+  echo GK_BUILD_FAILED; tail -20 /tmp/g23.log; exit 1; }
 echo BUILD_OK
 docker rm -f gatekeeper > /dev/null
 docker create --name gatekeeper -p 8105:8100 --restart unless-stopped \
@@ -55,7 +55,7 @@ docker create --name gatekeeper -p 8105:8100 --restart unless-stopped \
   -e REVIEW_KEY="$REVIEW_KEY" \
   -e INBOUND_KEY="$INBOUND_KEY" \
   -e OWNER_EMAIL=sales@xs.technology \
-  gatekeeper:22 > /dev/null
+  gatekeeper:23 > /dev/null
 docker network connect coolify gatekeeper
 docker start gatekeeper > /dev/null
 sleep 10
@@ -75,10 +75,10 @@ r = urllib.request.Request('http://127.0.0.1:8100/api/kb/reanalyze',
 print(urllib.request.urlopen(r, timeout=180).read().decode()[:200])
 "
 
-echo "== build lodge-office:18 =="
+echo "== build lodge-office:19 =="
 cd /home/coolify/admin
-docker build -t lodge-office:18 . > /tmp/b18.log 2>&1 || {
-  echo ADMIN_BUILD_FAILED; tail -20 /tmp/b18.log; exit 1; }
+docker build -t lodge-office:19 . > /tmp/b19.log 2>&1 || {
+  echo ADMIN_BUILD_FAILED; tail -20 /tmp/b19.log; exit 1; }
 echo BUILD_OK
 docker rm -f lodge-office > /dev/null
 docker create --name lodge-office \
@@ -94,7 +94,7 @@ docker create --name lodge-office \
   -e REVIEW_KEY="$REVIEW_KEY" \
   -e LICENSING_URL=http://10.1.2.217:8100 \
   -e SITE_FAQ_URL=https://datagatelodge.com/gatelodge.html \
-  lodge-office:18 > /dev/null
+  lodge-office:19 > /dev/null
 docker network connect coolify lodge-office
 docker start lodge-office > /dev/null
 sleep 5

@@ -19,6 +19,8 @@ No. The request log and the OTLP traces record the activity around each request 
 
 The one place request text is kept is the semantic cache: recent requests and responses stored on your own disk, inside your perimeter, so a paraphrased repeat can be served without re-billing upstream. It can be disabled in configuration (it is on by default) and cleared at any time.
 
+For environments that require content-level records — regulated industries, incident forensics — an optional Content Vault is on the roadmap as an Enterprise add-on: full request and response capture, encrypted to keys only you hold, searchable by user without decrypting content, with escrow built in so no single lost key means lost data. It is off by default; the posture above is the default posture.
+
 ## How are budgets enforced?
 
 Budgets are hard limits, not warnings. Teams get monthly token budgets; when a team's budget is exhausted, further requests are denied — not throttled, not "overage billed." Per-session budgets cap individual long conversations. The console shows spend against budget in real time, per team and per backend, so cost attribution answers "which workload, which team, which model."

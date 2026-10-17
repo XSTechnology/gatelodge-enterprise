@@ -1,0 +1,27 @@
+[
+  {
+    "content": "[v1-spec] Content Vault engineering spec (two-key search, multi-wrap escrow, chain, ops, seams, tests)",
+    "id": "v1-spec",
+    "status": "in_progress"
+  },
+  {
+    "content": "[v1-msg] Messaging alignment: deck claims item + evaluation.md roadmap note + deploy KB",
+    "id": "v1-msg",
+    "status": "pending"
+  },
+  {
+    "content": "[v2-seam] Standard-repo capture seam: TrafficCapture protocol + config schema + default no-op + suite tests",
+    "id": "v2-seam",
+    "status": "pending"
+  },
+  {
+    "content": "[v3-vault] Fork vault module: crypto writer, blind index, chain, keyfile, canaries, console tile, tools",
+    "id": "v3-vault",
+    "status": "pending"
+  },
+  {
+    "content": "[v4-ship] Suites both repos, license gating, docs+site messaging at ship, release",
+    "id": "v4-ship",
+    "status": "pending"
+  }
+]
