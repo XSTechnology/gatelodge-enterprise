@@ -187,6 +187,20 @@ def _wire_vault(enabled: bool = True) -> dict:
     return vault_wire(enabled=True)
 
 
+def _wire_evidence(enabled: bool = True) -> dict:
+    """Evidence Center (v2.5, Enterprise): request-ledger chaining is
+    CORE (gateway.app, gated live by the same 'evidence' claim); this
+    mounts the packaging surface (/admin/evidence — status + one-
+    command audit packages)."""
+    import logging
+    if not enabled:
+        logging.getLogger("gateway.enterprise").info(
+            "evidence NOT licensed — no packaging surface")
+        return {"installed": False, "reason": "not licensed"}
+    from gateway_enterprise.evidence import wire as evidence_wire
+    return evidence_wire(enabled=True)
+
+
 def main() -> None:
     # ── enterprise seam wiring (before serving) ────────────────────
     # The core's main() configures logging, but the wiring below logs
@@ -215,6 +229,7 @@ def main() -> None:
     _wire_mcp(enabled=licensing.allows("mcp"))
     _wire_teams(enabled=licensing.allows("teams"))
     _wire_vault(enabled=licensing.allows("vault"))
+    _wire_evidence(enabled=licensing.allows("evidence"))
 
     # v1.4: session budgets — the ENTERPRISE link (inert without the
     # session_budgets section; the core carries the charge hook). The
