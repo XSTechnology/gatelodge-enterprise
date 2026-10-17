@@ -4787,13 +4787,30 @@ function showGovernance(ui) {
       if (!box) return;
       var ch = a.chain || {};
       var valid = ch.valid !== false;
-      var html2 = '<div class="kv">' + (valid
+      var html2 = '<div class="kv"><b>config-audit</b> ' + (valid
         ? '<span class="badge ok">chain intact</span>'
         : '<span class="badge err">CHAIN BREAK</span>') +
         ' ' + esc(String(ch.chained || 0)) + ' chained record(s)' +
         ((ch.breaks || []).length
           ? ' — first break: ' + esc(JSON.stringify(ch.breaks[0]).slice(0, 120))
           : '') + '</div>';
+      // ── request ledger (v2.5): tamper-evident under 'evidence' ──
+      api('/admin/ledger').then(function (l) {
+        var ld = (l && l.ledger) || {};
+        html2 += '<div class="kv" style="margin-top:4px"><b>request ledger</b> ' +
+          (ld.valid !== false
+            ? '<span class="badge ok">chain intact</span>'
+            : '<span class="badge err">CHAIN BREAK</span>') +
+          ' ' + esc(String(ld.chained || 0)) + ' chained' +
+          (ld.plain ? ' / ' + esc(String(ld.plain)) + ' plain' : '') +
+          ' record(s)' +
+          ((ld.breaks || []).length
+            ? ' — first break: ' + esc(JSON.stringify(ld.breaks[0]).slice(0, 120))
+            : '') + '</div>';
+        box.innerHTML = html2;
+      }).catch(function () {
+        box.innerHTML = html2;   // older core without /admin/ledger
+      });
       var rows = (a.audit || []).slice(0, 10);
       if (rows.length) {
         html2 += '<table style="margin-top:8px"><thead><tr><th>ts</th><th>key</th><th>action</th></tr></thead><tbody>';
@@ -4817,8 +4834,9 @@ function showGovernance(ui) {
 function buildAuditWidget() {
   return '<div class="widget"><h3>Audit chain</h3>' +
     '<div id="audit-body"><div class="muted">loading…</div></div>' +
-    '<div class="muted" style="margin-top:6px">Every config mutation appends a hash-chained ' +
-    'record (config-audit.jsonl) — tamper-evident; the chain verifies on every open.</div></div>';
+    '<div class="muted" style="margin-top:6px">Config mutations append a hash-chained ' +
+    'record (config-audit.jsonl); under the Enterprise evidence claim the request ledger ' +
+    'chains too (gateway-log-*.jsonl) — tamper-evident; both verify on every open.</div></div>';
 }
 
 function errBox(e) { return '<div style="color:var(--danger);padding:12px;">✗ ' + esc(e.message) + '</div>'; }
