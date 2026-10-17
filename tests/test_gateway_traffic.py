@@ -176,6 +176,9 @@ def _config(gguf, vault=None):
 def test_no_backend_is_a_complete_noop(wired, gguf, monkeypatch):
     wired(_config(gguf))
     assert not traffic.installed()
+    # stats are cumulative process-wide — reset so this test measures
+    # exactly its own request (other tests may have installed backends)
+    traffic._STATS.update({k: 0 for k in traffic._STATS})
     fake = _patch_cloud(monkeypatch, _FakeCloud())
 
     def fn(records):
