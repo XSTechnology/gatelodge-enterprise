@@ -20,7 +20,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20261020">
+<link rel="stylesheet" href="styles.css?v=20261021">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body>
@@ -259,13 +259,16 @@
       <p class="note-tag mono">&#9670; How the audit chain verifies</p>
       <p>Every request appends a record to a local, append-only ledger — each
         record carries the hash of the one before it, so any edit anywhere
-        breaks the chain and the console says so. Verification is a command,
-        not a promise.</p>
+        breaks the chain. Verification is a command, not a promise.</p>
       <p>Need the prompts themselves? The <strong>Content Vault</strong>
-        (Enterprise add-on, v2.4.0) captures full traffic encrypted to keys
-        only you hold — searchable by user without decrypting, escrowed so no
-        lost key loses data. <button class="btn btn-ghost btn-sm" type="button"
+        (Enterprise add-on) captures full traffic encrypted to keys only you
+        hold — searchable without decrypting, escrowed against lost keys.
+        <button class="btn btn-ghost btn-sm" type="button"
         data-modal-open="vault-modal">See the audit commands</button></p>
+      <p>Need it as an artifact? The <strong>Evidence Center</strong>
+        (Enterprise, v2.5.0) assembles the auditor-ready package in one
+        command. <button class="btn btn-ghost btn-sm" type="button"
+        data-modal-open="evidence-modal">See what&#8217;s inside</button></p>
     </div>
     <div class="product-note">
       <p class="note-tag mono">&#9670; And the agents that walk through it</p>
@@ -494,7 +497,7 @@
         <li>Multi-replica tier D with shared state</li>
         <li>SCIM provisioning · SSO · teams &amp; workspaces</li>
         <li>Session budgets · MCP gateway governance</li>
-        <li>Content Vault add-on — encrypted full-traffic capture</li>
+        <li>Content Vault + Evidence Center add-ons — encrypted capture, audit packages</li>
         <li>Support, compliance &amp; audit assistance</li>
       </ul>
       <a class="btn btn-brass wide" href="#contact">Book a walkthrough</a>
@@ -503,7 +506,7 @@
 
   <p class="edition-fine mono">Self-hosted always. No SaaS tier — your prompts never
     transit our infrastructure, because there is no “our infrastructure.”</p>
-  <div style="margin-top:.45rem">
+  <div style="margin-top:.25rem">
     <button class="btn btn-ghost btn-sm" type="button" data-modal-open="compare-modal">Compare editions in detail</button>
   </div>
 </section>
@@ -721,6 +724,7 @@
           <tr><td>Teams &amp; workspaces</td><td class="no">—</td><td class="yes">✓</td></tr>
           <tr><td>Session budgets · MCP gateway governance</td><td class="no">—</td><td class="yes">✓</td></tr>
           <tr><td>Content Vault — encrypted full-traffic capture (add-on)</td><td class="no">—</td><td class="yes">✓</td></tr>
+          <tr><td>Evidence Center — tamper-evident ledger + audit packages</td><td class="no">—</td><td class="yes">✓</td></tr>
           <tr><td>Support</td><td>Email + this site's agent</td><td>Support, compliance &amp; audit assistance</td></tr>
         </tbody>
       </table>
@@ -825,6 +829,50 @@
         auditable choice</p>
     </div>
     <div class="eula-foot mono">Full spec on request &#183; Enterprise licenses carry the vault claim</div>
+  </div>
+</dialog>
+
+<dialog class="eula-modal modal" id="evidence-modal" aria-labelledby="evidence-title">
+  <div class="eula-frame">
+    <div class="eula-head">
+      <div>
+        <p class="eula-kicker">Enterprise &#183; shipped in v2.5.0</p>
+        <p class="eula-title" id="evidence-title">The Evidence Center</p>
+      </div>
+      <button class="eula-close" type="button" data-modal-close aria-label="Close evidence">✕</button>
+    </div>
+    <div class="eula-body">
+      <p class="vault-intro">Auditors ask for artifacts, not promises. One command assembles
+        the package from your own deployment — every number in it computed from
+        artifacts the package itself carries:</p>
+      <img class="vault-shot" src="img/evidence-terminal.png?v=20261017"
+           alt="Terminal session: an evidence package is assembled from a live
+           gateway, then verified offline — every manifest hash matches and the
+           request-ledger chain walks clean" loading="lazy" width="880" height="550">
+      <ul class="vault-points">
+        <li><strong>Tamper-evident request ledger.</strong> Under the
+          <span class="mono">evidence</span> claim every request line chains
+          (prev/hash, canonical sha256) — edits, deletions and downgrades all
+          break the walk. The chain continues across restarts and month files.</li>
+        <li><strong>The package is self-verifying.</strong> manifest.json carries
+          the sha256 of every file; the offline CLI re-walks the chain from the
+          package&#8217;s own extract — the verdict comes from the artifacts, not
+          from trusting the assembler.</li>
+        <li><strong>Inventory + posture, facts only.</strong> Models, keys
+          (hash-abbreviated, never material), providers, budgets — and a
+          governance posture where every figure cites the artifact it came
+          from. No risk scoring, no invented numbers.</li>
+        <li><strong>Honest boundaries, in writing.</strong> The control mapping
+          (SOC 2 TSC · ISO 27001 · NIST AI RMF · EU AI Act) says
+          &#8220;supports&#8221; — and the package carries an explicit
+          not-provided list: no certification, no content inspection, no threat
+          detection.</li>
+      </ul>
+      <p class="exec-scope mono">Self-hosted always — the package is assembled on your
+        machine and never transits ours &#183; community edition keeps plain request
+        logs; chaining + packages are the Enterprise evidence layer</p>
+    </div>
+    <div class="eula-foot mono">SOC 2 TSC · ISO 27001 · NIST AI RMF · EU AI Act mappings in every package</div>
   </div>
 </dialog>
 

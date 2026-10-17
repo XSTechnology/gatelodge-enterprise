@@ -127,6 +127,25 @@ def run():
                 page.wait_for_timeout(200)
                 check("gate: vault modal closes", not page.eval_on_selector(
                     "#vault-modal", "el => el.open"))
+                check("gate: evidence note on product",
+                      "Evidence Center" in page.eval_on_selector(
+                          "#product .product-note", "el => el.textContent"))
+                check("gate: evidence modal opens", (
+                    page.click('#product [data-modal-open="evidence-modal"]')
+                    or page.wait_for_timeout(300)
+                    or page.eval_on_selector("#evidence-modal",
+                                             "el => el.open")))
+                check("gate: evidence modal carries terminal shot", (
+                    page.eval_on_selector("#evidence-modal .vault-shot",
+                                          "el => el.naturalWidth > 0")
+                    and page.eval_on_selector_all(
+                        "#evidence-modal .vault-points li",
+                        "els => els.length") == 4))
+                page.screenshot(path=os.path.join(SHOTS, "03e-gate-evidence.png"))
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+                check("gate: evidence modal closes", not page.eval_on_selector(
+                    "#evidence-modal", "el => el.open"))
             if pid == "editions":
                 check("gate: editions list the vault", "Content Vault" in
                       page.eval_on_selector("#editions .edition-primary",
@@ -160,8 +179,8 @@ def run():
         page.wait_for_timeout(300)
         check("gate: compare modal opens", page.eval_on_selector(
             "#compare-modal", "el => el.open"))
-        check("gate: matrix has 13 rows", page.eval_on_selector_all(
-            "#compare-modal .matrix-table tbody tr", "els => els.length") == 13)
+        check("gate: matrix has 14 rows", page.eval_on_selector_all(
+            "#compare-modal .matrix-table tbody tr", "els => els.length") == 14)
         page.screenshot(path=os.path.join(SHOTS, "03c-editions-matrix.png"))
         page.keyboard.press("Escape")
         page.wait_for_timeout(200)

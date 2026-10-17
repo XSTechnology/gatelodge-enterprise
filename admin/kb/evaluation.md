@@ -21,6 +21,10 @@ The one place request text is kept is the semantic cache: recent requests and re
 
 For environments that require content-level records — regulated industries, incident forensics — an optional Content Vault ships as an Enterprise add-on (v2.4.0): full request and response capture, encrypted to keys only you hold, searchable by user without decrypting content, with escrow built in so no single lost key means lost data. It is off by default; the posture above is the default posture.
 
+## Can we get auditor-ready evidence?
+
+Yes — the Evidence Center ships in the Enterprise edition (v2.5.0). Under the `evidence` license claim, every request-ledger line becomes tamper-evident (hash-chained, the same pattern as the config-mutation audit chain), and one command assembles a self-verifying evidence package: the ledger months with their chain proofs, the config-audit chain, license state, an AI asset inventory (models, keys, providers, budgets — no key material), and a governance posture report where every figure is computed from artifacts included in the same package. The package carries a control mapping to SOC 2 TSC, ISO 27001, NIST AI RMF and EU AI Act — "supports" language, with an explicit not-provided list. Honest boundary: Gatelodge produces evidence for your audit; it does not certify anything, and no risk scoring is offered or implied. The community edition keeps plain (unchained) request logs; chaining and packaging are the Enterprise layer.
+
 ## How are budgets enforced?
 
 Budgets are hard limits, not warnings. Teams get monthly token budgets; when a team's budget is exhausted, further requests are denied — not throttled, not "overage billed." Per-session budgets cap individual long conversations. The console shows spend against budget in real time, per team and per backend, so cost attribution answers "which workload, which team, which model."

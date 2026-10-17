@@ -226,3 +226,18 @@ deck survivable in a technical evaluation:
   verification needs no keys at all; keycheck proves possession
   offline without the private key ever touching the gateway. Full
   spec: specs/content-vault-spec.md.
+
+## Shipped — say it as shipped (v2.5.0)
+
+- **Evidence Center (Enterprise, shipped):** the request ledger
+  becomes tamper-evident under the `evidence` claim (hash-chained
+  lines, chain continues across restarts and month files, edits/
+  deletions/downgrades all break the walk), and one command assembles
+  a self-verifying audit package: ledger months + chain proofs,
+  config-audit chain, license state, redacted AI asset inventory,
+  governance posture (facts only — every figure computed from
+  artifacts in the package), and a control mapping (SOC 2 TSC ·
+  ISO 27001 · NIST AI RMF · EU AI Act) with an explicit
+  not-provided list. Community keeps plain logs; chaining + packaging
+  are the Enterprise evidence layer. Spec:
+  specs/evidence-center-spec.md.
