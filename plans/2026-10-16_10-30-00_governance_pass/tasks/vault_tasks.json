@@ -1,27 +1,27 @@
 [
   {
-    "content": "[v1-spec] Content Vault engineering spec (two-key search, multi-wrap escrow, chain, ops, seams, tests)",
+    "content": "[v1-spec] Content Vault spec — DONE (specs/content-vault-spec.md, commit f7cfa69)",
     "id": "v1-spec",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[v1-msg] Messaging alignment: deck claims item + evaluation.md roadmap note + deploy KB",
+    "content": "[v1-msg] Messaging aligned + deployed (deck claims + roadmap, evaluation.md live on gatekeeper:23/lodge-office:19)",
     "id": "v1-msg",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v2-seam] Standard-repo capture seam: TrafficCapture protocol + config schema + default no-op + suite tests",
+    "content": "[v2-seam] Standard seam — DONE (gateway/traffic.py + wiring + boot gate + 11 tests; standard c5f94f6, suite 694)",
     "id": "v2-seam",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v3-vault] Fork vault module: crypto writer, blind index, chain, keyfile, canaries, console tile, tools",
+    "content": "[v3-vault] Fork vault module — DONE (keys/writer/index/tools + wire + 17 tests; fork 7b11bf3, suite 780)",
     "id": "v3-vault",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[v4-ship] Suites both repos, license gating, docs+site messaging at ship, release",
+    "content": "[v4-ship] License claim added (standard 8080a38, fork merged b83fc82, both suites green) — REMAINING: v2.4.0 release build + messaging flip at ship",
     "id": "v4-ship",
-    "status": "pending"
+    "status": "in_progress"
   }
 ]

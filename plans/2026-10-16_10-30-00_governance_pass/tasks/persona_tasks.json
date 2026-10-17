@@ -2,21 +2,21 @@
   {
     "content": "[deck] Ground-truthed security-architecture deck file (slide + table + talk track + claims discipline)",
     "id": "deck",
-    "status": "in_progress"
+    "status": "completed"
   },
   {
-    "content": "[kb] Corrected concern-to-control table in evaluation.md + intent re-analysis",
+    "content": "[kb] Corrected concern-to-control table + content-logging boundary in evaluation.md, re-analyzed, live-proven",
     "id": "kb",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[site] Buying-committee roles (CEO/CIO/CISO/Audit) with differentiated messaging + concern-to-control pairs",
+    "content": "[site] Buying-committee roles (CEO/CIO/CISO/Audit) live + staging, 63/63 fit",
     "id": "site",
-    "status": "pending"
+    "status": "completed"
   },
   {
-    "content": "[ship] Fit suite + deploy gatekeeper:21 + lodge-office:17 + staging refresh + verify + commit",
+    "content": "[ship] Deployed gatekeeper:22 + lodge-office:18, staging refreshed, 9/9 verified (commit efd0f04)",
     "id": "ship",
-    "status": "pending"
+    "status": "completed"
   }
 ]
