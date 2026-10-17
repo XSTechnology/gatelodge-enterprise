@@ -170,6 +170,23 @@ def _wire_auth_pipeline(session_budgets: bool, teams: bool = False) -> None:
     set_auth_pipeline(AuthPipeline(links))
 
 
+def _wire_vault(enabled: bool = True) -> dict:
+    """Content Vault (v2.4, Enterprise add-on): full-traffic capture to
+    an encrypted, tamper-evident local vault, wired through the core's
+    traffic seam. ``enabled`` is the ``vault`` license claim; the vault
+    ALSO requires vault.enabled in the config (default off — licensed
+    binaries capture nothing until the operator turns it on and
+    supplies the key wrap set). vault.enabled without the claim fails
+    the CORE boot gate (traffic.assert_configured)."""
+    import logging
+    if not enabled:
+        logging.getLogger("gateway.enterprise").info(
+            "vault NOT licensed — capture seam stays no-op")
+        return {"installed": False, "reason": "not licensed"}
+    from gateway_enterprise.vault import wire as vault_wire
+    return vault_wire(enabled=True)
+
+
 def main() -> None:
     # ── enterprise seam wiring (before serving) ────────────────────
     # The core's main() configures logging, but the wiring below logs
@@ -197,6 +214,7 @@ def main() -> None:
     _wire_scim(enabled=licensing.allows("scim"))
     _wire_mcp(enabled=licensing.allows("mcp"))
     _wire_teams(enabled=licensing.allows("teams"))
+    _wire_vault(enabled=licensing.allows("vault"))
 
     # v1.4: session budgets — the ENTERPRISE link (inert without the
     # session_budgets section; the core carries the charge hook). The
