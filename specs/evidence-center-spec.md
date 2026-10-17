@@ -1,23 +1,34 @@
 # Evidence Center — spec (M1, v2.5.0)
 
-Status: DRAFT for owner Go · 2026-10-17
-Owner decision: Evidence Center first (sequencing review, 2026-10-17)
+Status: APPROVED (owner Go, 2026-10-17) · decisions locked below
 
 ## What this is
 
 An auditor-ready evidence capability in two layers:
 
-1. **M2 (standard repo, both editions): chain the request ledger.** The
+1. **M2 (standard repo, Enterprise-gated): chain the request ledger.** The
    per-request metadata log (gateway-log-YYYY-MM.jsonl) becomes
    tamper-evident with the same proven pattern as config-audit.jsonl
-   (prev/hash, sha256 canonical JSON, restart-continuing). This closes a
-   claims gap: the site, exec-brief modal, and deck already say "hash-
-   linked request ledger"; today only config-audit is chained.
+   (prev/hash, sha256 canonical JSON, restart-continuing) — **gated live
+   by the `evidence` license claim**. This closes a claims gap: the
+   site, exec-brief modal, and deck already say "hash-linked request
+   ledger"; today only config-audit is chained.
 2. **M3 (fork, Enterprise): the Evidence Package.** One command assembles
    a self-describing zip: ledger extracts + chain proofs, config-audit
    chain, license state, AI asset inventory, governance posture report,
    and a control mapping (SOC 2 TSC / ISO 27001 Annex A / NIST AI RMF /
    EU AI Act) — everything an auditor asks for, in one artifact.
+
+**Owner decisions (2026-10-17):**
+- Go on the spec; license claim name **`evidence`**.
+- **Chaining is Enterprise-only. Community keeps today's plain request
+  logs** (console history and cost tiles unchanged); tamper-evidence +
+  evidence packages are the paid layer. Minimal messaging change: the
+  site's "hash-linked ledger" claims stay — they now describe the
+  Enterprise ledger, and the editions/compare rows make that explicit.
+- allows() is licensed-only (trial grants nothing): community trial and
+  the $99 key write PLAIN records; only an Enterprise license carrying
+  `evidence` chains.
 
 Non-goals (claims discipline — hard lines):
 - We produce evidence FOR the customer's audit. We do not certify,
@@ -38,40 +49,51 @@ Non-goals (claims discipline — hard lines):
 | license + CRL | signed | RS256 JWT, revocation list versioned + signed |
 | spend ledger | in-memory + rollups | per-key/team/provider budgets |
 
-## M2 — request-ledger chaining (gatelodge_standard)
+## M2 — request-ledger chaining (gatelodge_standard, Enterprise-gated)
 
-Record format: every request line gains `prev` (previous chained
-record's hash; "genesis" for the first) and `hash` (sha256 over the
-record with hash excluded, canonical sorted-keys JSON — identical rule
-to config-audit so one mental model covers both chains).
+Record format: when the ACTIVE license carries `evidence`, every
+request line gains `prev` (previous chained record's hash; "genesis"
+for the first) and `hash` (sha256 over the record with hash excluded,
+canonical sorted-keys JSON — identical rule to config-audit so one
+mental model covers both chains). Without the claim the line is written
+EXACTLY as today (plain) — the gate reads licensing state live per
+request, so a license swap mid-month yields mixed records in one file.
 
 - **Chain head:** in-process global under _log_lock; on cold start (or
   month rotation into an empty file) resolved by tail-reading the newest
   non-empty month file, walking back through months if needed; genesis
   only when no history exists. The chain therefore continues across
   restarts AND across month files — "any edit anywhere breaks the chain"
-  is literally true.
-- **Rotation:** month files rotate as today; the first record of a new
-  month carries the last hash of the previous month. Rollup files stay
-  derived (excluded from the chain; posture reports them as aggregates).
-- **Legacy records** (pre-v2.5 lines without `hash`): counted, not
-  verified; the chain restarts at genesis after them — the exact rule
-  config-audit's verifier already uses.
+  is literally true for every chained record.
+- **Interleaved plain records** (community→enterprise swaps, pre-v2.5
+  history): the verifier skips them TRANSPARENTLY — counted as `plain`,
+  not verified, `prev` PRESERVED (unlike config-audit's legacy rule,
+  which restarts at genesis — that rule assumes legacy only ever
+  prefixes, which is false for a live-gated request ledger).
+  Tamper-analysis still holds: editing a chained record into a plain
+  one (downgrade attack) is detected — the next chained record's prev
+  references the removed record's hash, which the walk can no longer
+  reach → break reported.
+- **Rotation:** month files rotate as today; the first chained record
+  of a new month carries the last chained hash of the previous month.
+  Rollup files stay derived (excluded; posture reports them as
+  aggregates).
 - **Hot path:** one dict copy + one sha256 per request inside the
   existing _log_lock critical section — the same cost class as
-  config-audit appends. No new I/O.
+  config-audit appends. No new I/O. Plain path unchanged (zero cost).
 - **Verifier:** verify_request_chain() walks archive (if present) then
   month files in chronological order; returns {files, lines, chained,
-  legacy, breaks, valid}. Exposed at GET /admin/ledger (verify result +
+  plain, breaks, valid}. Exposed at GET /admin/ledger (verify result +
   per-file counts) and folded into the console's audit panel next to
   the config-audit chain.
-- **Tests:** chain continuation across restart (new writer over same
-  file), across month rotation, tamper detection (edit a line → break),
-  legacy records counted-not-verified, open-mode and keyed records,
+- **FEATURE_CODES:** 'evidence' joins the claim list (enterprise
+  licenses default all-on; community licenses carry no feature claims).
+- **Tests:** chaining on evidence license; plain without (community +
+  trial); chain continuation across restart (new writer over same
+  file); across month rotation; interleaved plain/chained (license
+  swap) verifies clean; tamper (edit a chained line → break); downgrade
+  (strip hash → break at next chained record); verifier counts;
   perf smoke (10k appends < 1s).
-
-Community ships this too — the audit chain is core governance, and the
-free binary stays "the full governance stack."
 
 ## M3 — the Evidence Package (gateway_enterprise/evidence/)
 
@@ -186,11 +208,10 @@ Static table, "supports" language only:
 - E2E: enterprise binary on a verify port → drive traffic → assemble
   package → CLI re-verify → tamper a byte → re-verify FAILS.
 
-## Decision points for the owner
+## Decisions (resolved 2026-10-17)
 
-1. Go / no-go on this spec (M2+M3+M4 as v2.5.0).
-2. License claim name `evidence` (my recommendation) vs folding into
-   an existing claim.
-3. Community keeps chained ledgers (M2 ships to both editions) —
-   confirm; my recommendation stands (the free tier is "full
-   governance", packaging is the paid part).
+1. **Go** — spec approved as amended.
+2. License claim name: **`evidence`**.
+3. Community keeps plain request logs; chaining + packages are the
+   Enterprise `evidence` layer. Trial grants nothing (licensed-only
+   posture, same as `vault`).
