@@ -324,13 +324,15 @@ def admin_scope_app():
     """The app as served on the ADMIN port: ONLY the control plane —
     /admin/*, /teams, /scim, the console shell and /healthz — the data
     plane (/v1, /mcp) is not hosted here."""
+    from .auth import path_scope
+
     async def _shim(scope, receive, send):
         if scope["type"] == "http":
             path = scope.get("path") or ""
-            allowed = (path == "/healthz" or path == "/"
-                       or path.startswith("/admin")
-                       or path.startswith("/teams")
-                       or path.startswith("/scim"))
+            allowed = (path in ("/healthz", "/")
+                       or path_scope("/admin", path)
+                       or path_scope("/teams", path)
+                       or path_scope("/scim", path))
             if not allowed:
                 await _asgi_404(scope, receive, send)
                 return
@@ -867,7 +869,8 @@ async def _bearer_auth(request: Request, call_next):
     # extra-router seam: mounted enterprise surfaces (SCIM, …) own
     # their authentication — the core pipeline does not gate their
     # registered prefix (their bearers are not gateway credentials).
-    elif any(request.url.path.startswith(_p)
+    # Segment-aware (GL-R18): '/scim' never swallows '/scim-thing'.
+    elif any(auth.path_scope(_p, request.url.path)
              for _p in _EXTRA_ROUTER_PREFIXES):
         resp = await call_next(request)
     else:
@@ -6663,6 +6666,8 @@ class CustomDeployPayload(BaseModel):
     mmproj_name: str = ""
     mmproj_url: str = ""
     mmproj_size_gb: float = 0
+    sha256: str = ""               # GL-R25: verified at boot when set
+    mmproj_sha256: str = ""
     gpu_id: str = ""
     gpu_count: int = 1
     cloud: str = "secure"
@@ -6794,7 +6799,8 @@ async def admin_models_deploy_custom(
             cloud=payload.cloud, data_center_id=payload.data_center_id,
             volume_id=volume_id, ctx_key=ctx_key,
             container_disk_gb=disk, idle_stop_s=payload.idle_stop_s,
-            alias=alias)
+            alias=alias,
+            sha256=payload.sha256, mmproj_sha256=payload.mmproj_sha256)
         deploy_payload = runpod.deploy_payload(backend, alias, spec)
         try:
             pod = await runpod.deploy_pod(deploy_payload, api_key_env)

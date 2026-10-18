@@ -241,13 +241,23 @@ def _resolve_bearer(cfg, token: str) -> str:
     return ""
 
 
+def path_scope(scope: str, path: str) -> bool:
+    """Segment-aware scope match (GL-R18, v2.6): '/admin' matches
+    '/admin' and '/admin/…' but NEVER '/administrator'. ONE matcher
+    for the admin gate, RBAC patterns, listener scoping and the
+    extension-router pipeline skip — no loose startswith anywhere."""
+    if scope == "/":
+        return path == "/"
+    return path == scope or path.startswith(scope + "/")
+
+
 def admin_gate_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     """Link 2: /admin/* requires an admin key (gateway_keys). Virtual
     keys are CONSUMER keys — 403 on the admin surface. Open mode (no
     keys configured) keeps /admin open."""
     if key_id == "admin":
         return None
-    if not request.url.path.startswith("/admin"):
+    if not path_scope("/admin", request.url.path):
         return None
     if not key_id:
         return None  # open mode — /admin stays open
@@ -514,7 +524,7 @@ def rbac_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
     Runs BEFORE admin_gate_link, so an allowed admin request still
     passes the core gate (key_id == "admin")."""
     path = request.url.path
-    if not path.startswith("/admin"):
+    if not path_scope("/admin", path):
         return None
     if key_id != "admin":
         return None

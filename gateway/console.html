@@ -2294,9 +2294,13 @@ function fmBuildPayload() {
     file_name: p.file.name,
     file_url: p.file.url,
     size_gb: p.file.size_gb,
+    // GL-R25: when the source published a digest (HF LFS, Ollama
+    // blobs), the pod boot VERIFIES the downloaded artifact
+    sha256: p.file.sha256 || '',
     mmproj_name: p.mmproj ? p.mmproj.name : '',
     mmproj_url: p.mmproj ? p.mmproj.url : '',
     mmproj_size_gb: p.mmproj ? p.mmproj.size_gb : 0,
+    mmproj_sha256: p.mmproj ? (p.mmproj.sha256 || '') : '',
     gpu_id: st.gpuId,
     gpu_count: st.gpuCount,
     cloud: st.cloud,
@@ -2913,7 +2917,8 @@ function fmFinalize() {
                  file: {name: name, quant: '',
                         size_gb: Number(d.size_gb) ||
                           Math.round(up.sizeBytes / 1e9 * 100) / 100,
-                        url: d.file_url},
+                        url: d.file_url,
+                        sha256: d.sha256 || ''},
                  mmproj: null};
       _fmUp.done = true;
       fmUpSetProgress('<div class="muted">✓ uploaded — configure the deploy below · ' +

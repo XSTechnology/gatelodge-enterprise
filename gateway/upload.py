@@ -35,7 +35,7 @@ from typing import Any
 import httpx
 
 from . import catalog, runpod
-from .config import get_gateway_config
+from .config import atomic_write_json, get_gateway_config
 
 logger = logging.getLogger("gateway.upload")
 
@@ -296,8 +296,7 @@ def _persist_receiver_spec(cfg, backend: str, model_key: str,
             models = (raw.setdefault("backends", {})
                       .setdefault(backend, {}).setdefault("models", {}))
             models[model_key] = spec
-            cfg.path.write_text(json.dumps(raw, indent=2) + "\n",
-                                encoding="utf-8")
+            atomic_write_json(cfg.path, raw)
             cfg.reload_now()
     except Exception:  # noqa: BLE001 — upload init must still return
         logger.warning("helper spec persist failed", exc_info=True)
@@ -450,8 +449,8 @@ async def _terminate_helper(cfg, backend: str, model_key: str) -> dict[str, Any]
             raw = json.loads(cfg.path.read_text(encoding="utf-8"))
             (raw.get("backends", {}).get(backend, {})
              .get("models", {})).pop(model_key, None)
-            cfg.path.write_text(json.dumps(raw, indent=2) + "\n",
-                                encoding="utf-8")
+            from .config import atomic_write_json
+            atomic_write_json(cfg.path, raw)
             cfg.reload_now()
     except Exception:  # noqa: BLE001
         logger.warning("helper config cleanup failed", exc_info=True)

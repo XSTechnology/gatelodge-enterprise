@@ -184,6 +184,7 @@ async def test_budget_stop_grace_and_edge_trigger(monkeypatch):
 
 async def test_budget_allows(monkeypatch):
     lc.reset()
+    lc._BUDGET_STATE["at"] = time.monotonic()   # fresh fetch clock
 
     async def _snap(c):
         return {"total_usd": 7.5, "per_model": {"rp|big": 7.5}}
@@ -204,9 +205,51 @@ async def test_budget_allows(monkeypatch):
     cfg.budget_usd_month = 5.0
     ok, why = await lc.budget_allows(cfg, "rp", "cheap")
     assert not ok and "account cap" in why
-    # billing unavailable → fail-open (a hiccup must not brick requests)
+    # billing unavailable (FRESH clock) → fail-open (a hiccup must not
+    # brick requests) — the GL-R13 grace window
     monkeypatch.setattr(lc, "month_to_date", _none)
     ok, _ = await lc.budget_allows(cfg, "rp", "big")
+    assert ok
+
+
+async def test_budget_allows_billing_outage_policy(monkeypatch):
+    """GL-R13 (v2.6): a hard budget + a STALE spend signal denies NEW
+    pod starts — the cap stays enforceable when billing is lost. A
+    fresh outage (within billing_stale_after_s, default 900s) stays
+    fail-open; budget.billing_stale_after_s=0 turns the policy off."""
+    lc.reset()
+
+    async def _snap(c):
+        return {"total_usd": 1.0, "per_model": {}}
+
+    monkeypatch.setattr(lc, "month_to_date", _snap)
+
+    class _Store:
+        def load(self):
+            return {"budget": {"billing_stale_after_s": 900}}
+
+    cfg = types.SimpleNamespace(
+        budget_usd_month=10.0, store=_Store(),
+        backends={"rp": {"type": "runpod", "models": {
+            "cheap": {"monthly_budget_usd": 0}}}})
+
+    # fresh clock → allowed
+    lc._BUDGET_STATE["at"] = time.monotonic()
+    ok, _ = await lc.budget_allows(cfg, "rp", "cheap")
+    assert ok
+
+    # clock 20 min stale → NEW starts denied with the policy message
+    lc._BUDGET_STATE["at"] = time.monotonic() - 1200
+    ok, why = await lc.budget_allows(cfg, "rp", "cheap")
+    assert not ok and "stale" in why
+
+    # policy off (billing_stale_after_s=0) → fail-open even when stale
+    class _StoreOff:
+        def load(self):
+            return {"budget": {"billing_stale_after_s": 0}}
+
+    cfg.store = _StoreOff()
+    ok, _ = await lc.budget_allows(cfg, "rp", "cheap")
     assert ok
 
 

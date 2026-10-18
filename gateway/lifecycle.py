@@ -259,16 +259,42 @@ async def month_to_date(cfg) -> dict[str, Any] | None:
 
 async def budget_allows(cfg, backend: str,
                         model: str) -> tuple[bool, str]:
-    """D4 refuse-start gate. True when starting this pod is allowed;
-    fail-open when billing is unavailable (a billing hiccup must not
-    brick every request — it's alerted separately)."""
+    """D4 refuse-start gate. True when starting this pod is allowed.
+
+    v2.6 (GL-R13): billing-outage policy for HARD budgets. Default
+    fail-open stays (a billing hiccup must not brick every request —
+    it's alerted separately). With budget.billing_stale_after_s > 0
+    (default 900), a hard cap + a billing snapshot older than the
+    threshold DENIES NEW pod starts — the operator's cap stays
+    enforceable when the spend signal is lost. Existing pods continue
+    (stopping them doesn't recover the check either); accrual from
+    running pods still counts in the cached snapshot."""
     cap_global = float(getattr(cfg, "budget_usd_month", 0) or 0)
     backends = getattr(cfg, "backends", None) or {}
     spec = ((backends.get(backend) or {}).get("models") or {}).get(model) or {}
     cap_model = float(spec.get("monthly_budget_usd") or 0)
     if cap_global <= 0 and cap_model <= 0:
         return True, ""
-    snap = await month_to_date(cfg)
+    # billing-outage policy knob (GL-R13): default 900s; 0 = off
+    try:
+        _raw = cfg.store.load() if getattr(cfg, "store", None) else {}
+        budget_cfg = (_raw.get("budget") if isinstance(_raw, dict)
+                      else {}) or {}
+        _raw_s = budget_cfg.get("billing_stale_after_s")
+        stale_after = (900.0 if _raw_s is None
+                       else max(0.0, float(_raw_s)))
+    except Exception:                        # noqa: BLE001
+        stale_after = 900.0
+    snap = await month_to_date(cfg)   # attempts refresh; updates the
+    # fetch clock on success — _BUDGET_STATE["at"] measures time since
+    # the last SUCCESSFUL billing fetch
+    if stale_after > 0:
+        age = time.monotonic() - _BUDGET_STATE["at"]
+        if age > stale_after:
+            return False, (f"billing data is {age / 60:.0f} min stale "
+                           f"(> {stale_after / 60:g} min) — new pod "
+                           "starts are denied until the spend signal "
+                           "recovers (budget.billing_stale_after_s)")
     if snap is None:
         return True, ""
     if cap_global > 0 and snap["total_usd"] >= cap_global:
@@ -299,8 +325,8 @@ def _clear_pod_id(m) -> None:
                     .get("models", {}).get(m.model_key))
             if isinstance(spec, dict) and spec.get("pod_id"):
                 spec.pop("pod_id", None)
-                cfg.path.write_text(json.dumps(raw, indent=2) + "\n",
-                                    encoding="utf-8")
+                from .config import atomic_write_json
+                atomic_write_json(cfg.path, raw)
                 cfg.reload_now()
                 logger.info("lifecycle cleared pod_id for %s/%s",
                             m.backend_name, m.model_key)

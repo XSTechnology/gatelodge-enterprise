@@ -88,8 +88,15 @@ def _hf_files_sync(repo_id: str) -> tuple[list, list]:
         n = s.rfilename
         if not n.lower().endswith(".gguf"):
             continue
+        # GL-R25: LFS files carry their sha256 in the metadata — the
+        # deploy boot verifies the downloaded artifact against it
+        _sha = ""
+        lfs = getattr(s, "lfs", None)
+        if lfs is not None and getattr(lfs, "sha256", None):
+            _sha = str(lfs.sha256)
         entry = {"name": n, "size_bytes": int(s.size or 0),
-                 "url": f"https://huggingface.co/{repo_id}/resolve/main/{n}"}
+                 "url": f"https://huggingface.co/{repo_id}/resolve/main/{n}",
+                 "sha256": _sha}
         if capabilities.is_mmproj(n):
             mmproj.append(entry)
         elif capabilities.is_pickable(n):
@@ -203,10 +210,15 @@ async def _ollama_file(c: httpx.AsyncClient, model: str,
         return None
     quant = capabilities.parse_quant(tag) or (
         tag.upper() if tag else None)
+    # GL-R25: the blob digest IS the sha256 — verify at boot
+    _digest = str(layer["digest"])
+    _sha = _digest.removeprefix("sha256:") if _digest.startswith(
+        "sha256:") and len(_digest) > 7 else ""
     return {
         "name": f"{model}:{tag}",
         "size_bytes": int(layer.get("size") or 0),
         "url": f"{_OL}/{model}/blobs/{layer['digest']}",
+        "sha256": _sha,
         "quant": quant,
     }
 
