@@ -177,23 +177,36 @@ def test_safe_filename():
 
 
 def test_bootstrap_script():
-    s = up.bootstrap_script("https://x/m.gguf", "m.gguf")
+    """v2.5.1 (GL-R03): the URL/filename travel via POD ENV — the sh
+    text is FIXED (nothing dynamic interpolated), so a hostile catalog
+    entry cannot break out of quoting."""
+    s = up.bootstrap_script()
     assert "python3 /root/receiver.py > /root/receiver.log 2>&1 &" in s
-    assert 'curl -fsSL --retry 3 --max-time 5400 ' \
-           '-o "/workspace/uploads/m.gguf" \'https://x/m.gguf\'' in s
+    assert '$FILE_URL' in s and '$FILENAME' in s
+    assert "'https://" not in s          # no interpolated URL
+    assert "m.gguf" not in s             # no interpolated filename
+    assert "sha256sum" in s              # the content sidecar (GL-R02)
     assert "sleep infinity" in s
     inner = s.split("printf '%s' '", 1)[1].rsplit(
         "' > /root/receiver.py", 1)[0]
     compile(inner, "receiver.py", "exec")     # valid embedded python
+    # the embedded receiver requires the session token
+    assert "GW_UPLOAD_TOKEN" in inner
+    assert "/list" not in inner            # enumeration endpoint GONE
 
 
-def test_bootstrap_spec_mounts_volume():
+def test_bootstrap_spec_env_and_volume():
     spec = up.bootstrap_spec("g", "https://x/m.gguf", "m.gguf", "vol-1",
-                             "EUR-IS-1")
+                             "EUR-IS-1", token="sess-tok")
     assert spec["volume_id"] == "vol-1"
     assert spec["data_center_ids"] == ["EUR-IS-1"]   # volume DC-pinned
     assert spec["alias"] == up.BOOTSTRAP_MODEL
     assert spec["ports"] == "8081/http"
+    # the dynamic values ride the ENV, not the script
+    assert spec["env"]["FILE_URL"] == "https://x/m.gguf"
+    assert spec["env"]["FILENAME"] == "m.gguf"
+    assert spec["env"]["GW_UPLOAD_TOKEN"] == "sess-tok"
+    assert "https://x/m.gguf" not in spec["docker_script"]
 
 
 async def test_bootstrap_download_retries_gpu_tiers(monkeypatch, tmp_path):
@@ -223,8 +236,9 @@ async def test_bootstrap_download_retries_gpu_tiers(monkeypatch, tmp_path):
             raise rp.RunPodError("no instances in DC")
         return {"id": "pod-bs"}
 
-    async def fake_list(pod_id):
-        return [{"name": "m.gguf", "size": 10}]
+    async def fake_status(pod_id, filename, token=""):
+        # the v2.5.1 done-signal: size + sha256 sidecar (GL-R02)
+        return {"name": filename, "size": 10, "sha256": "ab" * 32}
 
     async def fake_term(cfg, backend, key):
         return {"ok": True}
@@ -232,11 +246,12 @@ async def test_bootstrap_download_retries_gpu_tiers(monkeypatch, tmp_path):
     monkeypatch.setattr(rp, "list_volumes", fake_vols)
     monkeypatch.setattr(gw_app.catalog, "live_options", fake_live)
     monkeypatch.setattr(rp, "deploy_pod", fake_deploy)
-    monkeypatch.setattr(up, "receiver_list", fake_list)
+    monkeypatch.setattr(up, "receiver_status", fake_status)
     monkeypatch.setattr(up, "_terminate_helper", fake_term)
     out = await up.bootstrap_download(cfg, "rp", "https://x/m.gguf",
                                       "m.gguf", 10, "vol-1")
     assert out["volume_id"] == "vol-1"
+    assert out["sha256"] == "ab" * 32
     assert len(deploys) == 2                       # cheap failed, next OK
     # the successful deploy is DC-pinned to the volume's DC
     assert deploys[1].get("dataCenterIds") == ["EUR-IS-1"] or \

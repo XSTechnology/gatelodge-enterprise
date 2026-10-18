@@ -2794,7 +2794,8 @@ function fmUploadStart() {
   api('/admin/models/upload-init', {method: 'POST',
       body: {filename: f.name, size_bytes: f.size, volume_id: _fmUpVolumeId}})
     .then(function (d) {
-      _fmUp = {podId: d.pod_id, reused: !!d.reused, filename: d.filename || f.name,
+      _fmUp = {podId: d.pod_id, token: d.upload_token || '',
+               reused: !!d.reused, filename: d.filename || f.name,
                sizeBytes: f.size, file: f, xhr: null, timer: null, got: -1, done: false,
                volumeId: _fmUpVolumeId || ''};
       _fmCleaned = false;
@@ -2825,6 +2826,7 @@ function fmUpRelay() {
   xhr.setRequestHeader('x-pod-id', up.podId);
   xhr.setRequestHeader('x-filename', up.filename);
   xhr.setRequestHeader('x-file-size', String(up.sizeBytes));
+  xhr.setRequestHeader('x-upload-token', up.token);
   xhr.onload = function () {
     if (up.done) return;
     up.done = true;
@@ -2859,7 +2861,8 @@ function fmUpPollTick() {
   var up = _fmUp;
   if (!up || up.done) { fmUpPollStop(); return; }
   api('/admin/models/upload-status?pod_id=' + encodeURIComponent(up.podId) +
-      '&filename=' + encodeURIComponent(up.filename))
+      '&filename=' + encodeURIComponent(up.filename) +
+      '&token=' + encodeURIComponent(up.token || ''))
     .then(function (d) {
       if (!_fmUp || _fmUp.done) return;
       fmUpTick(Number(d.size));
@@ -2901,7 +2904,8 @@ function fmFinalize() {
   var up = _fmUp;
   fmUpSetProgress('<div class="muted">finalizing…</div>');
   api('/admin/models/upload-finalize', {method: 'POST',
-      body: {pod_id: up.podId, filename: up.filename, size_bytes: up.sizeBytes}})
+      body: {pod_id: up.podId, filename: up.filename,
+             size_bytes: up.sizeBytes, token: up.token || ''}})
     .then(function (d) {
       var name = d.filename || up.filename;
       _fmPick = {source: 'upload', repoId: '', upload: true, podId: up.podId,

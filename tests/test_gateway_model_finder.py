@@ -555,15 +555,21 @@ def test_receiver_script_valid():
     for needle in ("/health", "/status/", "/file/", "ThreadingHTTPServer",
                    "os.replace", "Content-Length required"):
         assert needle in inner
+    # v2.5.1 (GL-R02): session-token auth, no /list, sha256 sidecar
+    assert "GW_UPLOAD_TOKEN" in inner
+    assert "_authed" in inner and "403" in inner
+    assert "/list" not in inner
 
 
 def test_receiver_spec():
     spec = up.receiver_spec("NVIDIA RTX 4090", 10 * 1024 ** 3,
-                            volume_id="vol-1")
+                            volume_id="vol-1", token="sess-tok")
     assert spec["ports"] == "8081/http" and spec["port"] == 8081
     assert spec["idle_stop_s"] == 1800
     assert spec["volume_id"] == "vol-1"
     assert spec["container_disk_gb"] == 22        # 10GB*1.2 + 10
+    assert spec["upload_token"] == "sess-tok"     # persisted for reuse
+    assert spec["env"]["GW_UPLOAD_TOKEN"] == "sess-tok"
     spec2 = up.receiver_spec("g", 0)
     assert "volume_id" not in spec2
     assert spec2["container_disk_gb"] == 20       # floor
@@ -574,7 +580,7 @@ async def test_init_receiver_reuse(wired, monkeypatch):
     cfg = gw_config.get_gateway_config()
     cfgdata = json.loads(cfgfile.read_text(encoding="utf-8"))
     cfgdata["backends"]["rp"]["models"][up.RECEIVER_MODEL] = {
-        "image": "x", "pod_id": "pod-live1"}
+        "image": "x", "pod_id": "pod-live1", "upload_token": "tok-live"}
     cfgfile.write_text(json.dumps(cfgdata), encoding="utf-8")
     cfg.reload_now()
 
@@ -587,7 +593,8 @@ async def test_init_receiver_reuse(wired, monkeypatch):
     monkeypatch.setattr(up, "probe_receiver", healthy)
     monkeypatch.setattr(gw_app.runpod, "deploy_pod", boom)
     info = await up.init_receiver(cfg, "rp", 1024)
-    assert info == {"pod_id": "pod-live1", "reused": True}
+    assert info == {"pod_id": "pod-live1", "upload_token": "tok-live",
+                    "reused": True}
 
 
 async def test_init_receiver_deploy(wired, monkeypatch):
@@ -608,12 +615,19 @@ async def test_init_receiver_deploy(wired, monkeypatch):
     monkeypatch.setattr(gw_app.runpod, "deploy_pod", fake_deploy)
     info = await up.init_receiver(cfg, "rp", 5 * 1024 ** 3,
                                   volume_id="vol-1")
-    assert info == {"pod_id": "pod-rx", "reused": False}
+    assert info["pod_id"] == "pod-rx"
+    assert info["reused"] is False
+    assert len(info["upload_token"]) == 48        # per-session token
     assert "gw-rp-upload-receiver" in str(deploys[0])
-    # persisted as a config model → watchdog owns its lifecycle
+    # the token reaches the pod via env (never the script text)
+    assert deploys[0].get("env", {}).get("GW_UPLOAD_TOKEN") == \
+        info["upload_token"]
+    # persisted as a config model → watchdog owns its lifecycle (and
+    # the token persists with it, so reuse keeps the session)
     raw = json.loads(cfgfile.read_text(encoding="utf-8"))
     spec = raw["backends"]["rp"]["models"][up.RECEIVER_MODEL]
     assert spec["pod_id"] == "pod-rx"
+    assert spec["upload_token"] == info["upload_token"]
     assert spec["volume_id"] == "vol-1"
     assert spec["idle_stop_s"] == 1800
 
@@ -622,7 +636,8 @@ def test_upload_endpoints(wired, monkeypatch):
     wired()
 
     async def fake_init(cfg, backend, size, vol=""):
-        return {"pod_id": "pod-rx", "reused": False}
+        return {"pod_id": "pod-rx", "upload_token": "sess-tok",
+                "reused": False}
 
     monkeypatch.setattr(gw_app.upload, "init_receiver", fake_init)
     with TestClient(gw_app.app) as client:
@@ -631,6 +646,7 @@ def test_upload_endpoints(wired, monkeypatch):
             "filename": "../evil/../mymodel.gguf", "size_bytes": 1234})
         assert r.status_code == 200
         assert r.json()["filename"] == "mymodel.gguf"
+        assert r.json()["upload_token"] == "sess-tok"
         r = client.post("/admin/models/upload-init", json={
             "filename": "x.gguf", "size_bytes": 21 * 1024 ** 3})
         assert r.status_code == 413
@@ -666,32 +682,64 @@ def test_upload_endpoints(wired, monkeypatch):
         r = client.put("/admin/models/upload", content=b"MODELDATA",
                        headers={"x-pod-id": "pod-rx",
                                 "x-filename": "mymodel.gguf",
-                                "x-file-size": "8"})
+                                "x-file-size": "8",
+                                "x-upload-token": "sess-tok"})
         assert r.status_code == 200, r.text
         assert captured["url"] == up.receiver_url("pod-rx", "mymodel.gguf")
         assert captured["headers"]["Content-Length"] == "8"
+        # the session token authorizes the relay to the receiver
+        assert captured["headers"]["Authorization"] == "Bearer sess-tok"
         assert captured["body"] == b"MODELDATA"
+        # the relay hashed the stream (returned + remembered)
+        import hashlib
+        relay_sha = hashlib.sha256(b"MODELDATA").hexdigest()
+        assert r.json()["sha256"] == relay_sha
+        assert up.relay_hash("pod-rx", "mymodel.gguf") == relay_sha
+        # missing token → 400 (GL-R02)
+        r = client.put("/admin/models/upload", content=b"x",
+                       headers={"x-pod-id": "p", "x-filename": "f",
+                                "x-file-size": "1"})
+        assert r.status_code == 400
         r = client.put("/admin/models/upload", content=b"x")
         assert r.status_code == 400
 
         # status / finalize (real finalize, patched receiver status)
-        async def fake_status(pid, fn):
-            return {"name": fn, "size": 8}
+        async def fake_status(pid, fn, token=""):
+            assert token == "sess-tok"            # token-authenticated
+            return {"name": fn, "size": 8, "sha256": ""}
 
         monkeypatch.setattr(gw_app.upload, "receiver_status", fake_status)
         r = client.get("/admin/models/upload-status",
-                       params={"pod_id": "pod-rx", "filename": "m.gguf"})
+                       params={"pod_id": "pod-rx", "filename": "m.gguf",
+                               "token": "sess-tok"})
         assert r.json()["size"] == 8
+        # status without token → 400
+        r = client.get("/admin/models/upload-status",
+                       params={"pod_id": "pod-rx", "filename": "m.gguf"})
+        assert r.status_code == 400
         r = client.post("/admin/models/upload-finalize", json={
-            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 8})
+            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 8,
+            "token": "sess-tok"})
         body = r.json()
-        assert body["file_url"] == up.receiver_url("pod-rx", "file/m.gguf")
+        # the file URL carries the token as ?t= — the URL is the
+        # capability the model pod curls (GL-R02)
+        assert body["file_url"] == up.receiver_url(
+            "pod-rx", "file/m.gguf") + "?t=sess-tok"
         assert body["source"] == "upload"
         assert body["size_gb"] == 0.0
+        assert body["sha256"] == up.relay_hash("pod-rx", "m.gguf")
         # size mismatch → 502
         r = client.post("/admin/models/upload-finalize", json={
-            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 99})
+            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 99,
+            "token": "sess-tok"})
         assert r.status_code == 502
+        # CONTENT mismatch (same-size replacement poisoning) → 502
+        up.remember_relay_hash("pod-rx", "m.gguf", relay_sha)
+        r = client.post("/admin/models/upload-finalize", json={
+            "pod_id": "pod-rx", "filename": "m.gguf", "size_bytes": 8,
+            "token": "sess-tok", "sha256": "f" * 64})
+        assert r.status_code == 502
+        assert "sha256 mismatch" in r.text
 
         # cleanup (patched)
         async def fake_clean(cfg, backend):

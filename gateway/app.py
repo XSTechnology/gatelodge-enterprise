@@ -111,7 +111,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -195,16 +195,31 @@ def set_extra_router(router, *, prefix: str) -> None:
     app.include_router(router, prefix=prefix)
 
 
-def add_extra_router(router, *, prefix: str) -> None:
+def add_extra_router(router, *, prefix: str, auth: str = "") -> None:
     """Mount an ADDITIONAL enterprise surface alongside whatever is
     already mounted (v2.0: SCIM at /scim and the MCP gateway at /mcp
-    coexist). Same auth-owns-prefix semantics as set_extra_router;
-    idempotent per prefix (a repeated mount is a no-op). set_extra_
-    router() remains the reset-and-mount primitive — calling it (or
-    its None cleanup) removes EVERYTHING mounted, added routers
-    included, because the truncation mark predates them all."""
+    coexist). Idempotent per prefix (a repeated mount is a no-op).
+    set_extra_router() remains the reset-and-mount primitive — calling
+    it (or its None cleanup) removes EVERYTHING mounted, added routers
+    included, because the truncation mark predates them all.
+
+    v2.5.1 (GL-R16): ``auth`` must be DECLARED —
+      auth="owned"  the router owns its own authentication (an IdP's
+                    SCIM bearer, MCP session auth) — the core pipeline
+                    does not gate the prefix
+      auth="admin"  the CORE enforces the /admin gate chain (resolve →
+                    RBAC → admin gate) on every route under the prefix
+                    — the router needs no guard of its own, so a guard
+                    can never be forgotten or drift from the core's
+    An undeclared auth raises at wiring time — a startup failure, not
+    a silent exposure."""
     global _EXTRA_ROUTER_MARK
     prefix = "/" + prefix.strip("/")
+    if auth not in ("owned", "admin"):
+        raise RuntimeError(
+            f"add_extra_router({prefix!r}): auth must be declared — "
+            "'owned' (router authenticates itself) or 'admin' (core "
+            "enforces the admin gate). Refusing to mount undeclared.")
     if prefix in _EXTRA_ROUTER_PREFIXES:
         return                      # already mounted — boot-time no-op
     if _EXTRA_ROUTER_MARK is None:
@@ -212,7 +227,54 @@ def add_extra_router(router, *, prefix: str) -> None:
         # so set_extra_router(None) still truncates everything.
         _EXTRA_ROUTER_MARK = len(app.router.routes)
     _EXTRA_ROUTER_PREFIXES.append(prefix)
-    app.include_router(router, prefix=prefix)
+    if auth == "admin":
+        app.include_router(router, prefix=prefix,
+                           dependencies=[Depends(_extension_admin_guard)])
+    else:
+        app.include_router(router, prefix=prefix)
+
+
+async def _extension_admin_guard(request: Request) -> None:
+    """Core-enforced admin gate for auth='admin' extension routers
+    (GL-R16): the SAME link chain the core /admin surface runs —
+    resolve → RBAC → admin gate — so behavior (open mode, role-scoped
+    keys, virtual-key 403s) is byte-identical and can never drift from
+    a router-owned copy."""
+    from .auth import (admin_gate_link, resolve_key_link, rbac_link)
+    from .config import get_gateway_config
+    cfg = get_gateway_config()
+
+    async def _run(link, key_id):
+        out = link(cfg, request, key_id)
+        if hasattr(out, "__await__"):
+            out = await out
+        return out
+
+    r = await _run(resolve_key_link, "")
+    if r is not None:
+        raise _PipelineBlocked(r)
+    key_id = _REQUEST_KEY_ID.get()
+    r = await _run(rbac_link, key_id)
+    if r is not None:
+        raise _PipelineBlocked(r)
+    r = await _run(admin_gate_link, key_id)
+    if r is not None:
+        raise _PipelineBlocked(r)
+
+
+class _PipelineBlocked(Exception):
+    """A pipeline link produced an error response — re-raised so the
+    extension router returns exactly the link's status + body."""
+
+    def __init__(self, response):
+        self.response = response
+        super().__init__("pipeline link blocked request")
+
+
+@app.exception_handler(_PipelineBlocked)
+async def _pipeline_blocked_handler(request: Request,
+                                     exc: _PipelineBlocked):
+    return exc.response
 
 
 # ── control-plane split (v2.1): port-scoped ASGI shims ─────────────────────
@@ -3359,7 +3421,10 @@ async def images_generations(request: Request) -> Response:
     except httpx.HTTPStatusError as e:
         return _exec_error_response(e, requested, False, t0)
     except httpx.RequestError as e:
-        return _error(502, f"images request failed: {e}", code="network")
+        # GL-R15: class only to the client; the URL-bearing detail goes
+        # to the operator log
+        logger.warning("images passthrough failure: %s", e)
+        return _error(502, "images request failed", code="network")
     _log_request(requested, backend_name, False,
                  int((time.perf_counter() - t0) * 1000), {}, 200)
     return JSONResponse(data)
@@ -3757,8 +3822,11 @@ async def _run_batch(batch_id: str, model: str,
             except Exception as e:  # noqa: BLE001 — one bad request
                 kind = (cloud.classify_error(e)
                         if not isinstance(e, GatewayConfigError) else "client")
+                # GL-R15: classification only in the batch result —
+                # exception strings can carry internal endpoints
                 return {"custom_id": cid, "status": "failed",
-                        "error": {"message": str(e)[:300], "code": kind}}
+                        "error": {"message": f"upstream {kind}",
+                                  "code": kind}}
 
     results = await asyncio.gather(*[_one(r, i)
                                      for i, r in enumerate(requests)])
@@ -4628,8 +4696,10 @@ async def anthropic_messages(request: Request) -> Response:
         logger.info("anthropic shim: model %r unknown, using %r", model, fallback)
         model = fallback
 
-    keys = getattr(cfg, "gateway_keys", None) or []
-    api_key = keys[0] if keys else "benchmark"
+    # v2.5.1: the shim self-calls /v1 with the per-process internal
+    # bearer (consumer-grade principal) — it no longer depends on
+    # gateway_keys, which are now hashed-at-rest (GL-R07).
+    api_key = _auth_internal_bearer()
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     if stream:
@@ -4803,14 +4873,18 @@ async def anthropic_messages(request: Request) -> Response:
     except Exception as e:  # noqa: BLE001 — surface upstream failure
         # classify (walks causes: the gateway's own 429/504 arrive as
         # openai APIStatusError) — the requestor gets the class, never a
-        # substituted model.
+        # substituted model. v2.5.1 (GL-R15): the CLASS only reaches the
+        # client — exception strings can carry internal endpoints; the
+        # detail goes to the operator log.
         kind = cloud.classify_error(e)
+        logger.warning("anthropic shim upstream failure (%s): %s",
+                       kind, e)
         if kind == "rate_limit":
-            return _anthropic_error(429, f"Upstream rate limited: {e}",
+            return _anthropic_error(429, "Upstream rate limited",
                                     "rate_limit_error")
         if kind == "timeout":
-            return _anthropic_error(504, f"Upstream timeout: {e}", "api_error")
-        return _anthropic_error(502, f"Upstream error: {e}", "api_error")
+            return _anthropic_error(504, "Upstream timeout", "api_error")
+        return _anthropic_error(502, "Upstream error", "api_error")
     finally:
         aw = _close_quietly(client)
         if aw is not None:
@@ -5245,43 +5319,68 @@ async def _verify_scheduler_loop() -> None:
 @app.on_event("startup")
 async def _start_verify_scheduler() -> None:
     global _VERIFY_SCHED_TASK
-    # tier B hardening at boot: hash-migrate any plaintext api_keys in
-    # the config FILE (the in-memory normalizer already hashes), then
-    # enforce log retention.
+    # tier B hardening at boot: hash-migrate any plaintext api_keys AND
+    # gateway_keys in the config FILE (the in-memory normalizer already
+    # hashes api_keys; _resolve_bearer hashes gateway_keys at compare),
+    # then enforce log retention.
     _migrate_plaintext_keys()
     _enforce_log_retention()
     if _VERIFY_SCHED_TASK is None or _VERIFY_SCHED_TASK.done():
         _VERIFY_SCHED_TASK = asyncio.create_task(_verify_scheduler_loop())
 
 
+def _auth_internal_bearer() -> str:
+    """The per-process internal self-call bearer (anthropic shim →
+    /v1). Consumer-grade principal; never admin."""
+    from .auth import _INTERNAL_BEARER
+    return _INTERNAL_BEARER
+
+
 def _migrate_plaintext_keys() -> None:
-    """One-time rewrite: api_keys entries carrying a plaintext `key` in
-    the stored config are replaced by their sha256 `key_hash` (the
-    plaintext is removed from the store). Idempotent — no entries with
-    plaintext → no write. Auth is unaffected: presented tokens are
-    hashed and compared either way."""
+    """One-time rewrite to hashed-at-rest (GL-R07, v2.5.1):
+    - api_keys entries carrying a plaintext `key` → sha256 `key_hash`
+    - gateway_keys strings that are not already sha256 hex → hashes
+    The plaintext leaves the stored config; auth is unaffected
+    (presented tokens are hashed and compared). Idempotent."""
     try:
         cfg = get_gateway_config()
         raw = cfg.store.load()
-        entries = raw.get("api_keys") if isinstance(raw, dict) else None
-        if not isinstance(entries, list):
+        if not isinstance(raw, dict):
             return
         changed = 0
-        for e in entries:
-            if isinstance(e, dict) and str(e.get("key") or "").strip():
-                e["key_hash"] = _sha256_hex(str(e["key"]).strip())
-                e.pop("key", None)
-                changed += 1
+        entries = raw.get("api_keys")
+        if isinstance(entries, list):
+            for e in entries:
+                if isinstance(e, dict) and str(e.get("key") or "").strip():
+                    e["key_hash"] = _sha256_hex(str(e["key"]).strip())
+                    e.pop("key", None)
+                    changed += 1
+        gw = raw.get("gateway_keys")
+        if isinstance(gw, list):
+            from .auth import _is_hex64
+            new_gw = []
+            for k in gw:
+                k = str(k)
+                if k and not _is_hex64(k):
+                    new_gw.append(_sha256_hex(k))
+                    changed += 1
+                else:
+                    new_gw.append(k)
+            if changed:
+                raw["gateway_keys"] = new_gw
         if not changed:
             return
 
         def _mut(r: dict) -> None:
-            r["api_keys"] = entries
+            if isinstance(entries, list):
+                r["api_keys"] = entries
+            if isinstance(gw, list):
+                r["gateway_keys"] = raw["gateway_keys"]
 
-        _mutate_config(_mut, f"api-key-hash-migration ({changed} keys)")
-        logger.info("migrated %d api_keys to hashed-at-rest", changed)
+        _mutate_config(_mut, f"key-hash-migration ({changed} keys)")
+        logger.info("migrated %d key(s) to hashed-at-rest", changed)
     except Exception:  # noqa: BLE001 — boot hardening must not block
-        logger.warning("api-key hash migration failed", exc_info=True)
+        logger.warning("key hash migration failed", exc_info=True)
 
 
 def _enforce_log_retention() -> None:
@@ -6775,7 +6874,11 @@ async def admin_upload_init(payload: UploadInitPayload) -> Response:
 async def admin_models_upload(request: Request) -> Response:
     """Gateway relay: stream the browser upload to the receiver pod's
     proxy URL. Content-Length is forwarded explicitly — the receiver
-    rejects chunked bodies (411)."""
+    rejects chunked bodies (411). v2.5.1 (GL-R02): the receiver session
+    token rides the x-upload-token header (the console got it from
+    upload-init), and the relay HASHES the stream as it passes —
+    finalize verifies content, not just size."""
+    import hashlib
     import os
     from urllib.parse import quote
 
@@ -6783,38 +6886,50 @@ async def admin_models_upload(request: Request) -> Response:
     filename = os.path.basename(
         (request.headers.get("x-filename") or "").strip())
     size_raw = (request.headers.get("x-file-size") or "").strip()
-    if not (pod_id and filename and size_raw.isdigit()):
-        return _error(400, "x-pod-id, x-filename and x-file-size headers "
-                           "are required")
+    token = (request.headers.get("x-upload-token") or "").strip()
+    if not (pod_id and filename and size_raw.isdigit() and token):
+        return _error(400, "x-pod-id, x-filename, x-file-size and "
+                           "x-upload-token headers are required")
     url = upload.receiver_url(pod_id, quote(filename))
+    digest = hashlib.sha256()
+
+    async def _tee():
+        async for chunk in request.stream():
+            digest.update(chunk)
+            yield chunk
+
     try:
         async with httpx.AsyncClient(
                 timeout=httpx.Timeout(600.0, connect=30.0)) as c:
-            r = await c.put(url, content=request.stream(),
-                            headers={"Content-Length": size_raw})
+            r = await c.put(url, content=_tee(),
+                            headers={"Content-Length": size_raw,
+                                     "Authorization": f"Bearer {token}"})
     except httpx.HTTPError as e:
         return _error(502, f"relay to receiver failed: {e}",
                       code="upload_error")
     if r.status_code != 200:
         return _error(502, f"receiver rejected upload: {r.text[:200]}",
                       code="upload_error")
+    upload.remember_relay_hash(pod_id, filename, digest.hexdigest())
     try:
         detail = r.json()
     except ValueError:
         detail = {}
     return {"ok": True, "pod_id": pod_id, "filename": filename,
+            "sha256": digest.hexdigest(),
             "detail": detail}
 
 
 @app.get("/admin/models/upload-status")
 async def admin_upload_status(pod_id: str = "",
-                              filename: str = "") -> Response:
+                              filename: str = "",
+                              token: str = "") -> Response:
     """Bytes the receiver has so far (the console polls this during the
     relay — browser-side progress is localhost-instant and useless)."""
-    if not (pod_id and filename):
-        return _error(400, "pod_id and filename required")
+    if not (pod_id and filename and token):
+        return _error(400, "pod_id, filename and token required")
     try:
-        return await upload.receiver_status(pod_id, filename)
+        return await upload.receiver_status(pod_id, filename, token)
     except Exception as e:  # noqa: BLE001 — receiver unreachable
         return _error(502, f"receiver status failed: {e}",
                       code="upload_error")
@@ -6826,17 +6941,25 @@ class UploadFinalizePayload(BaseModel):
     pod_id: str = ""
     filename: str = ""
     size_bytes: int = 0
+    token: str = ""          # the receiver session token (from init)
+    sha256: str = ""         # optional expected content hash
 
 
 @app.post("/admin/models/upload-finalize")
 async def admin_upload_finalize(payload: UploadFinalizePayload) -> Response:
-    """Verify the uploaded size; returns the receiver's PUBLIC file URL
-    — deploy-custom accepts it as file_url (the model pod curls it)."""
-    if not (payload.pod_id and payload.filename and payload.size_bytes > 0):
-        return _error(400, "pod_id, filename and size_bytes required")
+    """Verify the uploaded size AND content (v2.5.1: an expected sha256
+    is checked against the relay hash / receiver sidecar — same-size
+    replacement poisoning fails); returns the receiver's PUBLIC file
+    URL (token rides as ?t= — the URL is the capability the model pod
+    curls)."""
+    if not (payload.pod_id and payload.filename and payload.size_bytes > 0
+            and payload.token):
+        return _error(400, "pod_id, filename, size_bytes and token "
+                           "required")
     try:
         return await upload.finalize(payload.pod_id, payload.filename,
-                                     payload.size_bytes)
+                                     payload.size_bytes, payload.token,
+                                     payload.sha256)
     except upload.UploadError as e:
         return _error(502, str(e), code="upload_error")
     except Exception as e:  # noqa: BLE001

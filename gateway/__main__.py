@@ -72,6 +72,24 @@ def main() -> None:
     cfg = get_gateway_config()
     cfg.maybe_reload()
 
+    # GL-R01 (v2.5.1): binding beyond loopback in OPEN MODE (zero
+    # gateway_keys and zero api_keys) exposes the admin surface
+    # unauthenticated to every network the bind reaches. The operator
+    # owns their bind choice — this is a LOUD warning, not a refusal
+    # (self-hosted posture). The v2.1 admin_port split removes the
+    # exposure: /admin lives on admin_bind (loopback default).
+    _LOOPBACK = ("127.0.0.1", "::1", "localhost", "")
+    if (str(cfg.bind) not in _LOOPBACK
+            and not (cfg.gateway_keys or cfg.api_keys)
+            and not (getattr(cfg, "admin_port", None)
+                     and cfg.admin_port != cfg.port)):
+        logging.getLogger("gateway").warning(
+            "SECURITY: bind %s with NO keys configured — the admin "
+            "surface (console, /admin) is UNAUTHENTICATED on this "
+            "network. Configure gateway_keys, or set admin_port to "
+            "move /admin to admin_bind (loopback default).",
+            cfg.bind)
+
     # Content Vault (v2.4): vault.enabled requires an installed capture
     # backend (enterprise build + the 'vault' license claim, which wires
     # gateway_enterprise/vault). Fail fast with a clear error — silent
