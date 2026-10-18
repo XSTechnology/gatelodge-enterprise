@@ -408,20 +408,24 @@ def custom_ctx_options(model_gb: float,
     return out
 
 
-def _custom_script(file_url: str, mmproj_url: str, model_dir: str,
-                   parallel: int, ctx_total: int,
+def _custom_script(model_dir: str, parallel: int, ctx_total: int,
                    sha256: str = "",
-                   mmproj_sha256: str = "") -> str:
+                   mmproj_sha256: str = "",
+                   has_mmproj: bool = False) -> str:
     """Generic download-and-serve: curl the picked GGUF (+mmproj for
     vision models) and serve with the image's llama-server. curl -L
     follows the HF/ModelScope/Ollama CDN redirects; when a network
     volume is mounted the download persists across stops (container
     disk is ephemeral).
 
-    v2.6 (GL-R25): when the search result carried a sha256 (HF LFS
-    metadata, Ollama digests), the boot VERIFIES the downloaded file —
-    `set -e` fails the boot on a mismatched artifact (supply-chain
-    poisoning dies at boot, never serves)."""
+    v2.6 (GL-R03): the URLs travel via POD ENV ($FILE_URL /
+    $MMPROJ_URL) — NOTHING externally sourced is interpolated into the
+    sh text, so a hostile catalog entry cannot break out of quoting
+    (same treatment as the upload bootstrap). v2.6 (GL-R25): when the
+    search result carried a sha256 (HF LFS metadata, Ollama digests),
+    the boot VERIFIES the downloaded artifact — `set -e` fails the
+    boot on a mismatched artifact (supply-chain poisoning dies at
+    boot, never serves)."""
     def _verify(fname: str, expect: str) -> str:
         if not expect:
             return ""
@@ -431,22 +435,22 @@ def _custom_script(file_url: str, mmproj_url: str, model_dir: str,
         "set -e; mkdir -p " + model_dir + "; ",
         f"if [ ! -f {model_dir}/model.gguf ]; then "
         "echo '[boot] downloading model'; "
-        f"curl -fsSL --retry 3 --max-time 5400 "
-        f"-o {model_dir}/model.gguf '{file_url}'; "
+        "curl -fsSL --retry 3 --max-time 5400 "
+        f"-o {model_dir}/model.gguf \"$FILE_URL\"; "
         "echo '[boot] model download done'; "
         + _verify("model.gguf", sha256) + "fi; ",
     ]
-    if mmproj_url:
+    if has_mmproj:
         parts.append(
             f"if [ ! -f {model_dir}/mmproj.gguf ]; then "
-            f"curl -fsSL --retry 3 --max-time 900 "
-            f"-o {model_dir}/mmproj.gguf '{mmproj_url}'; "
+            "curl -fsSL --retry 3 --max-time 900 "
+            f"-o {model_dir}/mmproj.gguf \"$MMPROJ_URL\"; "
             + _verify("mmproj.gguf", mmproj_sha256) + "fi; ")
     parts.append("df -h " + model_dir + " | tail -1; ")
     parts.append("SRV=/app/llama-server; [ -x \"$SRV\" ] || "
                  "SRV=$(command -v llama-server || echo /llama-server); ")
     parts.append("echo '[boot] serving'; ")
-    mm = f"--mmproj {model_dir}/mmproj.gguf " if mmproj_url else ""
+    mm = f"--mmproj {model_dir}/mmproj.gguf " if has_mmproj else ""
     parts.append(f"exec \"$SRV\" -m {model_dir}/model.gguf {mm}"
                  f"--host 0.0.0.0 --port 8080 -ngl 99 --jinja "
                  f"--parallel {parallel} --ctx-size {ctx_total}")
@@ -474,9 +478,12 @@ def build_custom_spec(*, file_name: str, file_url: str, size_gb: float,
         "gpu_type_ids": [gpu_id],
         "gpu_count": int(gpu_count),
         "docker_entrypoint": ["sh", "-c"],
-        "docker_script": _custom_script(file_url, mmproj_url, model_dir,
-                                        parallel, ctx_total, sha256,
-                                        mmproj_sha256),
+        "docker_script": _custom_script(model_dir, parallel, ctx_total,
+                                        sha256, mmproj_sha256,
+                                        has_mmproj=bool(mmproj_url)),
+        # GL-R03: externally sourced URLs ride the POD ENV — the sh
+        # text is a fixed string
+        "env": {"FILE_URL": file_url, "MMPROJ_URL": mmproj_url or ""},
         "ports": "8080/http", "port": 8080,
         "container_disk_gb": int(container_disk_gb or 20),
         "start_timeout_s": 3600 if size_gb > 20 else 1800,

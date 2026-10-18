@@ -5340,9 +5340,13 @@ def _auth_internal_bearer() -> str:
 
 
 def _migrate_plaintext_keys() -> None:
-    """One-time rewrite to hashed-at-rest (GL-R07, v2.5.1):
+    """One-time rewrite to hashed-at-rest (GL-R07, v2.5.1 + v2.6):
     - api_keys entries carrying a plaintext `key` → sha256 `key_hash`
     - gateway_keys strings that are not already sha256 hex → hashes
+    - admin_key_roles[].key plaintext values → hashes (v2.6: the same
+      credential must not survive in plaintext in the role map when
+      gateway_keys itself is hashed; also fixes the RBAC lint's
+      dead-entry false positives after gateway_keys migration)
     The plaintext leaves the stored config; auth is unaffected
     (presented tokens are hashed and compared). Idempotent."""
     try:
@@ -5358,9 +5362,9 @@ def _migrate_plaintext_keys() -> None:
                     e["key_hash"] = _sha256_hex(str(e["key"]).strip())
                     e.pop("key", None)
                     changed += 1
+        from .auth import _is_hex64
         gw = raw.get("gateway_keys")
         if isinstance(gw, list):
-            from .auth import _is_hex64
             new_gw = []
             for k in gw:
                 k = str(k)
@@ -5371,6 +5375,19 @@ def _migrate_plaintext_keys() -> None:
                     new_gw.append(k)
             if changed:
                 raw["gateway_keys"] = new_gw
+        roles = raw.get("admin_key_roles")
+        if isinstance(roles, list):
+            new_roles = []
+            for item in roles:
+                if isinstance(item, dict):
+                    k = str(item.get("key") or "").strip()
+                    if k and not _is_hex64(k):
+                        item = dict(item)
+                        item["key"] = _sha256_hex(k)
+                        changed += 1
+                new_roles.append(item)
+            if changed:
+                raw["admin_key_roles"] = new_roles
         if not changed:
             return
 
@@ -5379,6 +5396,8 @@ def _migrate_plaintext_keys() -> None:
                 r["api_keys"] = entries
             if isinstance(gw, list):
                 r["gateway_keys"] = raw["gateway_keys"]
+            if isinstance(roles, list):
+                r["admin_key_roles"] = raw["admin_key_roles"]
 
         _mutate_config(_mut, f"key-hash-migration ({changed} keys)")
         logger.info("migrated %d key(s) to hashed-at-rest", changed)
@@ -5436,11 +5455,38 @@ async def admin_events() -> Response:
 
 # ── Admin: service definitions, models, secrets (console v2) ───────────────
 
+# GL-R02 follow-up (v2.6): model specs can carry receiver-session
+# credentials (upload_token, env.GW_UPLOAD_TOKEN) — they must never
+# leave the gateway through admin GETs. Redacted everywhere a model
+# spec is returned.
+_SENSITIVE_MODEL_KEYS = {"upload_token"}
+_SENSITIVE_ENV_NAMES = {"GW_UPLOAD_TOKEN"}
+
+
+def public_model_spec(spec: Any) -> Any:
+    """A model spec safe for admin responses: session credentials
+    redacted (presence preserved as '***')."""
+    if not isinstance(spec, dict):
+        return spec
+    out = {}
+    for k, v in spec.items():
+        if k in _SENSITIVE_MODEL_KEYS:
+            out[k] = "***redacted***" if v else ""
+        elif k == "env" and isinstance(v, dict):
+            out[k] = {name: ("***redacted***"
+                             if name in _SENSITIVE_ENV_NAMES else val)
+                      for name, val in v.items()}
+        else:
+            out[k] = v
+    return out
+
+
 @app.get("/admin/backends")
 async def admin_backends() -> Response:
     """Structured SERVICE DEFINITIONS for the console — every backend with
     its type, connection parameters, and models. Secrets never appear:
-    cloud/runpod backends carry only the env-var NAME (api_key_env)."""
+    cloud/runpod backends carry only the env-var NAME (api_key_env);
+    receiver-session tokens in pod specs are redacted (GL-R02)."""
     cfg = get_gateway_config()
     cfg.maybe_reload()
     unlicensed = set(_unlicensed_backends(cfg))
@@ -5450,27 +5496,32 @@ async def admin_backends() -> Response:
         # v2.2 provider entitlement — the console greys these out
         entry["licensed"] = name not in unlicensed
         if b.get("type") == "embedded":
-            entry["models"] = b.get("models") or {}
+            entry["models"] = {k: public_model_spec(v) for k, v in
+                               (b.get("models") or {}).items()}
             entry["embedding_models"] = b.get("embedding_models") or {}
         elif b.get("type") == "llama-server":
             if b.get("base_url"):
                 entry["mode"] = "remote"
                 entry["base_url"] = b["base_url"]
                 entry["api_key_env"] = b.get("api_key_env") or ""
-                entry["models"] = b.get("models") or {}
+                entry["models"] = {k: public_model_spec(v) for k, v in
+                                   (b.get("models") or {}).items()}
             else:
                 entry["mode"] = "subprocess"
                 for k in ("server_exe", "host", "port_base", "start_timeout_s",
                           "idle_timeout_s", "extra_args"):
                     entry[k] = b.get(k)
-                entry["models"] = b.get("models") or {}
+                entry["models"] = {k: public_model_spec(v) for k, v in
+                                   (b.get("models") or {}).items()}
         elif b.get("type") == "runpod":
             entry["api_key_env"] = b.get("api_key_env") or "RUNPOD_API_KEY"
-            entry["models"] = b.get("models") or {}
+            entry["models"] = {k: public_model_spec(v) for k, v in
+                               (b.get("models") or {}).items()}
         else:  # openai cloud
             entry["base_url"] = b.get("base_url") or "(OpenAI default)"
             entry["api_key_env"] = b.get("api_key_env") or ""
-            entry["models"] = b.get("models") or {}
+            entry["models"] = {k: public_model_spec(v) for k, v in
+                               (b.get("models") or {}).items()}
         out.append(entry)
     return {"backends": out, "queue": cfg.queue, "default_alias": cfg.default_alias,
             "bind": cfg.bind, "port": cfg.port, "models_dir": cfg.models_dir,

@@ -193,18 +193,22 @@ class AdminRoleMap:
 
     def role_for(self, cfg, token: str) -> str:
         """The role assigned to this bearer token; '' when unassigned
-        (the caller applies DEFAULT_ROLE). Matching mirrors the core's
-        gateway_keys resolution: plaintext equality, or constant-time
-        hash comparison for 64-hex entries."""
+        (the caller applies DEFAULT_ROLE). v2.6 (GL-R07 follow-up):
+        HASH-ONLY — 64-hex entries match sha256(presented token)
+        constant-time; plaintext entries compare constant-time and are
+        migrated to hashes at startup (app._migrate_plaintext_keys) so
+        the plaintext leaves the config file. Presenting a stored hash
+        does NOT match."""
         self.refresh(cfg)
         if not token or not self._entries:
             return ""
         token_hash = _sha256_hex(token)
         for e in self._entries:
             k = e["key"]
-            if k == token:
-                return e["role"]
             if len(k) == 64 and hmac.compare_digest(k, token_hash):
+                return e["role"]
+            if len(k) != 64 and hmac.compare_digest(k, token):
+                # legacy plaintext entry (migrated at startup)
                 return e["role"]
         return ""
 
