@@ -29,7 +29,10 @@ def wire(enabled: bool) -> dict:
         return {"installed": False, "reason": "not licensed"}
 
     from gateway.app import add_extra_router
-    add_extra_router(_build_router(), prefix="/admin/evidence")
+    # auth='admin' (v2.5.1 GL-R16): the CORE enforces the admin gate
+    # chain on every route — the router ships no guard of its own
+    add_extra_router(_build_router(), prefix="/admin/evidence",
+                     auth="admin")
     logger.info("evidence packaging surface ACTIVE (/admin/evidence)")
     return {"installed": True}
 

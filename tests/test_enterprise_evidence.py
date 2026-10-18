@@ -262,9 +262,11 @@ def test_surface_mounted_and_gated(ev_env, gguf, wired):
                          headers=auth("admin-secret"), json={})
         assert r2.status_code == 200
         assert r2.json()["package_id"].startswith("evidence-")
-        # virtual keys are denied (mirror of the core admin gate)
+        # no bearer → the CORE admin gate's exact response (401 — the
+        # v2.5.1 auth='admin' declaration replaces the old router-owned
+        # 403 with core-consistent semantics)
         r3 = client.get("/admin/evidence/status")
-        assert r3.status_code == 403
+        assert r3.status_code == 401
     # unwire: the router stays mounted for the process (add_extra_router
     # replaces on next wire) — flip to unlicensed for the next test
 

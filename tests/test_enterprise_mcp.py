@@ -101,7 +101,7 @@ def _mount(wired, gguf, monkeypatch, handler=None, seen=None, **cfgkw):
         lambda url, headers: httpx.AsyncClient(
             transport=httpx.MockTransport(handler or _stub_handler(seen)),
             headers=headers, timeout=5.0))
-    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp", auth="owned")
 
 
 def _rpc(client, method, params=None, msg_id=1, bearer=KEY):
@@ -357,7 +357,7 @@ def test_stdio_tools_list_and_call(wired, gguf, tmp_path):  # noqa: F811
     """A REAL child process: the gateway spawns the stub, handshakes,
     lists tools (namespaced) and round-trips a call."""
     wired(_stdio_config(gguf, _write_stub(tmp_path)))
-    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp", auth="owned")
     try:
         with TestClient(gw_app.app) as client:
             names = [t["name"] for t in
@@ -376,7 +376,7 @@ def test_stdio_env_passes_through(wired, gguf, tmp_path):  # noqa: F811
     """Server env entries ride atop the gateway environment."""
     wired(_stdio_config(gguf, _write_stub(tmp_path),
                         env={"GATELODGE_TEST_ENV": "injected-42"}))
-    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp", auth="owned")
     try:
         with TestClient(gw_app.app) as client:
             r = _rpc(client, "tools/call", {
@@ -391,7 +391,7 @@ def test_stdio_child_death_respawns(wired, gguf, tmp_path):  # noqa: F811
     """A child that DIES mid-call (boom → exit 1): the call fails with
     -32003, the NEXT call transparently respawns the child and works."""
     wired(_stdio_config(gguf, _write_stub(tmp_path)))
-    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp", auth="owned")
     try:
         with TestClient(gw_app.app) as client:
             boom = _rpc(client, "tools/call", {"name": "local.boom"})
@@ -417,7 +417,7 @@ def test_stdio_and_http_servers_coexist(wired, gguf, tmp_path, monkeypatch):  # 
     cfg = _stdio_config(gguf, _write_stub(tmp_path))
     cfg["mcp"]["servers"]["remote"] = {"url": "http://stub.internal/mcp"}
     wired(cfg)
-    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp", auth="owned")
     try:
         with TestClient(gw_app.app) as client:
             names = sorted(t["name"] for t in
@@ -432,7 +432,7 @@ def test_stdio_and_http_servers_coexist(wired, gguf, tmp_path, monkeypatch):  # 
 def test_stdio_governed_audit(wired, gguf, tmp_path):  # noqa: F811
     """stdio tool calls get the SAME governance: chained audit record."""
     wired(_stdio_config(gguf, _write_stub(tmp_path)))
-    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp")
+    gw_app.add_extra_router(mcp.build_router(), prefix="/mcp", auth="owned")
     try:
         with TestClient(gw_app.app) as client:
             _rpc(client, "tools/call", {
@@ -456,7 +456,7 @@ def test_wire_mcp_license_gate(wired, gguf, monkeypatch):  # noqa: F811
     wired(_mcp_config(gguf))
     mounted = []
     monkeypatch.setattr(gwa, "add_extra_router",
-                        lambda r, prefix: mounted.append(prefix))
+                        lambda r, prefix, auth="": mounted.append(prefix))
     enterprise_main._wire_mcp(enabled=False)
     assert mounted == []                      # claim absent → ignored
     enterprise_main._wire_mcp(enabled=True)

@@ -155,7 +155,10 @@ def wire(enabled: bool) -> dict:
 
     # admin surface (/admin/vault) — self-authed, admin-gate mirrored
     from gateway.app import add_extra_router, app as gw_app
-    add_extra_router(build_router(get_writer), prefix="/admin/vault")
+    # auth='admin' (v2.5.1 GL-R16): the CORE enforces the admin gate
+    # chain on every route — the router ships no guard of its own
+    add_extra_router(build_router(get_writer), prefix="/admin/vault",
+                     auth="admin")
 
     # writer lifecycle rides the app's events (the task needs the loop)
     gw_app.router.add_event_handler("startup", _start_writer)

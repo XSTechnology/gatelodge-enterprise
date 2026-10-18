@@ -178,7 +178,7 @@ def test_wire_scim_unlicensed_never_mounts(monkeypatch, tmp_path):
     import gateway.app as gw_app
     mounted = []
     monkeypatch.setattr(gw_app, "set_extra_router",
-                        lambda r, prefix: mounted.append(prefix))
+                        lambda r, prefix, auth="": mounted.append(prefix))
     # a config WITH scim.enabled — the claim must override it
     cfgfile = tmp_path / "gateway_config.json"
     cfgfile.write_text(json.dumps({"scim": {"enabled": True}}),

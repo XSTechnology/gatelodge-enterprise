@@ -119,7 +119,7 @@ def _wire_mcp(enabled: bool = True) -> None:
     if not mcp.get("enabled"):
         return
     from gateway_enterprise.mcp import build_router
-    add_extra_router(build_router(), prefix="/mcp")
+    add_extra_router(build_router(), prefix="/mcp", auth="owned")
 
 
 def _wire_teams(enabled: bool = True) -> None:
@@ -141,7 +141,7 @@ def _wire_teams(enabled: bool = True) -> None:
     if not teams.get("enabled"):
         return
     from gateway_enterprise.teams import build_router
-    add_extra_router(build_router(), prefix="/teams")
+    add_extra_router(build_router(), prefix="/teams", auth="owned")
 
 
 def _wire_auth_pipeline(session_budgets: bool, teams: bool = False) -> None:

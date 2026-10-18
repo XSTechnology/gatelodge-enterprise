@@ -68,7 +68,7 @@ def _wire(wired, gguf, **team_over):
     set_auth_pipeline(AuthPipeline(
         [resolve_link, rbac_link, team_link, team_budget_link,
          admin_gate_link, rate_limit_link]))
-    gw_app.add_extra_router(build_router(), prefix="/teams")
+    gw_app.add_extra_router(build_router(), prefix="/teams", auth="owned")
 
 
 def _chat(client, token="vk-team", content="team probe"):
@@ -290,7 +290,7 @@ def test_license_gate(wired, gguf, monkeypatch):  # noqa: F811
     wired(_teams_config(gguf))
     mounted = []
     monkeypatch.setattr(gwa, "add_extra_router",
-                        lambda r, prefix: mounted.append(prefix))
+                        lambda r, prefix, auth="": mounted.append(prefix))
     enterprise_main._wire_teams(enabled=False)
     assert mounted == []
     enterprise_main._wire_teams(enabled=True)
