@@ -324,13 +324,15 @@ def admin_scope_app():
     """The app as served on the ADMIN port: ONLY the control plane —
     /admin/*, /teams, /scim, the console shell and /healthz — the data
     plane (/v1, /mcp) is not hosted here."""
+    from .auth import path_scope
+
     async def _shim(scope, receive, send):
         if scope["type"] == "http":
             path = scope.get("path") or ""
-            allowed = (path == "/healthz" or path == "/"
-                       or path.startswith("/admin")
-                       or path.startswith("/teams")
-                       or path.startswith("/scim"))
+            allowed = (path in ("/healthz", "/")
+                       or path_scope("/admin", path)
+                       or path_scope("/teams", path)
+                       or path_scope("/scim", path))
             if not allowed:
                 await _asgi_404(scope, receive, send)
                 return
@@ -867,7 +869,8 @@ async def _bearer_auth(request: Request, call_next):
     # extra-router seam: mounted enterprise surfaces (SCIM, …) own
     # their authentication — the core pipeline does not gate their
     # registered prefix (their bearers are not gateway credentials).
-    elif any(request.url.path.startswith(_p)
+    # Segment-aware (GL-R18): '/scim' never swallows '/scim-thing'.
+    elif any(auth.path_scope(_p, request.url.path)
              for _p in _EXTRA_ROUTER_PREFIXES):
         resp = await call_next(request)
     else:
@@ -5337,9 +5340,13 @@ def _auth_internal_bearer() -> str:
 
 
 def _migrate_plaintext_keys() -> None:
-    """One-time rewrite to hashed-at-rest (GL-R07, v2.5.1):
+    """One-time rewrite to hashed-at-rest (GL-R07, v2.5.1 + v2.6):
     - api_keys entries carrying a plaintext `key` → sha256 `key_hash`
     - gateway_keys strings that are not already sha256 hex → hashes
+    - admin_key_roles[].key plaintext values → hashes (v2.6: the same
+      credential must not survive in plaintext in the role map when
+      gateway_keys itself is hashed; also fixes the RBAC lint's
+      dead-entry false positives after gateway_keys migration)
     The plaintext leaves the stored config; auth is unaffected
     (presented tokens are hashed and compared). Idempotent."""
     try:
@@ -5355,9 +5362,9 @@ def _migrate_plaintext_keys() -> None:
                     e["key_hash"] = _sha256_hex(str(e["key"]).strip())
                     e.pop("key", None)
                     changed += 1
+        from .auth import _is_hex64
         gw = raw.get("gateway_keys")
         if isinstance(gw, list):
-            from .auth import _is_hex64
             new_gw = []
             for k in gw:
                 k = str(k)
@@ -5368,6 +5375,19 @@ def _migrate_plaintext_keys() -> None:
                     new_gw.append(k)
             if changed:
                 raw["gateway_keys"] = new_gw
+        roles = raw.get("admin_key_roles")
+        if isinstance(roles, list):
+            new_roles = []
+            for item in roles:
+                if isinstance(item, dict):
+                    k = str(item.get("key") or "").strip()
+                    if k and not _is_hex64(k):
+                        item = dict(item)
+                        item["key"] = _sha256_hex(k)
+                        changed += 1
+                new_roles.append(item)
+            if changed:
+                raw["admin_key_roles"] = new_roles
         if not changed:
             return
 
@@ -5376,6 +5396,8 @@ def _migrate_plaintext_keys() -> None:
                 r["api_keys"] = entries
             if isinstance(gw, list):
                 r["gateway_keys"] = raw["gateway_keys"]
+            if isinstance(roles, list):
+                r["admin_key_roles"] = raw["admin_key_roles"]
 
         _mutate_config(_mut, f"key-hash-migration ({changed} keys)")
         logger.info("migrated %d key(s) to hashed-at-rest", changed)
@@ -5433,11 +5455,38 @@ async def admin_events() -> Response:
 
 # ── Admin: service definitions, models, secrets (console v2) ───────────────
 
+# GL-R02 follow-up (v2.6): model specs can carry receiver-session
+# credentials (upload_token, env.GW_UPLOAD_TOKEN) — they must never
+# leave the gateway through admin GETs. Redacted everywhere a model
+# spec is returned.
+_SENSITIVE_MODEL_KEYS = {"upload_token"}
+_SENSITIVE_ENV_NAMES = {"GW_UPLOAD_TOKEN"}
+
+
+def public_model_spec(spec: Any) -> Any:
+    """A model spec safe for admin responses: session credentials
+    redacted (presence preserved as '***')."""
+    if not isinstance(spec, dict):
+        return spec
+    out = {}
+    for k, v in spec.items():
+        if k in _SENSITIVE_MODEL_KEYS:
+            out[k] = "***redacted***" if v else ""
+        elif k == "env" and isinstance(v, dict):
+            out[k] = {name: ("***redacted***"
+                             if name in _SENSITIVE_ENV_NAMES else val)
+                      for name, val in v.items()}
+        else:
+            out[k] = v
+    return out
+
+
 @app.get("/admin/backends")
 async def admin_backends() -> Response:
     """Structured SERVICE DEFINITIONS for the console — every backend with
     its type, connection parameters, and models. Secrets never appear:
-    cloud/runpod backends carry only the env-var NAME (api_key_env)."""
+    cloud/runpod backends carry only the env-var NAME (api_key_env);
+    receiver-session tokens in pod specs are redacted (GL-R02)."""
     cfg = get_gateway_config()
     cfg.maybe_reload()
     unlicensed = set(_unlicensed_backends(cfg))
@@ -5447,27 +5496,32 @@ async def admin_backends() -> Response:
         # v2.2 provider entitlement — the console greys these out
         entry["licensed"] = name not in unlicensed
         if b.get("type") == "embedded":
-            entry["models"] = b.get("models") or {}
+            entry["models"] = {k: public_model_spec(v) for k, v in
+                               (b.get("models") or {}).items()}
             entry["embedding_models"] = b.get("embedding_models") or {}
         elif b.get("type") == "llama-server":
             if b.get("base_url"):
                 entry["mode"] = "remote"
                 entry["base_url"] = b["base_url"]
                 entry["api_key_env"] = b.get("api_key_env") or ""
-                entry["models"] = b.get("models") or {}
+                entry["models"] = {k: public_model_spec(v) for k, v in
+                                   (b.get("models") or {}).items()}
             else:
                 entry["mode"] = "subprocess"
                 for k in ("server_exe", "host", "port_base", "start_timeout_s",
                           "idle_timeout_s", "extra_args"):
                     entry[k] = b.get(k)
-                entry["models"] = b.get("models") or {}
+                entry["models"] = {k: public_model_spec(v) for k, v in
+                                   (b.get("models") or {}).items()}
         elif b.get("type") == "runpod":
             entry["api_key_env"] = b.get("api_key_env") or "RUNPOD_API_KEY"
-            entry["models"] = b.get("models") or {}
+            entry["models"] = {k: public_model_spec(v) for k, v in
+                               (b.get("models") or {}).items()}
         else:  # openai cloud
             entry["base_url"] = b.get("base_url") or "(OpenAI default)"
             entry["api_key_env"] = b.get("api_key_env") or ""
-            entry["models"] = b.get("models") or {}
+            entry["models"] = {k: public_model_spec(v) for k, v in
+                               (b.get("models") or {}).items()}
         out.append(entry)
     return {"backends": out, "queue": cfg.queue, "default_alias": cfg.default_alias,
             "bind": cfg.bind, "port": cfg.port, "models_dir": cfg.models_dir,
@@ -6663,6 +6717,8 @@ class CustomDeployPayload(BaseModel):
     mmproj_name: str = ""
     mmproj_url: str = ""
     mmproj_size_gb: float = 0
+    sha256: str = ""               # GL-R25: verified at boot when set
+    mmproj_sha256: str = ""
     gpu_id: str = ""
     gpu_count: int = 1
     cloud: str = "secure"
@@ -6794,7 +6850,8 @@ async def admin_models_deploy_custom(
             cloud=payload.cloud, data_center_id=payload.data_center_id,
             volume_id=volume_id, ctx_key=ctx_key,
             container_disk_gb=disk, idle_stop_s=payload.idle_stop_s,
-            alias=alias)
+            alias=alias,
+            sha256=payload.sha256, mmproj_sha256=payload.mmproj_sha256)
         deploy_payload = runpod.deploy_payload(backend, alias, spec)
         try:
             pod = await runpod.deploy_pod(deploy_payload, api_key_env)

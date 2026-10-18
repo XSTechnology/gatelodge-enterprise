@@ -35,7 +35,7 @@ from typing import Any
 import httpx
 
 from . import catalog, runpod
-from .config import get_gateway_config
+from .config import atomic_write_json, get_gateway_config
 
 logger = logging.getLogger("gateway.upload")
 
@@ -79,10 +79,12 @@ def receiver_url(pod_id: str, path: str = "") -> str:
 # content, not just size.
 
 _RECEIVER_PY = '''
-import hashlib, json, os
+import hashlib, hmac, json, os, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 D = "/workspace/uploads"
 TOKEN = os.environ.get("GW_UPLOAD_TOKEN", "")
+SAFE_NAME = re.compile("^[A-Za-z0-9._-]+$")
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body=b""):
         self.send_response(code)
@@ -95,23 +97,25 @@ class H(BaseHTTPRequestHandler):
         if not TOKEN:
             return False
         h = self.headers.get("Authorization") or ""
-        if h == "Bearer " + TOKEN:
+        if h.startswith("Bearer ") and hmac.compare_digest(h[7:], TOKEN):
             return True
-        q = self.path.split("?", 1)
-        if len(q) == 2 and ("t=" + TOKEN) in q[1]:
-            return True
-        return False
+        q = parse_qs(urlsplit(self.path).query,
+                     keep_blank_values=True).get("t", [""])
+        return hmac.compare_digest(q[0], TOKEN)
     def do_GET(self):
         try:
-            if self.path.split("?")[0] == "/health":
+            path = urlsplit(self.path).path
+            if path == "/health":
                 self._send(200, b"{\\"ok\\": true}")
                 return
             if not self._authed():
                 self._send(403, b"{\\"error\\": \\"token required\\"}")
                 return
-            path = self.path.split("?")[0]
             if path.startswith("/status/"):
                 n = os.path.basename(path[8:])
+                if not SAFE_NAME.fullmatch(n):
+                    self._send(400)
+                    return
                 p = os.path.join(D, n)
                 part = p + ".part"
                 if os.path.exists(p):
@@ -131,6 +135,9 @@ class H(BaseHTTPRequestHandler):
                     {"name": n, "size": sz, "sha256": sha}).encode())
             elif path.startswith("/file/"):
                 n = os.path.basename(path[6:])
+                if not SAFE_NAME.fullmatch(n):
+                    self._send(400)
+                    return
                 p = os.path.join(D, n)
                 if not os.path.exists(p):
                     self._send(404)
@@ -153,8 +160,9 @@ class H(BaseHTTPRequestHandler):
             if not self._authed():
                 self._send(403, b"{\\"error\\": \\"token required\\"}")
                 return
-            n = os.path.basename(self.path.lstrip("/").split("?")[0])
-            if not n or n in (".", ".."):
+            n = os.path.basename(
+                urlsplit(self.path).path.lstrip("/"))
+            if not n or n in (".", "..") or not SAFE_NAME.fullmatch(n):
                 self._send(400)
                 return
             length = self.headers.get("Content-Length")
@@ -188,10 +196,13 @@ ThreadingHTTPServer(("0.0.0.0", 8081), H).serve_forever()
 
 
 def _new_upload_token() -> str:
-    """Per-receiver-session token (GL-R02): the gateway generates it,
-    passes it to the pod via env, and shares it with the uploading
-    console via the init response. Anyone who can reach the pod proxy
-    URL but not the token gets 403 on everything but /health."""
+    """Per-RECEIVER session token (GL-R02): the gateway generates it at
+    receiver deploy, passes it to the pod via env, and shares it with
+    the uploading console via the init response. It lives as long as
+    the receiver pod (a reused healthy receiver keeps its token across
+    gateway restarts; cleanup terminates the pod and revokes it).
+    Anyone who can reach the pod proxy URL but not the token gets 403
+    on everything but /health."""
     import secrets
     return secrets.token_hex(24)
 
@@ -296,8 +307,7 @@ def _persist_receiver_spec(cfg, backend: str, model_key: str,
             models = (raw.setdefault("backends", {})
                       .setdefault(backend, {}).setdefault("models", {}))
             models[model_key] = spec
-            cfg.path.write_text(json.dumps(raw, indent=2) + "\n",
-                                encoding="utf-8")
+            atomic_write_json(cfg.path, raw)
             cfg.reload_now()
     except Exception:  # noqa: BLE001 — upload init must still return
         logger.warning("helper spec persist failed", exc_info=True)
@@ -379,6 +389,8 @@ async def receiver_status(pod_id: str, filename: str,
 # gateway-computed relay hashes (GL-R02): the PUT relay sees every
 # byte, so it records the actual sha256 per (pod, filename) — finalize
 # verifies content for browser uploads without a pod-side pass.
+# Popped at finalize (v2.6): verification state does not outlive its
+# upload.
 _RELAY_HASHES: dict[str, str] = {}
 
 
@@ -388,6 +400,10 @@ def remember_relay_hash(pod_id: str, filename: str, sha256: str) -> None:
 
 def relay_hash(pod_id: str, filename: str) -> str:
     return _RELAY_HASHES.get(f"{pod_id}/{filename}", "")
+
+
+def _pop_relay_hash(pod_id: str, filename: str) -> str:
+    return _RELAY_HASHES.pop(f"{pod_id}/{filename}", "")
 
 
 async def finalize(pod_id: str, filename: str, size_bytes: int,
@@ -403,7 +419,8 @@ async def finalize(pod_id: str, filename: str, size_bytes: int,
     if got != size_bytes:
         raise UploadError(f"size mismatch: receiver has {got} bytes, "
                           f"expected {size_bytes}")
-    actual = str(st.get("sha256") or "") or relay_hash(pod_id, filename)
+    actual = str(st.get("sha256") or "") or _pop_relay_hash(pod_id,
+                                                            filename)
     if expect_sha256:
         if not actual:
             raise UploadError("no sha256 available for the uploaded "
@@ -450,8 +467,8 @@ async def _terminate_helper(cfg, backend: str, model_key: str) -> dict[str, Any]
             raw = json.loads(cfg.path.read_text(encoding="utf-8"))
             (raw.get("backends", {}).get(backend, {})
              .get("models", {})).pop(model_key, None)
-            cfg.path.write_text(json.dumps(raw, indent=2) + "\n",
-                                encoding="utf-8")
+            from .config import atomic_write_json
+            atomic_write_json(cfg.path, raw)
             cfg.reload_now()
     except Exception:  # noqa: BLE001
         logger.warning("helper config cleanup failed", exc_info=True)
@@ -521,11 +538,19 @@ async def bootstrap_download(cfg, backend: str, file_url: str,
                 st = await receiver_status(pod_id, filename, token)
                 if int(st.get("size") or -1) >= size_bytes:
                     actual = str(st.get("sha256") or "")
-                    if sha256 and actual \
-                            and actual.lower() != sha256.lower():
-                        raise UploadError(
-                            f"sha256 mismatch after download: got "
-                            f"{actual[:16]}…, expected {sha256[:16]}…")
+                    if sha256:
+                        if not actual:
+                            # fail CLOSED (v2.6): an expected digest with
+                            # no sidecar is a verification failure — never
+                            # report the expected value as verified
+                            raise UploadError(
+                                "expected sha256 but the receiver "
+                                "produced no digest — content NOT "
+                                "verified")
+                        if actual.lower() != sha256.lower():
+                            raise UploadError(
+                                f"sha256 mismatch after download: got "
+                                f"{actual[:16]}…, expected {sha256[:16]}…")
                     return {"filename": filename,
                             "size_bytes": size_bytes,
                             "volume_id": volume_id,

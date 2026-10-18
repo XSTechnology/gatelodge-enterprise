@@ -243,13 +243,25 @@ def _export(spans: list[Span]) -> bool:
         return False
 
 
-def _flush_locked() -> None:
-    """Drain the buffer under the lock (chunked by batch_max)."""
+def _take_batch() -> list:
+    """Drain ONE batch from the buffer under the lock (v2.6, GL-R24:
+    the network export happens OUTSIDE the lock — a slow collector
+    can no longer block span-enqueue on the request path)."""
     batch_max = max(1, int(_config.get("batch_max") or 64))
-    while _buffer:
+    with _lock:
         chunk: list[Span] = []
         while _buffer and len(chunk) < batch_max:
             chunk.append(_buffer.popleft())
+        return chunk
+
+
+def _flush_all() -> None:
+    """Drain the buffer chunk-by-chunk; each chunk exports without
+    holding the lock."""
+    while True:
+        chunk = _take_batch()
+        if not chunk:
+            return
         _export(chunk)
 
 
@@ -260,9 +272,8 @@ def _flusher_loop() -> None:
         interval = max(0.5, float(_config.get("batch_flush_s") or 5.0))
         _wake.wait(timeout=interval)
         _wake.clear()
-        with _lock:
-            if _buffer:
-                _flush_locked()
+        if _buffer:
+            _flush_all()
 
 
 def configure(cfg: dict[str, Any] | None, *, version: str = "",
@@ -271,8 +282,7 @@ def configure(cfg: dict[str, Any] | None, *, version: str = "",
     (boot-time; section changes need a restart — same as scim). Starts
     the daemon flusher; a second call replaces state (tests, reload)."""
     global _flusher, _resource, _EXPORTER
-    with _lock:
-        _flush_locked() if _buffer else None            # drain the old
+    _flush_all()                                    # drain the old
     raw = cfg if isinstance(cfg, dict) else {}
     cfgd = dict(DEFAULTS)
     for k in ("enabled", "endpoint", "service_name", "headers",
@@ -309,9 +319,8 @@ def configure(cfg: dict[str, Any] | None, *, version: str = "",
 
 def shutdown_flush() -> None:
     """Best-effort final flush (app shutdown hook)."""
-    with _lock:
-        if _buffer:
-            _flush_locked()
+    if _buffer:
+        _flush_all()
 
 
 # ── request-path API (middleware + request-log chokepoint) ─────────────────
@@ -434,9 +443,8 @@ def healthz_status() -> dict[str, Any]:
 
 def flush() -> None:
     """Drain the buffer now (tests; also the shutdown path)."""
-    with _lock:
-        if _buffer:
-            _flush_locked()
+    if _buffer:
+        _flush_all()
 
 
 # ── test seams ─────────────────────────────────────────────────────────────

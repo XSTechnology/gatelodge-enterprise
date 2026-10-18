@@ -424,6 +424,8 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                         "custom": bool(m.get("custom")),
                         "source_file": str(m.get("source_file") or "").strip(),
                         "source_url": str(m.get("source_url") or "").strip(),
+                        "source_sha256": str(
+                            m.get("source_sha256") or "").strip(),
                         "source_size_gb": _num("source_size_gb", 0),
                         "mmproj_url": str(m.get("mmproj_url") or "").strip(),
                         "mmproj_size_gb": _num("mmproj_size_gb", 0),
@@ -845,6 +847,33 @@ class ConfigStore:
         raise NotImplementedError
 
 
+def atomic_write_json(path: Path, raw: dict[str, Any]) -> None:
+    """Crash-safe JSON write (GL-R10, v2.6): write to a temp file in
+    the SAME directory, fsync, then os.replace onto the target — a
+    crash mid-write can never truncate or corrupt the previous config.
+    ONE helper for the config store and every direct raw-file writer
+    (upload receiver specs, lifecycle pod-id clears)."""
+    import os
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(raw, indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix=path.name + ".",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class FileConfigStore(ConfigStore):
     """JSON-file-backed config storage — the core default."""
 
@@ -862,9 +891,7 @@ class FileConfigStore(ConfigStore):
 
     def save(self, raw: dict[str, Any],
              *, expected_version: Any = None) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(raw, indent=2) + "\n",
-                             encoding="utf-8")
+        atomic_write_json(self.path, raw)
         return True  # single-process file store — no race detection
 
     def version(self) -> Any:

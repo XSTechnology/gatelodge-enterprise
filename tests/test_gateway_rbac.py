@@ -103,8 +103,9 @@ def test_ops_readonly_role(wired, gguf):
 
 
 def test_key_manager_role(wired, gguf):
-    """key_manager: virtual-key CRUD + stats/secrets reads; the admin
-    key surface itself (/admin/gateway-keys) and raw config 403."""
+    """key_manager: virtual-key CRUD + stats reads; the admin key
+    surface itself (/admin/gateway-keys), raw config AND provider
+    secrets 403 (v2.6/GL-R14: secrets are secret_manager's duty)."""
     wired(_rbac_config(gguf, roles=[KM]))
     _wire_enterprise()
     try:
@@ -119,15 +120,18 @@ def test_key_manager_role(wired, gguf):
             assert "km-made-key" in [k["id"] for k in listed.json()["api_keys"]]
             assert client.get("/admin/stats",
                               headers=auth("km-secret")).status_code == 200
-            assert client.get("/admin/secrets",
-                              headers=auth("km-secret")).status_code == 200
             for r in (client.post("/admin/gateway-keys",
                                   headers=auth("km-secret"),
                                   json={"key": "minted-by-km"}),
                       client.get("/admin/config",
                                  headers=auth("km-secret")),
                       client.post("/admin/reload",
-                                  headers=auth("km-secret"))):
+                                  headers=auth("km-secret")),
+                      client.get("/admin/secrets",
+                                 headers=auth("km-secret")),
+                      client.post("/admin/secrets",
+                                  headers=auth("km-secret"),
+                                  json={"name": "K", "value": "v"})):
                 assert r.status_code == 403, r.text
                 assert r.json()["error"]["code"] == "rbac_forbidden"
     finally:

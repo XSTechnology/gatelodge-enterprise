@@ -332,8 +332,13 @@ def test_real_http_export_to_receiver(wired, gguf, monkeypatch):  # noqa: F811
         post = _Receiver.posts[-1]
         assert post["path"] == "/v1/traces"
         assert post["ctype"] == "application/json"
-        spans = post["body"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
-        assert any(s["kind"] == 2 for s in spans)
+        # v2.6 (GL-R24): exports drain OUTSIDE the buffer lock in
+        # batches — a single request's spans can span multiple POSTs.
+        # The server span (kind 2) must be in SOME chunk.
+        all_spans = [s for p in _Receiver.posts
+                     for s in p["body"]["resourceSpans"][0]
+                     ["scopeSpans"][0]["spans"]]
+        assert any(s["kind"] == 2 for s in all_spans)
         assert tracing.status()["spans_exported"] > 0
     finally:
         srv.shutdown()

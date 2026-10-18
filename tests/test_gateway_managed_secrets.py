@@ -130,12 +130,14 @@ def test_audit_records_name_only(wired, gguf):
 
 
 def test_key_manager_role_can_set(wired, gguf):
-    """RBAC: key_manager (the credential-steward role) may set/remove
-    provider credentials; ops_readonly may not."""
+    """RBAC (v2.6/GL-R14): key_manager may NOT touch provider
+    credentials anymore — secret_manager owns them; ops_readonly
+    may not either."""
     wired(_km_config(gguf))
     with TestClient(gw_app.app) as client:
         r = client.post("/admin/secrets", headers=KM,
                         json={"name": "GROQ_API_KEY", "value": "km-set"})
-        assert r.status_code == 200, r.text
+        assert r.status_code == 403, r.text
+        assert r.json()["error"]["code"] == "rbac_forbidden"
         r2 = client.get("/admin/secrets", headers=KM)
-        assert r2.status_code == 200
+        assert r2.status_code == 403

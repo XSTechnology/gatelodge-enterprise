@@ -25,7 +25,10 @@ it later is a table edit):
                   exposes all key material)
     key_manager   virtual-key CRUD + the reads the console keys pane
                   needs; NOT /admin/gateway-keys (minting admin keys
-                  is full_admin only)
+                  is full_admin only); NOT /admin/secrets (v2.6:
+                  provider credentials are secret_manager's duty)
+    secret_manager  provider-credential management (console-pasted
+                  cloud keys) — v2.6 split from key_manager (GL-R14)
 
 Unknown role names FAIL CLOSED (no /admin access) with a parse-time
 warning. Serving surface (/v1/*) is not RBAC's business — consumers
@@ -58,20 +61,28 @@ ROLES: dict[str, list[Rule]] = {
         ("deny", "GET", "/admin/config"),   # raw text = key material
         ("allow", "GET", "/admin/*"),
     ],
+    # v2.6 (GL-R14): provider-credential management is its own duty —
+    # key_manager keeps consumer-key CRUD only. A role that mints
+    # consumer keys must not also rotate cloud credentials.
     "key_manager": [
         ("allow", "GET", "/admin/keys"),
         ("allow", "POST", "/admin/keys"),
         ("allow", "GET", "/admin/stats"),
+    ],
+    "secret_manager": [
         ("allow", "GET", "/admin/secrets"),
-        ("allow", "POST", "/admin/secrets"),  # v2.2.1: console-pasted provider credentials
+        ("allow", "POST", "/admin/secrets"),  # console-pasted provider credentials
     ],
 }
 
 
 def _path_match(pattern: str, path: str) -> bool:
-    """Exact path, or prefix when the pattern ends with "/*"."""
+    """Exact path, or prefix when the pattern ends with "/*" — via the
+    shared SEGMENT-AWARE matcher (GL-R18): "/admin/*" matches
+    "/admin/keys" but never "/administrator"."""
+    from .auth import path_scope
     if pattern.endswith("/*"):
-        return path.startswith(pattern[:-2])
+        return path_scope(pattern[:-2], path)
     return pattern == path
 
 
@@ -182,18 +193,22 @@ class AdminRoleMap:
 
     def role_for(self, cfg, token: str) -> str:
         """The role assigned to this bearer token; '' when unassigned
-        (the caller applies DEFAULT_ROLE). Matching mirrors the core's
-        gateway_keys resolution: plaintext equality, or constant-time
-        hash comparison for 64-hex entries."""
+        (the caller applies DEFAULT_ROLE). v2.6 (GL-R07 follow-up):
+        HASH-ONLY — 64-hex entries match sha256(presented token)
+        constant-time; plaintext entries compare constant-time and are
+        migrated to hashes at startup (app._migrate_plaintext_keys) so
+        the plaintext leaves the config file. Presenting a stored hash
+        does NOT match."""
         self.refresh(cfg)
         if not token or not self._entries:
             return ""
         token_hash = _sha256_hex(token)
         for e in self._entries:
             k = e["key"]
-            if k == token:
-                return e["role"]
             if len(k) == 64 and hmac.compare_digest(k, token_hash):
+                return e["role"]
+            if len(k) != 64 and hmac.compare_digest(k, token):
+                # legacy plaintext entry (migrated at startup)
                 return e["role"]
         return ""
 
