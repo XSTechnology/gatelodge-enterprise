@@ -56,6 +56,7 @@ import hashlib
 import hmac
 import logging
 import re
+import secrets
 import time
 import urllib.parse
 from typing import Any, Callable
@@ -107,6 +108,21 @@ def session_id_from_header(request: Request) -> str:
 
 def _sha256_hex(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ── internal self-call bearer (v2.5.1) ────────────────────────────────────
+# A per-process random token for the gateway's OWN loopback calls (the
+# anthropic shim self-calls /v1). Never written to disk or config,
+# never exposed by any endpoint — it exists only in process memory for
+# the few seconds a self-call lives. Resolves to the principal
+# "internal": a CONSUMER-grade identity (never admin), so the shim no
+# longer depends on gateway_keys — which v2.5.1 migrates to
+# hashed-at-rest.
+_INTERNAL_BEARER = secrets.token_hex(32)
+
+
+def _is_hex64(s: str) -> bool:
+    return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
 
 
 # ── URL-token auth (v2.x) ──────────────────────────────────────────────────
@@ -194,17 +210,29 @@ def resolve_key_link(cfg, request: Request, key_id: str) -> JSONResponse | None:
 
 
 def _resolve_bearer(cfg, token: str) -> str:
-    """Bearer token → key_id: 'admin' for gateway_keys (plaintext OR
-    sha256-hex form), the api_keys id for a virtual key (hash compared,
-    constant-time). '' when unknown."""
+    """Bearer token → key_id: 'admin' for gateway_keys (hashed-at-rest
+    sha256 OR legacy plaintext), the api_keys id for a virtual key
+    (hash compared, constant-time), 'internal' for the gateway's own
+    loopback self-call bearer. '' when unknown.
+
+    v2.5.1 (GL-R07): a 64-hex gateway_keys entry is a HASH — only the
+    sha256 of the presented token matches it. Presenting the stored
+    hash itself (a file-reader's only move) does NOT authenticate.
+    Legacy plaintext entries compare constant-time (hmac, not ==) and
+    are migrated to hashes at startup (app._migrate_plaintext_keys)."""
     if not token:
         return ""
+    if token == _INTERNAL_BEARER:
+        return "internal"          # consumer-grade; never admin
     token_hash = _sha256_hex(token)
     for k in (cfg.gateway_keys or []):
         k = str(k)
-        if k == token:
-            return "admin"
-        if len(k) == 64 and hmac.compare_digest(k, token_hash):
+        if _is_hex64(k):
+            # hashed-at-rest: ONLY the digest of the presented token
+            if hmac.compare_digest(k, token_hash):
+                return "admin"
+        elif hmac.compare_digest(k, token):
+            # legacy plaintext entry (migrated at startup)
             return "admin"
     for entry in (cfg.api_keys or {}).values():
         if hmac.compare_digest(str(entry.get("key_hash") or ""),

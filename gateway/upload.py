@@ -71,11 +71,18 @@ def receiver_url(pod_id: str, path: str = "") -> str:
 
 # ── the receiver (stdlib-only python; NO single quotes — it is embedded
 #    in a single-quoted sh printf) ───────────────────────────────────────────
+# v2.5.1 (GL-R02): every endpoint except /health requires the session
+# token (Authorization: Bearer … or ?t=…) — the gateway generates it at
+# receiver deploy and passes it via the pod env GW_UPLOAD_TOKEN. /list
+# is GONE (the gateway polls /status/<name>); /status also reports the
+# sha256 sidecar when the bootstrap wrote one, so finalize can verify
+# content, not just size.
 
 _RECEIVER_PY = '''
-import os, json
+import hashlib, json, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 D = "/workspace/uploads"
+TOKEN = os.environ.get("GW_UPLOAD_TOKEN", "")
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body=b""):
         self.send_response(code)
@@ -84,19 +91,27 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         if body:
             self.wfile.write(body)
+    def _authed(self):
+        if not TOKEN:
+            return False
+        h = self.headers.get("Authorization") or ""
+        if h == "Bearer " + TOKEN:
+            return True
+        q = self.path.split("?", 1)
+        if len(q) == 2 and ("t=" + TOKEN) in q[1]:
+            return True
+        return False
     def do_GET(self):
         try:
-            if self.path == "/health":
+            if self.path.split("?")[0] == "/health":
                 self._send(200, b"{\\"ok\\": true}")
-            elif self.path == "/list":
-                out = []
-                if os.path.isdir(D):
-                    for n in os.listdir(D):
-                        out.append({"name": n,
-                                    "size": os.path.getsize(os.path.join(D, n))})
-                self._send(200, json.dumps({"files": out}).encode())
-            elif self.path.startswith("/status/"):
-                n = os.path.basename(self.path[8:])
+                return
+            if not self._authed():
+                self._send(403, b"{\\"error\\": \\"token required\\"}")
+                return
+            path = self.path.split("?")[0]
+            if path.startswith("/status/"):
+                n = os.path.basename(path[8:])
                 p = os.path.join(D, n)
                 part = p + ".part"
                 if os.path.exists(p):
@@ -105,9 +120,17 @@ class H(BaseHTTPRequestHandler):
                     sz = os.path.getsize(part)
                 else:
                     sz = -1
-                self._send(200, json.dumps({"name": n, "size": sz}).encode())
-            elif self.path.startswith("/file/"):
-                n = os.path.basename(self.path[6:])
+                sha = ""
+                sp = p + ".sha256"
+                if os.path.exists(sp):
+                    try:
+                        sha = open(sp).read().strip()
+                    except Exception:
+                        sha = ""
+                self._send(200, json.dumps(
+                    {"name": n, "size": sz, "sha256": sha}).encode())
+            elif path.startswith("/file/"):
+                n = os.path.basename(path[6:])
                 p = os.path.join(D, n)
                 if not os.path.exists(p):
                     self._send(404)
@@ -127,7 +150,10 @@ class H(BaseHTTPRequestHandler):
             self._send(500, str(e).encode())
     def do_PUT(self):
         try:
-            n = os.path.basename(self.path.lstrip("/"))
+            if not self._authed():
+                self._send(403, b"{\\"error\\": \\"token required\\"}")
+                return
+            n = os.path.basename(self.path.lstrip("/").split("?")[0])
             if not n or n in (".", ".."):
                 self._send(400)
                 return
@@ -161,6 +187,15 @@ ThreadingHTTPServer(("0.0.0.0", 8081), H).serve_forever()
 '''
 
 
+def _new_upload_token() -> str:
+    """Per-receiver-session token (GL-R02): the gateway generates it,
+    passes it to the pod via env, and shares it with the uploading
+    console via the init response. Anyone who can reach the pod proxy
+    URL but not the token gets 403 on everything but /health."""
+    import secrets
+    return secrets.token_hex(24)
+
+
 def receiver_script() -> str:
     """One-line sh: write the receiver to disk and run it foreground
     (the container lives exactly as long as the receiver serves)."""
@@ -169,24 +204,30 @@ def receiver_script() -> str:
             "exec python3 /root/receiver.py")
 
 
-def bootstrap_script(file_url: str, filename: str) -> str:
+def bootstrap_script() -> str:
     """Receiver in the BACKGROUND + a foreground curl that downloads
-    the model onto the volume. The receiver's /list is the 'done'
-    signal (file at the expected size) — the gateway polls it, then
-    terminates this pod. sleep infinity keeps the container alive
-    until then."""
+    the model onto the volume. v2.5.1 (GL-R03): the URL and filename
+    travel via POD ENV ($FILE_URL / $FILENAME) — nothing dynamic is
+    interpolated into the sh text, so a hostile catalog entry cannot
+    break out of quoting. After the download, the sha256 sidecar is
+    written so /status (the gateway's done-signal) reports content,
+    not just size. sleep infinity keeps the container alive until the
+    gateway terminates the pod."""
     return ("set -e; mkdir -p /workspace/uploads; "
             "printf '%s' '" + _RECEIVER_PY + "' > /root/receiver.py; "
             "python3 /root/receiver.py > /root/receiver.log 2>&1 & "
-            f"echo '[boot] downloading {filename}'; "
-            f"curl -fsSL --retry 3 --max-time 5400 "
-            f"-o \"/workspace/uploads/{filename}\" '{file_url}'; "
+            "echo '[boot] downloading ' \"$FILENAME\"; "
+            "curl -fsSL --retry 3 --max-time 5400 "
+            "-o \"/workspace/uploads/$FILENAME\" \"$FILE_URL\"; "
+            "sha256sum \"/workspace/uploads/$FILENAME\" "
+            "| cut -d ' ' -f 1 "
+            "> \"/workspace/uploads/$FILENAME.sha256\"; "
             "echo '[boot] download done'; "
             "sleep infinity")
 
 
 def receiver_spec(gpu_id: str, size_bytes: int,
-                  volume_id: str = "") -> dict[str, Any]:
+                  volume_id: str = "", token: str = "") -> dict[str, Any]:
     disk = max(20, int(size_bytes / 1e9 * 1.2) + 10)
     spec: dict[str, Any] = {
         "image": RECEIVER_IMAGE,
@@ -194,10 +235,14 @@ def receiver_spec(gpu_id: str, size_bytes: int,
         "docker_entrypoint": ["sh", "-c"],
         "docker_script": receiver_script(),
         "ports": "8081/http", "port": RECEIVER_PORT,
+        # GL-R02: the session token reaches the receiver via env —
+        # never in the script text, never in a URL the proxy logs.
+        "env": {"GW_UPLOAD_TOKEN": token},
         "container_disk_gb": disk, "start_timeout_s": 600,
         "idle_stop_s": 1800, "idle_terminate_s": 0,
         "alias": RECEIVER_MODEL, "custom": True,
         "source_file": "upload-receiver",
+        "upload_token": token,
     }
     if volume_id:
         spec["volume_id"] = volume_id
@@ -205,17 +250,22 @@ def receiver_spec(gpu_id: str, size_bytes: int,
 
 
 def bootstrap_spec(gpu_id: str, file_url: str, filename: str,
-                   volume_id: str, data_center_id: str = "") -> dict[str, Any]:
+                   volume_id: str, data_center_id: str = "",
+                   token: str = "") -> dict[str, Any]:
     """Receiver + background-download pod writing onto the VOLUME (the
     file must persist after this pod dies — container disk would not).
     DC-pinned to the volume's data center (network volumes are
-    DC-bound; a helper pod in another DC cannot mount it)."""
+    DC-bound; a helper pod in another DC cannot mount it). v2.5.1: the
+    URL/filename/token travel via pod ENV (GL-R03/R02) — the sh text
+    is a fixed string."""
     spec: dict[str, Any] = {
         "image": RECEIVER_IMAGE,
         "gpu_type_ids": [gpu_id], "gpu_count": 1,
         "docker_entrypoint": ["sh", "-c"],
-        "docker_script": bootstrap_script(file_url, filename),
+        "docker_script": bootstrap_script(),
         "ports": "8081/http", "port": RECEIVER_PORT,
+        "env": {"FILE_URL": file_url, "FILENAME": filename,
+                "GW_UPLOAD_TOKEN": token},
         "container_disk_gb": 20, "start_timeout_s": 600,
         "idle_stop_s": 1800, "idle_terminate_s": 0,
         "alias": BOOTSTRAP_MODEL, "custom": True,
@@ -280,63 +330,100 @@ async def _deploy_helper(cfg, backend: str, model_key: str,
 
 async def init_receiver(cfg, backend: str, size_bytes: int,
                         volume_id: str = "") -> dict[str, Any]:
-    """A healthy receiver pod_id — reused when possible, else deployed
-    on the cheapest GPU. Raises UploadError when the receiver never
-    becomes healthy (the config entry stays: the watchdog's never-
-    healthy reaper stops a broken boot, idle-stop reaps an idle one)."""
+    """A healthy receiver pod_id + its session token — reused when
+    possible, else deployed on the cheapest GPU. The token is
+    generated per receiver deployment, passed to the pod via env, and
+    persisted in the config entry (so a reused receiver keeps its
+    token across gateway restarts). Raises UploadError when the
+    receiver never becomes healthy (the config entry stays: the
+    watchdog's never-healthy reaper stops a broken boot, idle-stop
+    reaps an idle one)."""
     models = (cfg.backends.get(backend) or {}).get("models") or {}
     existing = models.get(RECEIVER_MODEL) or {}
     old_pod = str(existing.get("pod_id") or "").strip()
-    if old_pod and await probe_receiver(old_pod):
-        return {"pod_id": old_pod, "reused": True}
+    old_token = str(existing.get("upload_token") or "").strip()
+    if old_pod and old_token and await probe_receiver(old_pod):
+        return {"pod_id": old_pod, "upload_token": old_token,
+                "reused": True}
 
     env = ((cfg.backends.get(backend) or {}).get("api_key_env")
            or "RUNPOD_API_KEY")
     opts = await catalog.live_options(env)
     gpu = _cheapest_gpu(opts)
-    spec = receiver_spec(gpu["id"], size_bytes, volume_id)
+    token = _new_upload_token()
+    spec = receiver_spec(gpu["id"], size_bytes, volume_id, token=token)
     pod_id = await _deploy_helper(cfg, backend, RECEIVER_MODEL, spec)
     t0 = time.monotonic()
     while time.monotonic() - t0 < RECEIVER_READY_TIMEOUT_S:
         if await probe_receiver(pod_id):
-            return {"pod_id": pod_id, "reused": False}
+            return {"pod_id": pod_id, "upload_token": token,
+                    "reused": False}
         await asyncio.sleep(5.0)
     raise UploadError(f"receiver pod {pod_id} not healthy after "
                       f"{RECEIVER_READY_TIMEOUT_S:.0f}s (it stays in the "
                       "servers widget; the watchdog reaps it)")
 
 
-async def receiver_status(pod_id: str, filename: str) -> dict[str, Any]:
-    """Bytes received for a file (-1 = nothing yet)."""
+async def receiver_status(pod_id: str, filename: str,
+                          token: str = "") -> dict[str, Any]:
+    """Bytes received for a file (-1 = nothing yet) + the sha256
+    sidecar when the bootstrap wrote one. Token-authenticated."""
     from urllib.parse import quote
     async with httpx.AsyncClient(timeout=10.0) as c:
-        r = await c.get(receiver_url(pod_id, "status/" + quote(filename)))
+        r = await c.get(receiver_url(pod_id, "status/" + quote(filename)),
+                        headers={"Authorization": f"Bearer {token}"})
         r.raise_for_status()
         return r.json()
 
 
-async def receiver_list(pod_id: str) -> list[dict[str, Any]]:
-    """Files the receiver sees in /workspace/uploads (bootstrap's
-    done-signal)."""
-    async with httpx.AsyncClient(timeout=10.0) as c:
-        r = await c.get(receiver_url(pod_id, "list"))
-        r.raise_for_status()
-        return (r.json() or {}).get("files") or []
+# gateway-computed relay hashes (GL-R02): the PUT relay sees every
+# byte, so it records the actual sha256 per (pod, filename) — finalize
+# verifies content for browser uploads without a pod-side pass.
+_RELAY_HASHES: dict[str, str] = {}
 
 
-async def finalize(pod_id: str, filename: str,
-                   size_bytes: int) -> dict[str, Any]:
-    """Verify the uploaded size and hand back the deployable URL."""
-    st = await receiver_status(pod_id, filename)
+def remember_relay_hash(pod_id: str, filename: str, sha256: str) -> None:
+    _RELAY_HASHES[f"{pod_id}/{filename}"] = sha256
+
+
+def relay_hash(pod_id: str, filename: str) -> str:
+    return _RELAY_HASHES.get(f"{pod_id}/{filename}", "")
+
+
+async def finalize(pod_id: str, filename: str, size_bytes: int,
+                   token: str = "", expect_sha256: str = "") -> dict[str, Any]:
+    """Verify the uploaded size AND content (GL-R02): the actual
+    sha256 comes from the receiver's sidecar (bootstrap downloads) or
+    the gateway's relay hash (browser uploads). A provided
+    expect_sha256 must match — same-size replacement poisoning fails
+    here. Returns the deployable URL (the token rides as ?t= — the
+    URL is the capability the model pod curls)."""
+    st = await receiver_status(pod_id, filename, token)
     got = int(st.get("size") or -1)
     if got != size_bytes:
         raise UploadError(f"size mismatch: receiver has {got} bytes, "
                           f"expected {size_bytes}")
+    actual = str(st.get("sha256") or "") or relay_hash(pod_id, filename)
+    if expect_sha256:
+        if not actual:
+            raise UploadError("no sha256 available for the uploaded "
+                              "file (relay hash missing) — cannot "
+                              "verify content")
+        if actual.lower() != expect_sha256.lower():
+            raise UploadError(f"sha256 mismatch: got {actual[:16]}…, "
+                              "expected "
+                              f"{expect_sha256[:16]}… — the file may "
+                              "have been replaced")
     from urllib.parse import quote
+    from urllib.parse import urlencode
+    file_url = receiver_url(pod_id, "file/" + quote(filename))
+    if token:
+        file_url += "?" + urlencode({"t": token})
     return {"pod_id": pod_id, "filename": filename,
             "size_bytes": got,
             "size_gb": round(got / 1e9, 2),
-            "file_url": receiver_url(pod_id, "file/" + quote(filename)),
+            "sha256": actual,
+            "file_url": file_url,
             "source": "upload"}
 
 
@@ -379,15 +466,19 @@ async def cleanup_receiver(cfg, backend: str) -> dict[str, Any]:
 async def bootstrap_download(cfg, backend: str, file_url: str,
                              filename: str, size_bytes: int,
                              volume_id: str,
+                             sha256: str = "",
                              timeout_s: float = 3600.0) -> dict[str, Any]:
     """Download a repo file ONTO THE VOLUME via a temporary bootstrap
     pod (receiver in the background + curl in the foreground). The
-    receiver's /list is the done-signal; the pod is terminated on
-    success AND failure. Returns {filename, size_bytes, volume_id}.
-    GPU: price-ascending retry — the globally cheapest GPU often has
-    no instances in the volume's DC (E2E-proven), so walk the list."""
+    receiver's /status/<name> (size + sha256 sidecar) is the
+    done-signal; the pod is terminated on success AND failure. An
+    optional expected sha256 is verified before success is reported
+    (GL-R02/R25) — a same-size replacement fails. Returns {filename,
+    size_bytes, volume_id, sha256}."""
     env = ((cfg.backends.get(backend) or {}).get("api_key_env")
            or "RUNPOD_API_KEY")
+    # the bootstrap receiver shares the upload-session token posture
+    token = _new_upload_token()
     # volume's DC (network volumes are DC-bound)
     try:
         vols = await runpod.list_volumes(env)
@@ -410,7 +501,7 @@ async def bootstrap_download(cfg, backend: str, file_url: str,
     last_err = ""
     for _, gpu_id in priced:
         spec = bootstrap_spec(gpu_id, file_url, filename, volume_id,
-                              vol_dc)
+                              vol_dc, token=token)
         try:
             pod_id = await _deploy_helper(cfg, backend, BOOTSTRAP_MODEL,
                                           spec)
@@ -427,12 +518,20 @@ async def bootstrap_download(cfg, backend: str, file_url: str,
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout_s:
             try:
-                for f in await receiver_list(pod_id):
-                    if (f.get("name") == filename
-                            and int(f.get("size") or 0) >= size_bytes):
-                        return {"filename": filename,
-                                "size_bytes": size_bytes,
-                                "volume_id": volume_id}
+                st = await receiver_status(pod_id, filename, token)
+                if int(st.get("size") or -1) >= size_bytes:
+                    actual = str(st.get("sha256") or "")
+                    if sha256 and actual \
+                            and actual.lower() != sha256.lower():
+                        raise UploadError(
+                            f"sha256 mismatch after download: got "
+                            f"{actual[:16]}…, expected {sha256[:16]}…")
+                    return {"filename": filename,
+                            "size_bytes": size_bytes,
+                            "volume_id": volume_id,
+                            "sha256": actual or sha256}
+            except UploadError:
+                raise
             except Exception:  # noqa: BLE001 — poll is best-effort
                 pass
             await asyncio.sleep(10.0)

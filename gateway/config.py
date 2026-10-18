@@ -404,6 +404,11 @@ def _normalize_backends(raw: Any) -> dict[str, dict[str, Any]]:
                                if isinstance(m.get("env") or {}, dict) else {},
                         "alias": str(m.get("alias") or mname).strip() or mname,
                         "pod_id": str(m.get("pod_id") or "").strip(),
+                        # v2.5.1 upload receiver: the per-session token
+                        # persists with the pod spec so a REUSED receiver
+                        # keeps its session across gateway restarts
+                        "upload_token": str(
+                            m.get("upload_token") or "").strip(),
                         "start_timeout_s": _num("start_timeout_s", 600),
                         "idle_stop_s": _num("idle_stop_s", 0),
                         "idle_terminate_s": _num("idle_terminate_s", 0),

@@ -1771,8 +1771,14 @@ def test_config_audit_trail(wired, gguf):
         actions = [e["action"] for e in r.json()["audit"]]
         assert actions[0] == "model-upsert groq:m1"  # newest first
         assert actions[1] == "api-key-create audited"
-        # every entry records WHO (the admin key)
-        assert all(e["key"] == "admin" for e in r.json()["audit"])
+        # every OPERATOR entry records WHO (the admin key); the boot
+        # key-hash migration (v2.5.1) audits itself as (open) — no
+        # request is in flight at startup
+        ops = [e for e in r.json()["audit"]
+               if not e["action"].startswith("key-hash-migration")]
+        assert all(e["key"] == "admin" for e in ops)
+        assert any(e["action"].startswith("key-hash-migration")
+                   for e in r.json()["audit"])
 
 
 def test_network_retry_once(wired, gguf, monkeypatch):

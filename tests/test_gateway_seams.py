@@ -18,6 +18,7 @@ from gateway.storage import InMemoryStorage, reset_storage, set_storage
 # shared fixtures/helpers (same directory; pytest inserts it in sys.path)
 from test_gateway_stage3 import (gguf, wired, _config, _patch_cloud,  # noqa: F401
                                  _FakeCloud, _secured_config)
+from test_gateway_rbac import auth  # noqa: F401
 
 
 class RecordingStorage(InMemoryStorage):
@@ -273,8 +274,8 @@ def test_extra_router_additive_two_surfaces(wired, gguf):
     def _mcp_hello():
         return {"surface": "mcp"}
 
-    gw_app.add_extra_router(r2, prefix="/mcp")
-    gw_app.add_extra_router(r2, prefix="/mcp")   # idempotent re-mount
+    gw_app.add_extra_router(r2, prefix="/mcp", auth="owned")
+    gw_app.add_extra_router(r2, prefix="/mcp", auth="owned")  # idempotent
     try:
         with TestClient(gw_app.app) as client:
             assert client.get("/probe/hello").status_code == 200
@@ -293,10 +294,48 @@ def test_extra_router_additive_alone(wired, gguf):
     the None cleanup still removes it (the mark is recorded on first
     additive mount too)."""
     wired(_secured_config(gguf))
-    gw_app.add_extra_router(_probe_router(), prefix="/solo")
+    gw_app.add_extra_router(_probe_router(), prefix="/solo", auth="owned")
     try:
         with TestClient(gw_app.app) as client:
             assert client.get("/solo/hello").status_code == 200
     finally:
         gw_app.set_extra_router(None, prefix="/solo")
         assert "/solo" not in gw_app._EXTRA_ROUTER_PREFIXES
+
+
+def test_extra_router_requires_auth_declaration(wired, gguf):
+    """GL-R16: an undeclared auth is a startup FAILURE, not a silent
+    exposure — and auth='admin' gets the CORE gate chain (resolve →
+    RBAC → admin gate), byte-identical to /admin itself."""
+    from fastapi import APIRouter
+    wired(_secured_config(gguf))
+    # undeclared → refuse to mount
+    try:
+        gw_app.add_extra_router(_probe_router(), prefix="/oops")
+        assert False, "undeclared auth must raise"
+    except RuntimeError as e:
+        assert "auth must be declared" in str(e)
+    # invalid value → refuse
+    try:
+        gw_app.add_extra_router(_probe_router(), prefix="/oops",
+                                auth="maybe")
+        assert False, "invalid auth must raise"
+    except RuntimeError:
+        pass
+    # auth='admin': the CORE enforces the admin gate on the prefix
+    r = APIRouter()
+
+    @r.get("/stats")
+    def _stats():
+        return {"surface": "core-gated"}
+
+    gw_app.add_extra_router(r, prefix="/ext-admin", auth="admin")
+    try:
+        with TestClient(gw_app.app) as client:
+            # no bearer → 401 (the core admin gate's exact behavior)
+            assert client.get("/ext-admin/stats").status_code == 401
+            # a valid admin key passes — the router needed no guard
+            assert client.get("/ext-admin/stats", headers=auth(
+                "admin-secret")).status_code == 200
+    finally:
+        gw_app.set_extra_router(None, prefix="/ext-admin")

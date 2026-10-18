@@ -143,7 +143,11 @@ def test_messages_upstream_error(wired, tmp_path, monkeypatch):
             "model": "m", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 502
     assert r.json()["error"]["type"] == "api_error"
-    assert "boom" in r.json()["error"]["message"]
+    # GL-R15 (v2.5.1): the exception DETAIL never reaches the client —
+    # internal endpoints/URLs can ride exception strings. The class
+    # does; 'boom' does not.
+    assert "boom" not in r.json()["error"]["message"]
+    assert r.json()["error"]["message"] == "Upstream error"
 
 
 # ── streaming ──────────────────────────────────────────────────────────────

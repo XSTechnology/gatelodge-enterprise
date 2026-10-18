@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,11 @@ import httpx
 from openai import (APIConnectionError, APITimeoutError, AsyncOpenAI)
 
 logger = logging.getLogger(__name__)
+
+# shell metacharacters that force the legacy shell=True path for
+# api_key_cmd (GL-R04): pipes/redirects/;/$/backticks — the argv form
+# handles everything else safely.
+_SHELL_META = re.compile(r"[|;&<>$`\\]")
 
 # Cloud-side max_tokens cap (design decision — mirrors the assistant's
 # LLMClient). Only caps when the client sent one; omitted stays omitted.
@@ -166,8 +172,25 @@ def resolve_backend_key(backend: dict[str, Any]) -> str:
     if cmd:
         try:
             import subprocess
-            out = subprocess.run(  # noqa: S603 — operator-configured command
-                cmd, shell=True, capture_output=True, text=True, timeout=15)
+            # v2.5.1 (GL-R04): argv execution by default — no shell.
+            # Shell metacharacters (pipes for `pass | head` style
+            # fetchers) fall back to shell=True with a loud warning:
+            # the command rides operator-trusted config, but argv is
+            # the safe default for the common single-command case.
+            import shlex
+            if _SHELL_META.search(cmd):
+                logger.warning(
+                    "api_key_cmd for %s uses shell metacharacters — "
+                    "executing via shell (legacy form). Prefer a single "
+                    "command; the argv form needs no shell.",
+                    backend.get("api_key_env") or "?")
+                out = subprocess.run(  # noqa: S603 — operator-configured
+                    cmd, shell=True, capture_output=True, text=True,
+                    timeout=15)
+            else:
+                out = subprocess.run(  # noqa: S603 — operator-configured
+                    shlex.split(cmd), shell=False, capture_output=True,
+                    text=True, timeout=15)
             stdout = (out.stdout or "").strip()
             if stdout:
                 return stdout.splitlines()[0].strip()
