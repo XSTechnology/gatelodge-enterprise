@@ -1,7 +1,12 @@
 """Redeploy portal as task-portal:3 (launch sets next_run_at + run-again)."""
 import paramiko
 
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+# SECURITY (review fix): SSH credentials removed from source. And ROTATE
+# the server password -- git history still contains the old literal.
+import os
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = os.environ["GK_SSH_PASSWORD"]
 FORK = r"C:\Users\dlang\Workspace\gatelodge_enterprise"
 
 cli = paramiko.SSHClient()

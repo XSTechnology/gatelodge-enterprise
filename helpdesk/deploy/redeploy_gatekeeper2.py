@@ -5,7 +5,12 @@ from pathlib import Path
 
 import paramiko
 
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+# SECURITY (review fix): SSH credentials removed from source. And ROTATE
+# the server password -- git history still contains the old literal.
+import os
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = os.environ["GK_SSH_PASSWORD"]
 TMP = Path(r"C:\Users\dlang\AppData\Local\Temp\workshop_"
            r"833c5d6b-9aa2-4380-a63b-7c740c69a0e5")
 FORK = Path(r"C:\Users\dlang\Workspace\gatelodge_enterprise")

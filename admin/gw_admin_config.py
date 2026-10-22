@@ -1,11 +1,17 @@
 """Raise the gateway groq backend max_tokens_cap 800 -> 3000 via
 PUT /admin/config (the gateway's own config store, audited)."""
+import os
+
 import paramiko
 
-PW = "@231Garton"
+# SECURITY (review fix): credential removed from source -- env only, and
+# ROTATE the server password (git history retains the old literal).
+PW = os.environ["GK_SSH_PASSWORD"]
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect("10.1.2.217", username="coolify", password=PW, timeout=15)
+ssh.connect(os.environ.get("GK_SSH_HOST", "10.1.2.217"),
+            username=os.environ.get("GK_SSH_USER", "coolify"),
+            password=PW, timeout=15)
 
 PROBE = r'''
 import json, os, httpx

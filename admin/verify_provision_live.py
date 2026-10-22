@@ -1,5 +1,6 @@
 """Live E2E: provision a client in the Lodge Office, sign into the
 portal with the generated key, pause blocks login, then clean up."""
+import os
 import re
 import sys
 import httpx
@@ -8,7 +9,9 @@ import paramiko
 LO = "http://10.1.2.217:8111"
 PORTAL = "https://portal.datagatelodge.com"
 CREDS = r"C:\Users\dlang\Workspace\gateway_secrets\gatekeeper-credentials.txt"
-PW = "@231Garton"
+# SECURITY (review fix): credential removed from source -- env only, and
+# ROTATE the server password (git history retains the old literal).
+PW = os.environ["GK_SSH_PASSWORD"]
 
 admin = ""
 for line in open(CREDS, encoding="utf-8", errors="replace"):

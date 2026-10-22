@@ -7,6 +7,9 @@
  *   2. Set the worker's secrets/env:
  *        WEBHOOK_URL  = https://chat.datagatelodge.com/api/email/inbound
  *        INBOUND_KEY  = the INBOUND_KEY env on the gatekeeper container
+ *        FALLBACK_MAILBOX (optional, recommended) = a human-monitored
+ *            mailbox that receives the raw email when the webhook fails,
+ *            so backend downtime never silently drops support mail.
  *   3. In Cloudflare Email Routing (datagatelodge.com), change the
  *      support@ rule from "forward to sales@xs.technology" to
  *      "send to worker gatelodge-mail". The catch-all can stay as-is
@@ -19,7 +22,7 @@ export default {
   async email(message, env, ctx) {
     const raw = await new Response(message.raw).text();
     try {
-      await fetch(env.WEBHOOK_URL, {
+      const resp = await fetch(env.WEBHOOK_URL, {
         method: "POST",
         headers: {
           "Authorization": "Bearer " + env.INBOUND_KEY,
@@ -30,8 +33,21 @@ export default {
           raw: raw.slice(0, 50000),
         }),
       });
+      // REVIEW FIX: fetch only rejects on network errors -- a non-2xx
+      // (backend down, auth rejected) used to be silently swallowed, and
+      // routed support mail was consumed with no trace anywhere.
+      if (!resp.ok) {
+        throw new Error("gatekeeper webhook HTTP " + resp.status);
+      }
     } catch (e) {
       console.error("gatekeeper webhook failed", e);
+      // REVIEW FIX: don't lose the mail -- fall back to forwarding it to
+      // a human-monitored mailbox when FALLBACK_MAILBOX is configured,
+      // so a backend outage degrades to slower human handling instead
+      // of silent loss.
+      if (env.FALLBACK_MAILBOX) {
+        await message.forward(env.FALLBACK_MAILBOX);
+      }
     }
   },
 };

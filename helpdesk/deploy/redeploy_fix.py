@@ -1,11 +1,23 @@
-"""Redeploy fix: groq-named license + create-connect-start ordering."""
+"""Redeploy fix: groq-named license + create-connect-start ordering.
+
+SECURITY (review finding): hardcoded SSH credentials removed -- see
+fix_gk5.py's note. Env/keyring only; rotate the server password.
+"""
+import os
+import re
 import sys
 from pathlib import Path
 
 import keyring
 import paramiko
 
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = (os.environ.get("GK_SSH_PASSWORD")
+      or keyring.get_password("gatelodge", "ssh_password"))
+if not PW:
+    raise SystemExit("Set GK_SSH_PASSWORD (or keyring 'gatelodge'/"
+                     "'ssh_password') -- credentials are no longer in source.")
 TMP = Path(r"C:\Users\dlang\AppData\Local\Temp\workshop_"
            r"833c5d6b-9aa2-4380-a63b-7c740c69a0e5")
 FORK = Path(r"C:\Users\dlang\Workspace\gatelodge_enterprise")

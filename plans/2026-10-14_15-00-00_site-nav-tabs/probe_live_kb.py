@@ -1,7 +1,12 @@
 """Probe the live gatekeeper container: image, baked KB docs, catalog."""
 import paramiko
 
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+# SECURITY (review fix): SSH credentials removed from source. And ROTATE
+# the server password -- git history still contains the old literal.
+import os
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = os.environ["GK_SSH_PASSWORD"]
 
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
