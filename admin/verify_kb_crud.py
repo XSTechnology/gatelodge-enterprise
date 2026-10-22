@@ -5,7 +5,12 @@ import paramiko
 
 LODGE = "http://10.1.2.217:8111"
 CRED = r"C:\Users\dlang\Workspace\gateway_secrets\gatekeeper-credentials.txt"
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+# SECURITY (review fix): SSH credentials removed from source. And ROTATE
+# the server password -- git history still contains the old literal.
+import os
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = os.environ["GK_SSH_PASSWORD"]
 NAME = "verify-crud-test"
 
 

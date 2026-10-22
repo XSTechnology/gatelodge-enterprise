@@ -6,7 +6,12 @@ import keyring
 
 import paramiko
 
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+# SECURITY (review fix): SSH credentials removed from source. And ROTATE
+# the server password -- git history still contains the old literal.
+import os
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = os.environ["GK_SSH_PASSWORD"]
 FORK = pathlib.Path(r"C:\Users\dlang\Workspace\gatelodge_enterprise")
 ZONE = "c8636bf700c64992db3261d2ff010d24"          # datagatelodge.com
 TUNNEL_CNAME = "2107a01d.cfargotunnel.com"          # vm-rehearsal

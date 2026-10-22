@@ -1,12 +1,29 @@
 """Fix: recreate gatekeeper:5 with explicit env (env-carry broke because
-docker inspect ran after docker rm)."""
+docker inspect ran after docker rm).
+
+SECURITY (review finding): this file previously hardcoded the deployment
+SSH host/user/password. The password has been REMOVED from source -- it
+now comes from the GK_SSH_PASSWORD environment variable (or the OS
+keyring). REMOVING IT FROM GIT DOES NOT ROTATE IT: the old value was in
+the repository history and must be changed on the server itself before
+this repo can be considered clean."""
+import os
 import re
 from pathlib import Path
 
 import keyring
 import paramiko
 
-HOST, USER, PW = "10.1.2.217", "coolify", "@231Garton"
+# ROTATE THE SERVER PASSWORD -- then set it here via env or keyring.
+# History still contains the old literal; only a server-side change
+# invalidates it.
+HOST = os.environ.get("GK_SSH_HOST", "10.1.2.217")
+USER = os.environ.get("GK_SSH_USER", "coolify")
+PW = (os.environ.get("GK_SSH_PASSWORD")
+      or keyring.get_password("gatelodge", "ssh_password"))
+if not PW:
+    raise SystemExit("Set GK_SSH_PASSWORD (or keyring 'gatelodge'/"
+                     "'ssh_password') -- credentials are no longer in source.")
 TMP = Path(r"C:\Users\dlang\AppData\Local\Temp\workshop_"
            r"833c5d6b-9aa2-4380-a63b-7c740c69a0e5")
 

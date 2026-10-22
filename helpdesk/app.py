@@ -275,7 +275,11 @@ def _load_kb_overrides() -> dict:
         return docs
     for name, content in rows:
         if _is_internal(content):
-            # a saved edit that keeps the internal flag stays internal
+            # REVIEW FIX: a saved edit marked internal WITHDRAWS the
+            # document from the public catalog entirely. The previous
+            # `continue` left the built-in PUBLIC copy live, so marking a
+            # doc internal never actually hid it from public answers.
+            docs.pop(name, None)
             continue
         title = re.search(r"^title:\s*(.+)$", content, re.M)
         desc = re.search(r"^description:\s*(.+)$", content, re.M)
@@ -882,8 +886,18 @@ def rate_ok(ip: str, limit: int, bucket: str, window_s: int = 3600) -> bool:
 
 
 def client_ip(request: Request) -> str:
-    return (request.headers.get("cf-connecting-ip")
-            or request.client.host if request.client else "?")
+    # SECURITY (review finding): cf-connecting-ip is only trustworthy when
+    # the service is reachable ONLY through Cloudflare. Anyone who can hit
+    # the origin directly can spoof the header and draw a fresh
+    # rate-limit bucket per request. Trust it only when explicitly opted
+    # in via TRUST_CF_IP=1 (also fixes the old operator-precedence quirk
+    # that returned "?" whenever request.client was None despite a header
+    # being present).
+    if os.environ.get("TRUST_CF_IP", "").lower() in ("1", "true", "yes"):
+        header = request.headers.get("cf-connecting-ip")
+        if header:
+            return header
+    return request.client.host if request.client else "?"
 
 
 async def turnstile_ok(token: str, ip: str) -> bool:
@@ -1242,11 +1256,18 @@ async def _extract_decision_facts(history: list[dict]) -> dict:
 
 async def _decision_answer(question_history: list[dict], facts: dict,
                            decision: dict, policy: str) -> str:
-    """Phrase a deterministic decision for the visitor (non-streaming)."""
+    """Phrase a deterministic decision for the visitor (non-streaming).
+
+    REVIEW FIX: `decision` IS the policy result dict ({"decision": ...,
+    "rule": ...}) -- the caller passes pol["result"], exactly like the
+    streaming chat path does. An earlier version re-dereferenced
+    decision.get("result", {}) here, so the phrasing model was always
+    prompted with {} and an empty rule, and the emailed prose could
+    contradict the correctly-decided policy."""
     messages = ([{"role": "system",
                   "content": DECISION_ANSWER_SYSTEM.format(
-                      decision=json.dumps(decision.get("result", {})),
-                      rule=decision.get("result", {}).get("rule", ""),
+                      decision=json.dumps(decision),
+                      rule=decision.get("rule", ""),
                       policy=policy, support=SUPPORT_EMAIL)}]
                 + question_history[-6:])
     async with httpx.AsyncClient(timeout=90) as c:

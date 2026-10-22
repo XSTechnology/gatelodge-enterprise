@@ -61,22 +61,27 @@ for q, tag, want in QS:
 
 # 3. new sections in both serving containers (separate execs — the
 # earlier && chain ate the second output)
+import os as _os
+# SECURITY (review fix): credential removed from source -- env only, and
+# ROTATE the server password (git history retains the old literal).
+_PW = _os.environ["GK_SSH_PASSWORD"]
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-cli.connect("10.1.2.217", username="coolify", password="@231Garton",
-            timeout=20)
+cli.connect(_os.environ.get("GK_SSH_HOST", "10.1.2.217"),
+            username=_os.environ.get("GK_SSH_USER", "coolify"),
+            password=_PW, timeout=20)
 for container in ("gatekeeper", "lodge-office"):
     stdin, stdout, stderr = cli.exec_command(
         "sudo -S -p '' docker exec " + container + " grep -c "
         "'Is prompt content logged' /app/kb/evaluation.md", timeout=60)
-    stdin.write("@231Garton\n")
+    stdin.write(_PW + "\n")
     n = stdout.read().decode(errors="replace").strip()
     check(f"{container} serves the content-logging section", n == "1", n)
 stdin, stdout, stderr = cli.exec_command(
     "sudo -S -p '' docker exec zrqxzbetinodrkqrfd1berbq psql -U "
     "gatelodge -d gatelodge -t -A -c \"SELECT count(*) FROM kb_intent "
     "WHERE doc='evaluation'\"", timeout=60)
-stdin.write("@231Garton\n")
+stdin.write(_PW + "\n")
 n = stdout.read().decode(errors="replace").strip()
 check("evaluation intent map present (10 sections)", n == "10", n)
 cli.close()
